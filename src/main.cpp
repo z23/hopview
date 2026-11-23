@@ -89,7 +89,7 @@ bool seedExample(const QString &file) {
             const bool incident = round >= 1660 && round < 1682 && hop >= 5;
             const auto rtt = 0.55 + 1.7 * hop + 0.13 * hop * hop +
                              1.8 * std::abs(std::sin(round * 0.14 + hop)) +
-                             (incident ? 68 + 8 * std::sin(round * 0.4) : 0);
+                             (incident ? 180 + 35 * std::sin(round * 0.4) : 0);
             const auto lost = (incident && round % 5 == 0) || (hop == 3 && round % 11 == 0);
             batch.push_back({id, stamp, hop, lost ? QString() : QString("2001:db8:%1::1").arg(hop),
                              lost ? -1.0 : rtt, hop == 9 && !lost});
@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
     else
         app = std::make_unique<QCoreApplication>(argc, argv);
     app->setApplicationName("hopline");
-    app->setApplicationVersion("0.1.0");
+    app->setApplicationVersion("0.2.0");
     QCommandLineParser parser;
     parser.setApplicationDescription("Hopline — continuous IPv4 and IPv6 path monitoring");
     parser.addHelpOption();

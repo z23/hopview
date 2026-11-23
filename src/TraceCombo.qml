@@ -53,6 +53,8 @@ C.ComboBox {
     popup: C.Popup {
         y: control.height + 3
         width: control.width
+        scale: control.Window.window ? control.Window.window.uiScale : 1
+        transformOrigin: C.Popup.TopLeft
         height: Math.min(contentItem.implicitHeight + 8, 320)
         padding: 4
         contentItem: ListView {

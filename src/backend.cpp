@@ -5,6 +5,7 @@
 #include <QHostInfo>
 #include <QHostAddress>
 #include <algorithm>
+#include <utility>
 
 namespace {
 QObject *contextOn(QThread &thread) {
@@ -46,10 +47,11 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent) {
             },
             Qt::BlockingQueuedConnection);
     }
-    for (auto &entry : m_sessions) {
+    const auto recordings = std::exchange(m_sessions, {});
+    for (const auto &entry : recordings) {
         auto info = entry.toMap();
         info["running"] = false;
-        entry = info;
+        (info.take("closed").toBool() ? m_closedSessions : m_sessions).append(info);
     }
     connect(m_probe, &Probe::status, this, [this](qint64 id, QString message, bool fatal) {
         if (!m_active.contains(id))
@@ -155,17 +157,26 @@ void Backend::flushSamples() {
     QHash<qint64, qint64> ends;
     for (const auto &s : batch)
         ends[s.session] = std::max(ends.value(s.session), s.timeMs);
-    QMetaObject::invokeMethod(this, [this, ends] {
-        for (auto &entry : m_sessions) {
-            auto info = entry.toMap();
-            const auto id = info.value("id").toLongLong();
-            if (!ends.contains(id))
-                continue;
-            ++m_revisions[id];
-            info["endMs"] = std::max(info.value("endMs").toLongLong(), ends[id]);
-            entry = info;
+    QMetaObject::invokeMethod(this, [this, ends = std::move(ends)]() mutable {
+        const bool selectedUpdated = ends.contains(m_session);
+        // Most batches belong entirely to open tabs. A final batch may arrive
+        // after a tab closes, while its recording is still being flushed.
+        for (auto *list : {&m_sessions, &m_closedSessions}) {
+            if (ends.isEmpty())
+                break;
+            for (auto &entry : *list) {
+                auto info = entry.toMap();
+                const auto id = info.value("id").toLongLong();
+                auto stamp = ends.find(id);
+                if (stamp == ends.end())
+                    continue;
+                ++m_revisions[id];
+                info["endMs"] = std::max(info.value("endMs").toLongLong(), stamp.value());
+                entry = info;
+                ends.erase(stamp);
+            }
         }
-        if (ends.contains(m_session)) {
+        if (selectedUpdated) {
             m_dirty = true;
             if (m_snapshot.isEmpty())
                 scheduleView(false);
@@ -336,14 +347,14 @@ void Backend::toggleRunning() {
     scheduleView();
 }
 void Backend::selectSession(qint64 id) {
-    if (id == m_session || sessionInfo(id).isEmpty())
+    if (id == m_session || (id && sessionInfo(id).isEmpty()))
         return;
     if (m_session)
-        m_views[m_session] = {m_hops, m_viewSecs, m_focusSecs, m_live, m_viewEnd, m_focusCenter};
+        m_views[m_session] = {m_hops, m_spanMs, m_focusSecs, m_live, m_viewEnd, m_focusCenter};
     m_session = id;
     const auto saved = m_views.value(id);
     m_hops = saved.hops;
-    m_viewSecs = saved.viewSeconds;
+    m_spanMs = saved.spanMs;
     m_focusSecs = saved.focusSeconds;
     m_live = saved.live;
     m_viewEnd = m_live ? latest() : saved.end;
@@ -352,10 +363,56 @@ void Backend::selectSession(qint64 id) {
     emit selectionChanged();
     emit sessionsChanged();
     emit snapshotChanged();
-    setStatus(m_messages.value(id, tr("Recorded session")));
+    setStatus(id ? m_messages.value(id, tr("Recorded session")) : QString());
+    if (!id) {
+        ++m_version;
+        m_pending = false;
+        m_coalesce.stop();
+    }
     emit viewportChanged();
     scheduleView();
 }
+void Backend::closeSession(qint64 id) { changeTabVisibility(id, true); }
+void Backend::reopenSession(qint64 id) { changeTabVisibility(id, false); }
+
+void Backend::changeTabVisibility(qint64 id, bool closed) {
+    if (!m_ready || id <= 0)
+        return;
+    QMetaObject::invokeMethod(m_writerContext, [this, id, closed] {
+        const bool ok = m_writer->setTabClosed(id, closed);
+        const QString error = m_writer->error();
+        QMetaObject::invokeMethod(this, [this, id, closed, ok, error] {
+            if (!ok) {
+                setStatus(error);
+                return;
+            }
+            auto &from = closed ? m_sessions : m_closedSessions;
+            auto &to = closed ? m_closedSessions : m_sessions;
+            for (qsizetype i = 0; i < from.size(); ++i) {
+                if (from.at(i).toMap().value("id").toLongLong() != id)
+                    continue;
+                auto info = from.takeAt(i).toMap();
+                if (closed && m_active.remove(id)) {
+                    info["running"] = false;
+                    m_messages[id] = tr("Paused");
+                    QMetaObject::invokeMethod(m_probe, [this, id] { m_probe->stop(id); });
+                }
+                to.prepend(info);
+                if (!closed)
+                    selectSession(id);
+                else if (id == m_session) {
+                    const auto next =
+                        from.isEmpty() ? 0
+                                       : from.at(std::min(i, from.size() - 1)).toMap().value("id").toLongLong();
+                    selectSession(next);
+                } else
+                    emit sessionsChanged();
+                return;
+            }
+        });
+    });
+}
+
 void Backend::toggleHop(int hop) {
     if (hop < 0 || hop > 255)
         return;
@@ -378,9 +435,20 @@ void Backend::toggleHop(int hop) {
     scheduleView();
 }
 void Backend::setViewSeconds(int seconds) {
-    m_viewSecs = std::clamp(seconds, 1, 7 * 86400);
+    m_spanMs = qint64(std::clamp(seconds, 1, 7 * 86400)) * 1000;
     if (!m_live && m_focusCenter)
-        m_viewEnd = std::min(latest(), m_focusCenter + qint64(m_viewSecs) * 500);
+        m_viewEnd = std::min(latest(), m_focusCenter + m_spanMs / 2);
+    emit viewportChanged();
+    scheduleView();
+}
+void Backend::zoomToRange(qint64 a, qint64 b) {
+    if (!m_session || a == b || a < 0 || b < 0)
+        return;
+    m_viewEnd = std::max(a, b);
+    m_spanMs = std::min(m_viewEnd - std::min(a, b), qint64(7) * 86400000);
+    m_focusSecs = 0;
+    m_focusCenter = 0;
+    m_live = false;
     emit viewportChanged();
     scheduleView();
 }
@@ -393,7 +461,7 @@ void Backend::focusAt(qint64 stamp) {
     if (!m_session || m_focusSecs < 0)
         return;
     if (m_focusSecs == 0)
-        m_focusSecs = std::max(1, std::min(60, m_viewSecs / 5));
+        m_focusSecs = std::max(1, std::min(60, int(m_spanMs / 5000)));
     m_live = false;
     m_focusCenter = std::clamp(stamp, viewStart(), viewEnd());
     emit viewportChanged();
@@ -403,7 +471,7 @@ void Backend::panBy(qint64 deltaMs) {
     if (!m_session || !deltaMs)
         return;
     const qint64 end = latest();
-    const auto minEnd = std::min(end, earliest() + qint64(m_viewSecs) * 1000);
+    const auto minEnd = std::min(end, earliest() + m_spanMs);
     m_viewEnd = std::clamp(m_viewEnd + deltaMs, minEnd, end);
     m_focusCenter = 0;
     m_live = false;

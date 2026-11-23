@@ -144,6 +144,8 @@ constexpr char schema[] = R"SQL(
 CREATE TABLE IF NOT EXISTS sessions(
  id INTEGER PRIMARY KEY,target TEXT NOT NULL,family INTEGER NOT NULL,interval_ms INTEGER NOT NULL,
  created_ms INTEGER NOT NULL,first_ms INTEGER,last_ms INTEGER);
+CREATE TABLE IF NOT EXISTS closed_tabs(
+ session INTEGER PRIMARY KEY REFERENCES sessions(id));
 CREATE TABLE IF NOT EXISTS notes(
  session INTEGER NOT NULL,t INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(session,t),
  FOREIGN KEY(session) REFERENCES sessions(id)) WITHOUT ROWID;
@@ -375,6 +377,22 @@ bool History::setInterval(qint64 id, int intervalMs) {
     }
 }
 
+bool History::setTabClosed(qint64 id, bool closed) {
+    if (!open())
+        return false;
+    error_.clear();
+    try {
+        Statement q(db_, closed ? "INSERT OR IGNORE INTO closed_tabs(session) VALUES(?)"
+                                : "DELETE FROM closed_tabs WHERE session=?");
+        q.integer(1, id);
+        q.next();
+        return true;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return false;
+    }
+}
+
 bool History::addNote(qint64 id, qint64 timeMs, QString text) {
     if (!open())
         return false;
@@ -404,11 +422,12 @@ QVariantList History::sessions() {
     error_.clear();
     try {
         Statement q(db_, "SELECT id,target,family,interval_ms,coalesce(first_ms,created_ms),"
-                         "coalesce(last_ms,created_ms) FROM sessions ORDER BY id DESC");
+                         "coalesce(last_ms,created_ms),closed_tabs.session IS NOT NULL FROM sessions "
+                         "LEFT JOIN closed_tabs ON closed_tabs.session=sessions.id ORDER BY id DESC");
         while (q.next())
             list << QVariantMap{{"id", q.integer(0)},      {"target", q.string(1)},
                                 {"family", q.integer(2)},  {"intervalMs", q.integer(3)},
-                                {"startMs", q.integer(4)}, {"endMs", q.integer(5)}};
+                                {"startMs", q.integer(4)}, {"endMs", q.integer(5)}, {"closed", bool(q.integer(6))}};
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
         list.clear();

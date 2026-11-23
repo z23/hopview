@@ -1,5 +1,5 @@
 pkgname=hopline
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Native IPv4 and IPv6 network path monitor with interactive history"
 arch=('x86_64' 'aarch64')

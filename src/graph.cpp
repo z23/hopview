@@ -14,6 +14,8 @@
 
 namespace {
 using Vertices = std::vector<QPointF>;
+constexpr qreal warningMs = 100;
+constexpr qreal criticalMs = 200;
 enum Layer { Warning, Critical, Grid, Band, Loss, Range, Line, Current, Count };
 using Layers = std::array<Vertices, Count>;
 
@@ -108,10 +110,10 @@ void profileLayers(Layers &layers, const QVariantList &samples, qreal width,
     auto x = [=](qreal latency) {
         return 5 + std::clamp(latency / ceiling, 0.0, 1.0) * std::max(1.0, width - 10);
     };
-    if (ceiling > 100)
-        rectangle(layers[Warning], x(100), 0, x(std::min(200.0, ceiling)), height);
-    if (ceiling > 200)
-        rectangle(layers[Critical], x(200), 0, x(ceiling), height);
+    if (ceiling > warningMs)
+        rectangle(layers[Warning], x(warningMs), 0, x(std::min(criticalMs, ceiling)), height);
+    if (ceiling > criticalMs)
+        rectangle(layers[Critical], x(criticalMs), 0, x(ceiling), height);
     for (int i = 0; i <= 4; ++i) {
         const qreal gx = x(ceiling * i / 4);
         rectangle(layers[Grid], gx, 0, gx + 1, height);
@@ -147,6 +149,11 @@ void profileLayers(Layers &layers, const QVariantList &samples, qreal width,
 void timelineLayers(Layers &layers, const QVariantList &samples, qreal width,
                     qreal height, qreal ceiling, int pixels, qreal maxGap)
 {
+    auto y = [=](qreal rtt) { return height - 2 - std::clamp(rtt / ceiling, 0.0, 1.0) * (height - 5); };
+    if (ceiling > warningMs)
+        rectangle(layers[Warning], 0, ceiling > criticalMs ? y(criticalMs) : 0, width, y(warningMs));
+    if (ceiling > criticalMs)
+        rectangle(layers[Critical], 0, 0, width, y(criticalMs));
     for (int i = 0; i <= 4; ++i) {
         const qreal gx = (width - 1) * i / 4;
         rectangle(layers[Grid], gx, 0, gx + 1, height);
@@ -154,7 +161,6 @@ void timelineLayers(Layers &layers, const QVariantList &samples, qreal width,
     rectangle(layers[Grid], 0, height / 2, width, height / 2 + 1);
     rectangle(layers[Grid], 0, height - 1, width, height);
     const qreal step = width / std::max(1, pixels);
-    auto y = [=](qreal rtt) { return height - 2 - std::clamp(rtt / ceiling, 0.0, 1.0) * (height - 5); };
     QPointF last;
     bool haveLast = false;
     for (const auto &item : samples) {

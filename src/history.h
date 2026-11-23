@@ -18,6 +18,7 @@ class History {
     QString error() const;
     qint64 createSession(QString target, int family, int intervalMs);
     QVariantList sessions();
+    bool setTabClosed(qint64 session, bool closed);
     bool setInterval(qint64 session, int intervalMs);
     bool addNote(qint64 session, qint64 timeMs, QString text);
     bool append(const QVector<Sample> &samples);

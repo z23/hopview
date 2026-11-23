@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as C
 import QtQuick.Layouts
+import QtCore as Core
 import QtQuick.Dialogs as Dialogs
 import Hopline.Graphics 1.0
 
@@ -27,6 +28,16 @@ C.ApplicationWindow {
     readonly property color faint: "#8295a3"
     readonly property color accent: themeAccent.hslLightness < 0.50 ? Qt.lighter(themeAccent, 1.55) : themeAccent
     readonly property color lossColor: "#ed8086"
+    Core.Settings {
+        id: preferences
+        location: Core.StandardPaths.writableLocation(Core.StandardPaths.AppConfigLocation) + "/appearance.ini"
+        property int scaleStep: 0
+    }
+    readonly property real uiScale: 1 + Math.max(-2, Math.min(8, preferences.scaleStep)) / 8
+    function changeScale(step) {
+        preferences.scaleStep = Math.max(-2, Math.min(8, step))
+        preferences.sync()
+    }
     readonly property var rows: backend.snapshot.rows || []
     readonly property var charts: backend.snapshot.charts || []
     readonly property var currentSession: {
@@ -38,11 +49,11 @@ C.ApplicationWindow {
     readonly property var focusOptions: [0, -1, 10, 30, 60, 300, 900, 3600, 21600, 86400]
     readonly property var viewOptions: [10, 30, 60, 300, 900, 3600, 21600, 86400, 604800]
     readonly property int rowSize: 29
-    readonly property int numWidth: width >= 1060 ? 61 : 47
+    readonly property int numWidth: workspace.width >= 1060 ? 61 : 47
     readonly property int hopWidth: 69
     readonly property int graphWidth: Math.floor(Math.max(155, routeContent.width * 0.34))
     readonly property int hostWidth: Math.max(90, routeContent.width - graphWidth - 7 * numWidth - hopWidth)
-    readonly property int chartLabelWidth: app.width >= 950 ? 171 : 127
+    readonly property int chartLabelWidth: workspace.width >= 950 ? 171 : 127
     readonly property int axisRight: 18
     readonly property real chartWidth: Math.max(1, timelineFrame.width - 26 - chartLabelWidth - axisRight)
     readonly property real viewSpan: Math.max(1, backend.viewEnd - backend.viewStart)
@@ -51,6 +62,9 @@ C.ApplicationWindow {
     property real cursorFraction: -1
     property int cursorHop: -1
     property var cursorBucket: null
+    property double rangeAnchorMs: -1
+    property double rangeEndMs: -1
+    readonly property bool selectingRange: rangeAnchorMs >= 0 && rangeEndMs >= 0
     property bool inputError: false
     property string exportStatus: ""
 
@@ -71,8 +85,15 @@ C.ApplicationWindow {
     function timeAt(x) { return Math.round(backend.viewStart + Math.max(0, Math.min(1, x)) * viewSpan) }
     function timeText(t, detailed) {
         if (t <= 0) return "—"
-        const pattern = detailed ? "ddd d MMM, HH:mm:ss" : viewSpan >= 86400000 ? "ddd HH:mm" : "HH:mm:ss"
+        const pattern = detailed ? (viewSpan < 10000 ? "ddd d MMM, HH:mm:ss.zzz" : "ddd d MMM, HH:mm:ss")
+                                 : viewSpan >= 86400000 ? "ddd HH:mm" : viewSpan < 10000 ? "HH:mm:ss.zzz" : "HH:mm:ss"
         return Qt.formatDateTime(new Date(t), pattern)
+    }
+    function durationText(ms) {
+        if (ms < 1000) return Math.round(ms) + " ms"
+        if (ms < 60000) return Number((ms / 1000).toFixed(2)) + " s"
+        if (ms < 3600000) return Number((ms / 60000).toFixed(2)) + " min"
+        return Number((ms / 3600000).toFixed(2)) + " hr"
     }
     function percent(v) { return v >= 0 ? (+Number(v).toFixed(1)) + "%" : "—" }
     function findRow(hop) {
@@ -84,8 +105,14 @@ C.ApplicationWindow {
         return false
     }
     function moveZoom(direction) {
-        const i = viewOptions.indexOf(backend.viewSeconds)
-        backend.setViewSeconds(viewOptions[Math.max(0, Math.min(viewOptions.length - 1, i + direction))])
+        const seconds = viewSpan / 1000
+        if (direction < 0) {
+            for (let i = viewOptions.length - 1; i >= 0; --i)
+                if (viewOptions[i] < seconds) { backend.setViewSeconds(viewOptions[i]); return }
+        } else {
+            for (const preset of viewOptions)
+                if (preset > seconds) { backend.setViewSeconds(preset); return }
+        }
     }
     function chooseExport() {
         if (!backend.sessionId) return
@@ -98,7 +125,8 @@ C.ApplicationWindow {
         backend.startTrace(target, [0, 4, 6][family.currentIndex], [250, 500, 1000, 2500, 5000][interval.currentIndex])
     }
     onChartWidthChanged: pixelTimer.restart()
-    Timer { id: pixelTimer; interval: 100; onTriggered: backend.setPixels(Math.max(1, Math.floor(app.chartWidth))) }
+    onUiScaleChanged: pixelTimer.restart()
+    Timer { id: pixelTimer; interval: 100; onTriggered: backend.setPixels(Math.max(1, Math.floor(app.chartWidth * app.uiScale))) }
     Component.onCompleted: pixelTimer.restart()
 
     component Caption: Text {
@@ -120,7 +148,7 @@ C.ApplicationWindow {
         height: app.rowSize
         color: app.ink
         font.family: "monospace"
-        font.pixelSize: app.width >= 1060 ? 12 : 11
+        font.pixelSize: workspace.width >= 1060 ? 12 : 11
         horizontalAlignment: Text.AlignRight
         rightPadding: 9
         verticalAlignment: Text.AlignVCenter
@@ -128,9 +156,27 @@ C.ApplicationWindow {
     }
     component Rule: Rectangle { implicitHeight: 1; color: app.edge }
 
+    Flickable {
+        id: viewport
+        objectName: "workspaceViewport"
+        anchors.fill: parent
+        clip: true
+        contentWidth: Math.max(width, app.minimumWidth * app.uiScale)
+        contentHeight: Math.max(height, app.minimumHeight * app.uiScale)
+        interactive: contentWidth > width || contentHeight > height
+        boundsBehavior: Flickable.StopAtBounds
+        C.ScrollBar.horizontal: C.ScrollBar {}
+        C.ScrollBar.vertical: C.ScrollBar {}
+    }
+
     ColumnLayout {
         id: workspace
-        anchors.fill: parent
+        objectName: "workspace"
+        parent: viewport.contentItem
+        width: viewport.contentWidth / app.uiScale
+        height: viewport.contentHeight / app.uiScale
+        scale: app.uiScale
+        transformOrigin: Item.TopLeft
         spacing: 0
         Rectangle {
             Layout.fillWidth: true
@@ -179,18 +225,19 @@ C.ApplicationWindow {
                 TraceCombo { id: family; implicitWidth: 83; model: ["Auto IP", "IPv4", "IPv6"]; hint: "Address family" }
                 TraceCombo { id: interval; implicitWidth: 85; model: ["0.25 s", "0.5 s", "1 s", "2.5 s", "5 s"]; currentIndex: 2; hint: "Interval between trace rounds" }
                 TraceButton { text: "Start trace"; primary: true; accent: app.accent; onClicked: app.launch() }
-                Item { Layout.fillWidth: true; visible: app.width > 950 }
+                Item { Layout.fillWidth: true; visible: workspace.width > 950 }
             }
         }
         Rule { Layout.fillWidth: true }
         Rectangle {
-            visible: backend.sessions.length > 0
+            visible: backend.sessions.length > 0 || backend.closedSessions.length > 0
             Layout.fillWidth: true
             implicitHeight: 42
             color: app.well
             ListView {
                 id: sessionsList
-                anchors.fill: parent
+                anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
+                anchors.right: reopenButton.visible ? reopenButton.left : parent.right
                 anchors.leftMargin: 12; anchors.rightMargin: 12
                 orientation: ListView.Horizontal
                 clip: true
@@ -203,9 +250,10 @@ C.ApplicationWindow {
                     required property int index
                     readonly property var modelData: backend.sessions[index] || ({})
                     readonly property bool active: modelData.id === backend.sessionId
+                    objectName: "sessionTab" + (modelData.id || "")
                     height: sessionsList.height
                     padding: 0
-                    width: Math.min(260, tabName.implicitWidth + 50)
+                    width: Math.min(280, tabName.implicitWidth + 66)
                     hoverEnabled: true
                     Accessible.name: modelData.target + ", " + app.timeText(modelData.startMs, true)
                     onClicked: backend.selectSession(modelData.id)
@@ -219,7 +267,32 @@ C.ApplicationWindow {
                         Rectangle { width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: tab.modelData.running ? app.accent : app.faint }
                         Caption { id: tabName; width: Math.min(210, implicitWidth); anchors.verticalCenter: parent.verticalCenter; color: tab.active ? app.ink : app.mute; text: tab.modelData.target }
                     }
-                    C.ToolTip.visible: hovered
+                    TapHandler {
+                        acceptedButtons: Qt.MiddleButton
+                        onTapped: backend.closeSession(tab.modelData.id)
+                    }
+                    C.ToolButton {
+                        id: closeTab
+                        objectName: "closeTab" + (tab.modelData.id || "")
+                        anchors.right: parent.right; anchors.rightMargin: 3; anchors.verticalCenter: parent.verticalCenter
+                        width: 25; height: 26
+                        hoverEnabled: true
+                        Accessible.name: qsTr("Close trace to %1").arg(tab.modelData.target)
+                        onClicked: backend.closeSession(tab.modelData.id)
+                        contentItem: Text {
+                            text: "×"; color: closeTab.hovered || closeTab.visualFocus ? app.ink : app.faint
+                            font.pixelSize: 17
+                            horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            radius: 4; color: closeTab.hovered ? "#344552" : "transparent"
+                            border.color: closeTab.visualFocus ? app.accent : "transparent"
+                        }
+                        C.ToolTip.visible: hovered
+                        C.ToolTip.delay: 450
+                        C.ToolTip.text: tab.modelData.running ? qsTr("Stop and close trace. Recording is kept.") : qsTr("Close tab. Recording is kept.")
+                    }
+                    C.ToolTip.visible: hovered && !closeTab.hovered
                     C.ToolTip.delay: 600
                     C.ToolTip.text: modelData.target + " · " + app.timeText(modelData.startMs, true)
                 }
@@ -227,6 +300,58 @@ C.ApplicationWindow {
                     enabled: sessionsList.contentWidth > sessionsList.width
                     acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
                     onWheel: event => sessionsList.contentX = Math.max(0, Math.min(sessionsList.contentWidth - sessionsList.width, sessionsList.contentX - event.angleDelta.y))
+                }
+            }
+            TraceButton {
+                id: reopenButton
+                objectName: "reopenTraces"
+                visible: backend.closedSessions.length > 0
+                anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                text: qsTr("Reopen trace")
+                hint: qsTr("Open a closed recording")
+                onClicked: closedPopup.open()
+                C.Popup {
+                    id: closedPopup
+                    objectName: "closedTracesPopup"
+                    x: reopenButton.width - width
+                    y: reopenButton.height + 4
+                    scale: app.uiScale
+                    transformOrigin: C.Popup.TopLeft
+                    width: Math.min(330, workspace.width - 30)
+                    height: Math.min(300, 8 + backend.closedSessions.length * 38)
+                    padding: 4
+                    focus: true
+                    onOpened: { archiveList.currentIndex = 0; archiveList.forceActiveFocus() }
+                    function restore(index) {
+                        const session = backend.closedSessions[index]
+                        if (!session) return
+                        close()
+                        backend.reopenSession(session.id)
+                    }
+                    background: Rectangle { radius: 5; color: "#1d2934"; border.color: "#425461" }
+                    contentItem: ListView {
+                        id: archiveList
+                        clip: true
+                        keyNavigationEnabled: true
+                        model: backend.closedSessions
+                        Keys.onReturnPressed: closedPopup.restore(currentIndex)
+                        Keys.onEnterPressed: closedPopup.restore(currentIndex)
+                        C.ScrollIndicator.vertical: C.ScrollIndicator {}
+                        delegate: C.ItemDelegate {
+                            required property var modelData
+                            required property int index
+                            objectName: "reopenTrace" + modelData.id
+                            width: archiveList.width; height: 38
+                            highlighted: archiveList.currentIndex === index
+                            Accessible.name: modelData.target + " " + app.timeText(modelData.startMs, true)
+                            onClicked: closedPopup.restore(index)
+                            contentItem: RowLayout {
+                                Caption { text: modelData.target; Layout.fillWidth: true; color: app.ink }
+                                Caption { text: app.timeText(modelData.startMs, true); font.pixelSize: 11 }
+                            }
+                            background: Rectangle { radius: 3; color: parent.highlighted || parent.hovered ? "#344552" : "transparent" }
+                        }
+                    }
                 }
             }
         }
@@ -274,7 +399,7 @@ C.ApplicationWindow {
                         Layout.fillWidth: true; Layout.leftMargin: 16; Layout.rightMargin: 16
                         implicitHeight: 50; spacing: 10
                         Heading { text: "Route profile" }
-                        Caption { visible: app.width >= 875; text: backend.live ? app.rows.length + (app.rows.length === 1 ? " hop" : " hops")
+                        Caption { visible: workspace.width >= 875; text: backend.live ? app.rows.length + (app.rows.length === 1 ? " hop" : " hops")
                             : app.timeText(backend.focusStart, false) + " – " + app.timeText(backend.focusEnd, false) }
                         Item { Layout.fillWidth: true }
                         TraceButton { text: "Save PNG"; hint: "Save the visible graphs (Ctrl+Shift+S)"; onClicked: app.chooseExport() }
@@ -431,16 +556,26 @@ C.ApplicationWindow {
                         Layout.fillWidth: true; Layout.leftMargin: 16; Layout.rightMargin: 16
                         implicitHeight: 50; spacing: 9
                         Heading { text: "Timelines" }
-                        Caption { visible: app.width > 970; text: "● RTT"; color: app.accent }
-                        Caption { visible: app.width > 970; text: "▮ Loss"; color: app.lossColor }
+                        Caption { visible: workspace.width > 970; text: "● RTT"; color: app.accent }
+                        Caption { visible: workspace.width > 970; text: "▮ Loss"; color: app.lossColor }
+                        Caption {
+                            visible: workspace.width > 1020 && app.timeCeiling > 100
+                            text: "■ 100–200 ms"; color: "#d5b777"
+                        }
+                        Caption {
+                            visible: workspace.width > 1100 && app.timeCeiling > 200
+                            text: "■ >200 ms"; color: "#ce9398"
+                        }
                         Item { Layout.fillWidth: true }
                         Caption { text: "View" }
                         TraceCombo {
-                            implicitWidth: 85
+                            objectName: "timelineDuration"
+                            implicitWidth: 92
                             model: ["10 sec", "30 sec", "1 min", "5 min", "15 min", "1 hr", "6 hr", "1 day", "7 days"]
-                            currentIndex: app.viewOptions.indexOf(backend.viewSeconds)
+                            currentIndex: app.viewOptions.indexOf(app.viewSpan / 1000)
+                            displayText: currentIndex >= 0 ? currentText : app.durationText(app.viewSpan)
                             onActivated: i => backend.setViewSeconds(app.viewOptions[i])
-                            hint: "Displayed duration · Ctrl+wheel to zoom"
+                            hint: "Drag on a timeline to zoom to a range. Ctrl+wheel changes duration."
                         }
                         TraceButton {
                             text: "‹"; font.pixelSize: 18; hint: "Previous half window"
@@ -529,7 +664,16 @@ C.ApplicationWindow {
                                         }
                                         Rectangle {
                                             x: app.cursorFraction * parent.width
-                                            visible: app.cursorFraction >= 0; width: 1; height: parent.height; color: app.ink; opacity: 0.75
+                                            visible: app.cursorFraction >= 0 && !app.selectingRange; width: 1; height: parent.height; color: app.ink; opacity: 0.75
+                                        }
+                                        Rectangle {
+                                            visible: app.selectingRange
+                                            x: (Math.min(app.rangeAnchorMs, app.rangeEndMs) - backend.viewStart) / app.viewSpan * parent.width
+                                            width: Math.abs(app.rangeEndMs - app.rangeAnchorMs) / app.viewSpan * parent.width
+                                            height: parent.height
+                                            color: Qt.rgba(app.accent.r, app.accent.g, app.accent.b, 0.18)
+                                            border.width: 1
+                                            border.color: app.accent
                                         }
                                         MouseArea {
                                             id: chartMouse
@@ -537,11 +681,23 @@ C.ApplicationWindow {
                                             anchors.fill: parent
                                             acceptedButtons: Qt.LeftButton | Qt.RightButton
                                             hoverEnabled: true
-                                            cursorShape: mouseDrag ? Qt.ClosedHandCursor : Qt.CrossCursor
+                                            cursorShape: panGesture && mouseDrag ? Qt.ClosedHandCursor : Qt.CrossCursor
                                             preventStealing: true
                                             property real startX: 0
                                             property real previousX: 0
                                             property bool mouseDrag: false
+                                            property bool panGesture: false
+                                            property double pressViewStart: 0
+                                            property double pressSpan: 0
+                                            function dragTime(xp) {
+                                                return Math.round(pressViewStart + Math.max(0, Math.min(1, xp / width)) * pressSpan)
+                                            }
+                                            function clearDrag() {
+                                                app.rangeAnchorMs = -1
+                                                app.rangeEndMs = -1
+                                                mouseDrag = false
+                                                panGesture = false
+                                            }
                                             function updateCursor(xp) {
                                                 app.cursorFraction = Math.max(0, Math.min(1, xp / width))
                                                 app.cursorHop = track.modelData.hop
@@ -559,23 +715,35 @@ C.ApplicationWindow {
                                             }
                                             onPressed: e => {
                                                 startX = e.x; previousX = e.x; mouseDrag = false
-                                                if (e.button === Qt.RightButton) app.openNote(e.x / width)
+                                                if (e.button === Qt.RightButton) { app.openNote(e.x / width); return }
+                                                panGesture = !!(e.modifiers & Qt.ShiftModifier)
+                                                pressViewStart = backend.viewStart
+                                                pressSpan = app.viewSpan
                                             }
                                             onPositionChanged: e => {
                                                 if (pressedButtons & Qt.LeftButton) {
                                                     if (Math.abs(e.x - startX) > 4) mouseDrag = true
-                                                    if (mouseDrag) {
+                                                    if (mouseDrag && panGesture) {
                                                         const delta = Math.round((previousX - e.x) / width * app.viewSpan)
                                                         if (delta) backend.panBy(delta)
                                                         previousX = e.x
+                                                    } else if (mouseDrag) {
+                                                        app.rangeAnchorMs = dragTime(startX)
+                                                        app.rangeEndMs = dragTime(e.x)
                                                     }
                                                 }
                                                 updateCursor(e.x)
                                             }
                                             onReleased: e => {
-                                                if (e.button === Qt.LeftButton && !mouseDrag) backend.focusAt(app.timeAt(e.x / width))
-                                                mouseDrag = false
+                                                if (e.button !== Qt.LeftButton) return
+                                                if (mouseDrag || Math.abs(e.x - startX) > 4) {
+                                                    if (!panGesture) backend.zoomToRange(dragTime(startX), dragTime(e.x))
+                                                } else {
+                                                    backend.focusAt(dragTime(e.x))
+                                                }
+                                                clearDrag()
                                             }
+                                            onCanceled: clearDrag()
                                             onExited: { app.cursorFraction = -1; app.cursorBucket = null; app.cursorHop = -1 }
                                             onWheel: e => {
                                                 if (e.modifiers & Qt.ControlModifier) { app.moveZoom(e.angleDelta.y > 0 ? -1 : 1); e.accepted = true }
@@ -627,9 +795,10 @@ C.ApplicationWindow {
                 }
                 Caption {
                     visible: app.cursorFraction >= 0
-                    text: app.timeText(app.timeAt(app.cursorFraction), true)
+                    text: app.selectingRange ? "Zoom to " + app.durationText(Math.abs(app.rangeAnchorMs - app.rangeEndMs))
+                                             : app.timeText(app.timeAt(app.cursorFraction), true)
                 }
-                Caption { visible: app.currentSession !== null && app.width >= 820 && app.cursorFraction < 0; text: "Click to focus  ·  Drag to pan  ·  Right-click to annotate"; font.pixelSize: 11 }
+                Caption { visible: app.currentSession !== null && workspace.width >= 820 && app.cursorFraction < 0; text: "Click to focus  ·  Drag to zoom  ·  Shift-drag to pan  ·  Right-click to annotate"; font.pixelSize: 11 }
                 Caption { visible: !!app.currentSession; text: "Interval"; font.pixelSize: 11 }
                 TraceCombo {
                     visible: !!app.currentSession; implicitHeight: 26; implicitWidth: 77
@@ -662,7 +831,8 @@ C.ApplicationWindow {
         id: noteDialog
         objectName: "noteDialog"
         modal: true
-        width: Math.min(app.width - 40, 425)
+        width: Math.min(app.width / app.uiScale - 40, 425)
+        scale: app.uiScale
         anchors.centerIn: parent
         padding: 18
         property double stamp: 0
@@ -698,7 +868,7 @@ C.ApplicationWindow {
         onAccepted: {
             const url = selectedFile
             Qt.callLater(() => {
-                workspace.grabToImage(result => {
+                viewport.grabToImage(result => {
                     app.exportStatus = result.saveToFile(url) ? "Graph image saved." : "Could not save the graph image."
                     exportMessageTimer.restart()
                 })
@@ -708,4 +878,7 @@ C.ApplicationWindow {
     Timer { id: exportMessageTimer; interval: 4500; onTriggered: app.exportStatus = "" }
     Shortcut { sequence: "Ctrl+Shift+S"; onActivated: app.chooseExport() }
     Shortcut { sequence: "Ctrl+L"; onActivated: { destination.forceActiveFocus(); destination.selectAll() } }
+    Shortcut { sequences: ["Ctrl++", "Ctrl+=", "Ctrl+Shift+=", "Ctrl+Shift++"]; onActivated: app.changeScale(preferences.scaleStep + 1) }
+    Shortcut { sequence: "Ctrl+-"; onActivated: app.changeScale(preferences.scaleStep - 1) }
+    Shortcut { sequence: "Ctrl+0"; onActivated: app.changeScale(0) }
 }

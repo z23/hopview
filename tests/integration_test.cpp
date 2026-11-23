@@ -29,7 +29,7 @@ qint64 fill(const QString &file, int rounds) {
         for (int h = 1; h <= hops; ++h) {
             const bool incident = i >= rounds - 170 && i < rounds - 140 && h >= 6;
             const bool lost = (incident && i % 6 == 0) || (h == 3 && i % 10 == 0);
-            const double delay = (incident ? 60 : 0) + h * 2.1 + 1.8 * std::abs(std::sin(i * .115 + h));
+            const double delay = (incident ? 210 : 0) + h * 2.1 + 1.8 * std::abs(std::sin(i * .115 + h));
             QString ip = QString("2001:db8:%1::1").arg(h);
             if (h == 6 && i < rounds - 120)
                 ip = "2001:db8:ef::2";
@@ -97,6 +97,9 @@ class Integration : public QObject {
     Q_OBJECT
   private slots:
     void desktop();
+    void latencyColors();
+    void tabControlsAndScale();
+    void rangeSelection();
     void replayWhileProbing();
 };
 
@@ -167,6 +170,158 @@ void Integration::desktop() {
     History persisted(db);
     auto view = persisted.view(id, note - 1, note + 1, note - 1, note + 1, {}, 32);
     QCOMPARE(view.value("notes").toList().first().toMap().value("text").toString(), QString("Test incident"));
+}
+
+void Integration::tabControlsAndScale() {
+    QTemporaryDir dir;
+    const auto db = dir.filePath("tabs.db");
+    const auto first = fill(db, 120);
+    History recorder(db);
+    const auto second = recorder.createSession(example, 6, 1000);
+    QVERIFY(second > first && first > 0);
+    {
+        Backend b(db);
+        Window ui(b);
+        QVERIFY(ui.win);
+        QVERIFY(waitFor([&] { return ui.win->isExposed(); }));
+        ui.win->requestActivate();
+        const auto scale = [&] { return ui.win->property("uiScale").toReal(); };
+        QTest::keyClick(ui.win, Qt::Key_0, Qt::ControlModifier);
+        QCOMPARE(scale(), 1.0);
+        QTest::keyClick(ui.win, Qt::Key_Plus, Qt::ControlModifier);
+        QVERIFY(waitFor([&] { return scale() > 1.0; }));
+        const double raised = scale();
+        auto *workspace = findItem(ui.win->contentItem(), "workspace");
+        QVERIFY(workspace);
+        QCOMPARE(workspace->scale(), raised);
+        QTest::keyClick(ui.win, Qt::Key_Plus, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(scale() > raised);
+        QTest::keyClick(ui.win, Qt::Key_Minus, Qt::ControlModifier);
+        QCOMPARE(scale(), raised);
+        QTest::keyClick(ui.win, Qt::Key_Minus, Qt::ControlModifier);
+        QCOMPARE(scale(), 1.0);
+        QTest::keyClick(ui.win, Qt::Key_Equal, Qt::ControlModifier);
+        QCOMPARE(scale(), raised);
+        auto clickControl = [&](QString name, Qt::MouseButton button) {
+            auto *item = findItem(ui.win->contentItem(), name);
+            QVERIFY2(item, qPrintable(name));
+            QTest::mouseClick(ui.win, button, Qt::NoModifier,
+                              item->mapToScene(item->boundingRect().center()).toPoint());
+        };
+        // Close the background tab with middle-click and the selected tab with its X.
+        clickControl("sessionTab" + QString::number(first), Qt::MiddleButton);
+        QVERIFY(waitFor([&] { return b.closedSessions().size() == 1; }));
+        QCOMPARE(b.sessionId(), second);
+        clickControl("closeTab" + QString::number(second), Qt::LeftButton);
+        QVERIFY(waitFor([&] { return b.sessions().isEmpty() && !b.sessionId(); }));
+        QVERIFY(b.snapshot().isEmpty());
+        QCOMPARE(b.closedSessions().size(), 2);
+        QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+    }
+    {
+        Backend b(db);
+        Window ui(b);
+        QVERIFY(ui.win);
+        QVERIFY(waitFor([&] { return ui.win->isExposed(); }));
+        QVERIFY(ui.win->property("uiScale").toReal() > 1.0);
+        QVERIFY(b.sessions().isEmpty());
+        QCOMPARE(b.closedSessions().size(), 2);
+        auto *button = findItem(ui.win->contentItem(), "reopenTraces");
+        QVERIFY(button && button->isVisible());
+        QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                          button->mapToScene(button->boundingRect().center()).toPoint());
+        QQuickItem *entry = nullptr;
+        QVERIFY(waitFor([&] {
+            entry = findItem(ui.win->contentItem(), "reopenTrace" + QString::number(first));
+            return entry && entry->isVisible() && entry->width() > 0;
+        }));
+        QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                          entry->mapToScene(entry->boundingRect().center()).toPoint());
+        QVERIFY(waitFor([&] { return b.sessionId() == first && rowFor(b, hops).value("sent").toInt() > 0; }));
+        QVERIFY(!b.running());
+        QTest::keyClick(ui.win, Qt::Key_0, Qt::ControlModifier);
+        QCOMPARE(ui.win->property("uiScale").toReal(), 1.0);
+        QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+    }
+}
+
+void Integration::rangeSelection() {
+    QTemporaryDir dir;
+    const auto db = dir.filePath("zoom.db");
+    const auto id = fill(db, testRounds);
+    Backend b(db);
+    Window ui(b);
+    QVERIFY(ui.win);
+    QVERIFY(waitFor([&] { return ui.win->isExposed() && fresh(b) && !rowFor(b, hops).isEmpty(); }));
+    b.toggleHop(6);
+    QVERIFY(waitFor([&] { return b.snapshot().value("charts").toList().size() == 2; }));
+    const auto initial = b.viewEnd() - b.viewStart();
+    for (bool reverse : {false, true}) {
+        auto *plot = findItem(ui.win->contentItem(), "timelineInput" + QString::number(reverse ? 6 : hops));
+        QVERIFY(plot && plot->isVisible());
+        auto point = [&](double fraction) {
+            return plot->mapToScene({plot->width() * fraction, plot->height() * .5}).toPoint();
+        };
+        const QPoint a = point(reverse ? .71 : .31), z = point(reverse ? .23 : .63);
+        const qint64 before = b.viewStart(), span = b.viewEnd() - before;
+        auto stamp = [&](QPoint p) {
+            return before + qRound64(plot->mapFromScene(p).x() / plot->width() * span);
+        };
+        const auto min = std::min(stamp(a), stamp(z)), max = std::max(stamp(a), stamp(z));
+        QTest::mousePress(ui.win, Qt::LeftButton, Qt::NoModifier, a);
+        QTest::mouseMove(ui.win, z, 20);
+        QVERIFY(ui.win->property("selectingRange").toBool());
+        QTest::mouseRelease(ui.win, Qt::LeftButton, Qt::NoModifier, z);
+        QVERIFY(waitFor([&] { return fresh(b) && b.viewEnd() - b.viewStart() < span; }));
+        QVERIFY(std::abs(b.viewStart() - min) <= 1 && std::abs(b.viewEnd() - max) <= 1);
+        QCOMPARE(b.focusStart(), b.viewStart());
+        QCOMPARE(b.focusEnd(), b.viewEnd());
+        QVERIFY(!b.live());
+        QCOMPARE(b.sessionId(), id);
+    }
+    auto *plot = findItem(ui.win->contentItem(), "timelineInput12");
+    QVERIFY(plot);
+    const auto left = plot->mapToScene({70, 30}).toPoint(), right = plot->mapToScene({150, 30}).toPoint();
+    auto from = b.viewStart(), length = b.viewEnd() - from;
+    QTest::mousePress(ui.win, Qt::LeftButton, Qt::ShiftModifier, left);
+    QTest::mouseMove(ui.win, right, 20);
+    QTest::mouseRelease(ui.win, Qt::LeftButton, Qt::ShiftModifier, right);
+    QVERIFY(waitFor([&] { return fresh(b) && b.viewStart() < from; }));
+    QCOMPARE(b.viewEnd() - b.viewStart(), length);
+    b.setViewSeconds(300);
+    QCOMPARE(b.viewEnd() - b.viewStart(), initial);
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
+void Integration::latencyColors() {
+    const QColor background("#121c25");
+    QQuickWindow window;
+    window.setColor(background);
+    window.resize(320, 240);
+    GraphView timeline(window.contentItem());
+    timeline.setSize(QSizeF(320, 240));
+    timeline.setCeiling(300);
+    window.show();
+    QVERIFY(waitFor([&] { return window.isExposed(); }));
+    const auto image = window.grabWindow();
+    QVERIFY(!image.isNull());
+    const auto pixelAt = [&](const QImage &frame, double fraction) {
+        const auto y = timeline.height() - 2 - fraction * (timeline.height() - 5);
+        return frame.pixelColor(qRound(55 * frame.devicePixelRatio()), qRound(y * frame.devicePixelRatio()));
+    };
+    const auto normal = pixelAt(image, 95.0 / 300);
+    const auto amber = pixelAt(image, 105.0 / 300);
+    const auto red = pixelAt(image, 205.0 / 300);
+    QCOMPARE(normal, background);
+    QCOMPARE(pixelAt(image, 195.0 / 300), amber);
+    QVERIFY(amber.red() > normal.red() + 8 && amber.green() > normal.green() + 5);
+    QVERIFY(red.red() > amber.red() && red.green() < amber.green());
+
+    // A fast route can fill the vertical axis without reaching the warning threshold.
+    timeline.setCeiling(80);
+    const auto fast = window.grabWindow();
+    QVERIFY(!fast.isNull());
+    QCOMPARE(pixelAt(fast, 0.9), normal);
 }
 
 void Integration::replayWhileProbing() {
@@ -242,11 +397,28 @@ void Integration::replayWhileProbing() {
     QCOMPARE(rowFor(b, 1).value("sent").toInt(), paused);
     b.toggleRunning();
     QVERIFY(waitFor([&] { return b.running() && rowFor(b, 1).value("sent").toInt() > paused; }));
+    b.selectSession(ref);
+    b.closeSession(v6);
+    QVERIFY(waitFor([&] { return b.closedSessions().size() == 1; }));
+    QCOMPARE(b.sessionId(), ref);
+    b.reopenSession(v6);
+    QVERIFY(waitFor([&] { return b.sessionId() == v6 && !b.running() && fresh(b); }));
+    QTest::qWait(800);
+    b.goLive();
+    QVERIFY(waitFor([&] { return fresh(b); }));
+    const auto stoppedEnd = b.viewEnd();
+    QTest::qWait(800);
+    b.goLive();
+    QCOMPARE(b.viewEnd(), stoppedEnd);
     QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
 }
 } // namespace
 
 int main(int argc, char **argv) {
+    QTemporaryDir config;
+    if (!config.isValid())
+        return 1;
+    qputenv("XDG_CONFIG_HOME", QFile::encodeName(config.path()));
     QGuiApplication app(argc, argv);
     QQuickStyle::setStyle("Basic");
     qmlRegisterType<GraphView>("Hopline.Graphics", 1, 0, "GraphView");
