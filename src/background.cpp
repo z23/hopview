@@ -165,7 +165,7 @@ void BackgroundInstance::notify(const QVariantMap &event) {
     auto message = QDBusMessage::createMethodCall("org.freedesktop.Notifications",
         "/org/freedesktop/Notifications", "org.freedesktop.Notifications", "Notify");
     const double latency = event["latency"].toDouble();
-    const auto summary = QString("%1 — %2").arg(event["target"].toString().toHtmlEscaped(), event["label"].toString());
+    const auto summary = QString("%1 — %2").arg(event.value("sourceLabel", event["target"]).toString().toHtmlEscaped(), event["label"].toString());
     const auto body = tr("Destination loss %1% · Mean RTT %2")
         .arg(QString::number(event["loss"].toDouble(), 'f', 1),
              latency < 0 ? tr("unavailable") : QString::number(latency, 'f', 1) + " ms");

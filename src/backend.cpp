@@ -3,6 +3,7 @@
 #include "backend.h"
 #include "history.h"
 #include "routeevents.h"
+#include "diagnostics.h"
 #include "probe.h"
 #include <QDateTime>
 #include <QHostInfo>
@@ -25,6 +26,7 @@ qint64 now() { return QDateTime::currentMSecsSinceEpoch(); }
 
 Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_historyPath(file) {
     m_exports.setMaxThreadCount(1);
+    m_baselinePool.setMaxThreadCount(1);
     m_writerContext = contextOn(m_writerThread);
     m_readContext = contextOn(m_readThread);
     m_probe = new Probe;
@@ -38,6 +40,8 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
             m_ready = m_writer->open();
             if (m_ready) {
                 m_sessions = m_writer->sessions();
+                m_diagnosticsSettings = m_writer->diagnosticsSettings();
+                m_groupNames = m_writer->groupNames();
                 const auto settings = m_writer->monitoringSettings();
                 m_resumeSessions = settings["active"].toList();
                 m_background = settings["background"].toBool();
@@ -64,6 +68,7 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
         info["running"] = false;
         (info.take("closed").toBool() ? m_closedSessions : m_sessions).append(info);
     }
+    for (auto &event : m_alertEvents) event = labelAlert(event.toMap());
     connect(m_probe, &Probe::status, this, [this](qint64 id, QString message, bool fatal) {
         if (!m_active.contains(id))
             return;
@@ -90,14 +95,25 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
         }
     });
     m_refresh.start();
+    m_remotePoll.setInterval(2000);
+    connect(&m_remotePoll,&QTimer::timeout,this,&Backend::pollReceiver);
+    m_remotePoll.start();
     if (!m_sessions.isEmpty())
         selectSession(m_sessions.first().toMap().value("id").toLongLong());
 }
 
 Backend::~Backend() {
+    m_remotePoll.stop();
     m_refresh.stop();
     m_coalesce.stop();
+    cancelBaseline();
+    m_baselinePool.waitForDone();
     m_exports.waitForDone();
+    if (m_diagnostics) {
+        QMetaObject::invokeMethod(m_diagnostics, &Diagnostics::shutdown, Qt::BlockingQueuedConnection);
+        m_diagnosticThread.quit();
+        m_diagnosticThread.wait();
+    }
     QMetaObject::invokeMethod(m_probe, [this] { m_probe->shutdown(); }, Qt::BlockingQueuedConnection);
     m_collectorThread.quit();
     m_collectorThread.wait();
@@ -168,12 +184,12 @@ void Backend::flushSamples() {
         return;
     }
     if (!eventIds.isEmpty()) {
-        auto events = m_writer->alertEvents(eventIds.front() - 1);
-        QMetaObject::invokeMethod(this, [this, events] {
-            m_alertEvents = (events + m_alertEvents).mid(0, 200);
-            emit alertsChanged();
-            for (auto it = events.crbegin(); it != events.crend(); ++it)
-                emit destinationAlert(it->toMap());
+        QMetaObject::invokeMethod(this,[this] {
+            const auto last = m_alertEvents.isEmpty() ? 0LL : m_alertEvents.first().toMap()["id"].toLongLong();
+            QMetaObject::invokeMethod(m_readContext,[this,last] {
+                const auto events = m_reader->alertEvents(last);
+                QMetaObject::invokeMethod(this,[this,events] { publishAlerts(events); });
+            });
         });
     }
     QHash<qint64, qint64> ends;
@@ -263,15 +279,19 @@ void Backend::toggleComparison(qint64 id) {
     scheduleView();
 }
 
-void Backend::exportIncident(qint64 id, qint64 from, qint64 through, QUrl file, bool csv) {
+void Backend::exportIncident(qint64 id, qint64 from, qint64 through, QUrl file, bool csv, QVariantList peers, QVariantList pinned) {
     if (!m_ready || !id || !file.isLocalFile()) {
         emit incidentExported(false, tr("Choose a local output file."));
         return;
     }
     const auto path = file.toLocalFile();
-    m_exports.start([this, id, from, through, path, csv] {
+    QList<qint64> members;
+    for (const auto &peer : peers) members.append(peer.toLongLong());
+    QList<int> hops;
+    for (const auto &hop : pinned) hops.append(hop.toInt());
+    m_exports.start([this, id, from, through, path, csv, members, hops] {
         History reader(m_historyPath);
-        const bool ok = reader.exportIncident(id, from, through, path, csv);
+        const bool ok = reader.exportIncident(id, from, through, path, csv, members, hops);
         const auto message = ok ? tr("Saved incident to %1").arg(path) : reader.error();
         QMetaObject::invokeMethod(this, [this, ok, message] { emit incidentExported(ok, message); });
     });
@@ -383,12 +403,13 @@ void Backend::setActive(qint64 id, bool active) {
         entry = info;
         break;
     }
+    syncDiagnostics(id);
     persistRecordingSet();
     emit sessionsChanged();
 }
 void Backend::runSession(qint64 id) {
     const auto info = sessionInfo(id);
-    if (m_replayMode || !m_ready || info.isEmpty())
+    if (m_replayMode || info.value("remoteLive").toBool() || info.value("remote").toBool() || info.value("imported").toBool() || !m_ready || info.isEmpty())
         return;
     QMetaObject::invokeMethod(m_writerContext, [this, id] {
         if (!m_writer->resetAlertWindow(id)) {
@@ -407,7 +428,7 @@ void Backend::runSession(qint64 id) {
     });
 }
 void Backend::setIntervalMs(int intervalMs) {
-    if (m_replayMode || !m_session || intervalMs < 250 || intervalMs > 60000)
+    if (m_replayMode || sessionInfo(m_session).value("remoteLive").toBool() || sessionInfo(m_session).value("imported").toBool() || !m_session || intervalMs < 250 || intervalMs > 60000)
         return;
     const qint64 id = m_session;
     QMetaObject::invokeMethod(m_writerContext, [this, id, intervalMs] {
@@ -449,8 +470,10 @@ void Backend::saveNote(qint64 stamp, const QString &text) {
         QMetaObject::invokeMethod(this, [this, id, ok, error] {
             if (!ok)
                 setStatus(error);
-            else if (id == m_session)
-                scheduleView();
+            else {
+                ++m_revisions[id];
+                if (id == m_session || m_comparisons.contains(id)) scheduleView();
+            }
         });
     });
 }
@@ -473,7 +496,9 @@ void Backend::selectSession(qint64 id) {
         return;
     if (m_session)
         m_views[m_session] = {m_hops, m_spanMs, m_focusSecs, m_live, m_viewEnd, m_focusCenter, m_comparisons};
+    cancelBaseline();
     m_session = id;
+    emit baselineChanged();
     const auto saved = m_views.value(id);
     m_hops = saved.hops;
     m_spanMs = saved.spanMs;
@@ -486,7 +511,9 @@ void Backend::selectSession(qint64 id) {
     emit selectionChanged();
     emit sessionsChanged();
     emit snapshotChanged();
-    setStatus(id ? m_messages.value(id, tr("Recorded session")) : QString());
+    const auto origin = sessionInfo(id);
+    const auto label = origin.value("remoteLive").toBool() ? tr("Receiving telemetry from %1").arg(origin.value("location").toString()) : tr("Recorded session");
+    setStatus(id ? m_messages.value(id, label) : QString());
     if (!id) {
         ++m_version;
         m_pending = false;
@@ -516,6 +543,7 @@ void Backend::changeTabVisibility(qint64 id, bool closed, qint64 fromMs, qint64 
                     continue;
                 auto info = from.takeAt(i).toMap();
                 if (closed && m_active.remove(id)) {
+                    syncDiagnostics(id);
                     persistRecordingSet();
                     info["running"] = false;
                     m_messages[id] = tr("Paused");
@@ -702,6 +730,8 @@ void Backend::fetchView() {
                 auto chart = entry.charts.value(0).toMap();
                 chart["comparisonId"] = peerId;
                 chart["target"] = peer.value("target");
+                for (const auto &key : {"location", "resolvedAddress", "clockOffsetMs", "clockErrorMs", "manualCorrectionMs"})
+                    chart[key] = peer.value(key);
                 chart["family"] = peer.value("family");
                 chart["intervalMs"] = peer.value("intervalMs");
                 if (!chart.contains("buckets"))
@@ -711,6 +741,8 @@ void Backend::fetchView() {
                 nextCache.insert(peerId, std::move(entry));
             }
             m_comparisonCache.swap(nextCache);
+            view["diagnostics"] = m_reader->diagnosticTracks(id, start, end, pixels);
+            if (!m_reader->error().isEmpty()) error = m_reader->error();
             view["charts"] = charts;
             view["timeMax"] = maximum;
             view["focusStart"] = fs;
@@ -848,6 +880,7 @@ void Backend::setBackgroundEnabled(bool enabled) {
 
 void Backend::setWindowVisible(bool visible) {
     m_windowVisible = visible;
+    if (visible) pollReceiver();
     if (visible && m_session) {
         if (m_live) {
             m_viewEnd = latest();
@@ -884,4 +917,62 @@ void Backend::showAlert(qint64 id, qint64 from, qint64 through) {
         selectSession(id);
         zoomToRange(from, through);
     }
+}
+
+void Backend::setDiagnostics(qint64 id, QString url, QString interfaceName, int seconds) {
+    const auto source = sessionInfo(id);
+    if (!m_ready || m_replayMode || source.isEmpty() || source.value("remote").toBool() ||
+        source.value("imported").toBool()) {
+        emit diagnosticSettingsSaved(id,
+                                     tr("Only local traces can collect service and interface measurements."));
+        return;
+    }
+    url = url.trimmed();
+    QMetaObject::invokeMethod(m_writerContext, [this, id, url, interfaceName, seconds] {
+        const bool ok = m_writer->saveDiagnostics(id, url, interfaceName, seconds);
+        const auto error = m_writer->error();
+        QMetaObject::invokeMethod(this, [this, id, url, interfaceName, seconds, error, ok] {
+            if (!ok) {
+                setStatus(error);
+                emit diagnosticSettingsSaved(id, error);
+                return;
+            }
+            const auto key = QString::number(id);
+            if (url.isEmpty() && interfaceName.isEmpty())
+                m_diagnosticsSettings.remove(key);
+            else
+                m_diagnosticsSettings[key] =
+                    QVariantMap{{"url", url}, {"interface", interfaceName}, {"seconds", seconds}};
+            syncDiagnostics(id);
+            emit diagnosticsChanged();
+            emit diagnosticSettingsSaved(id, {});
+        });
+    });
+}
+
+void Backend::syncDiagnostics(qint64 id) {
+    const auto info = sessionInfo(id);
+    const bool local = m_active.contains(id) && !m_replayMode && !info.value("remote").toBool() &&
+                       !info.value("imported").toBool();
+    const auto config = local ? m_diagnosticsSettings.value(QString::number(id)).toMap() : QVariantMap{};
+    if (!m_diagnostics && config.isEmpty())
+        return;
+    if (!m_diagnostics) {
+        m_diagnostics = new Diagnostics;
+        m_diagnostics->moveToThread(&m_diagnosticThread);
+        connect(&m_diagnosticThread, &QThread::finished, m_diagnostics, &QObject::deleteLater);
+        // Backpressure stays on the diagnostics thread when storage is slow.
+        connect(m_diagnostics, &Diagnostics::observation, m_writerContext,
+                [this](qint64 id, const QVariantMap &record) {
+                    if (!m_writer->appendDiagnostic(id, record)) {
+                        const auto error = m_writer->error();
+                        QMetaObject::invokeMethod(this, [this, error] { setStatus(error); });
+                    }
+                }, Qt::BlockingQueuedConnection);
+        m_diagnosticThread.start();
+    }
+    QMetaObject::invokeMethod(m_diagnostics, [this, id, config, info] {
+        m_diagnostics->configure(id, config, info.value("family").toInt(),
+                                 info.value("interfaceName").toString());
+    });
 }

@@ -1,0 +1,12 @@
+{
+  "site": "melbourne-vm",
+  "receiver": "telemetry.example.net",
+  "port": 8347,
+  "tokenFile": "melbourne-vm.token",
+  "spool": "/var/lib/hopline-collector/outbox.sqlite",
+  "spoolMiB": 64,
+  "targets": [
+    {"target": "service.example.net", "family": 4, "protocol": "tcp", "port": 443, "intervalMs": 1000},
+    {"target": "service.example.net", "family": 6, "protocol": "tcp", "port": 443, "intervalMs": 1000}
+  ]
+}

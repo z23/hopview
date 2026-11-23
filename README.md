@@ -1,12 +1,12 @@
 # Hopline
 
-![A selected latency spike in two synchronized timelines raises the average and loss in the corresponding hop rows.](docs/trace.png)
+![Hopline showing hop-by-hop latency, an upstream latency spike, service timing and network interface activity.](docs/trace.png)
 
 Hopline is a native Linux continuous traceroute client. It records IPv4 and IPv6 probes, plots latency and loss at each hop, and lets you investigate an earlier incident while collection continues.
 
 ## Build and run
 
-Install a C++20 compiler, make, pkg-config, Qt 6 Base and Declarative development files (including qmake6, Quick Controls and Quick Dialogs), and the SQLite 3 development files. Build from the project directory.
+Install a C++20 compiler, make, pkg-config, libcurl development files, Qt 6 Base and Declarative development files (including qmake6, Quick Controls and Quick Dialogs), and the SQLite 3 development files. Build from the project directory.
 
 ```sh
 bin/build
@@ -39,17 +39,27 @@ The **Probes** menu selects ICMP, UDP, or TCP and an outgoing interface for the 
 - **Close a trace tab** with its × button or a middle-click. Closing stops collection and keeps the recording. Use the closed-traces menu to reopen it, including after restarting Hopline.
 - **Pause** stops collection for that tab. Resume appends to the same session. Switching tabs preserves the current focus and pinned hops for the duration of the app session. By default, closing the window stops collection. Reopen Hopline to review the recording or resume a trace.
 
+## Compare a healthy period with an incident
+
+Zoom to the bad interval, then choose **Trace actions → Compare time ranges**. By default Hopline compares the focused interval with the immediately preceding interval of the same duration. To choose a different baseline, select the healthy interval first, choose **Mark focus as baseline**, then select the incident and open the comparison. The mark belongs to that trace for the current app session.
+
+The destination and hop rows show replies/sent, median RTT, p95 RTT, loss and the longest run of consecutive recorded timeouts in each period. RTT uses raw replies and nearest-rank p95. Empty periods display a dash for loss and latency. Hopline estimates the historical probe interval using nearby recorded rounds. A gap longer than three of those intervals, with a three-second minimum, breaks a timeout streak. When neighboring rounds provide no cadence evidence, Hopline uses the trace’s configured interval. A responder change lists the addresses observed in each period. The comparison runs on a separate reader while collection continues.
+
 ## Compare destinations
 
 Open at least two traces, then choose **Compare…** above the timelines. Select the other destinations to display beneath the active trace. All tracks share the same time axis and RTT scale. Hover over a spike to read latency and loss at the same instant for every destination. Drag across any track to zoom them together. The route profile belongs to the active tab. A blank stretch means that recording has no samples for that period. A timeout is a recorded probe and contributes to loss.
+
+To keep a comparison, enter a name in **Compare…** and choose **Save group**. A group remembers the primary trace, ordered comparison destinations, pinned hops, zoom and focus. A live group follows the latest samples when reopened. A group saved on a historical interval returns to those timestamps. Choose the name and **Open group** to restore it after restarting Hopline. Archived member tabs reopen for review. **Update group** saves the current selection under an existing name, and **Remove** deletes the bookmark.
+
+To bring a recording from another site onto the same graphs, choose **Trace actions → Add recording to comparison**. The site name fills in missing location labels. By default, all measurements use their recorded UTC timestamps. If you know a collector clock ran 250 ms fast, enter `-250` to move its evidence back by that amount. Hopline shifts probes, notes, and diagnostic observations together and shows the applied adjustment in the tab tooltip. Imported tabs retain their recorded data across restarts. An import into a replay window lasts until that window closes.
 
 For example, monitor your gateway, a public endpoint, and the service you are troubleshooting. A spike that begins at the same time on all three points you toward the shared part of the path. A spike seen only on the service gives you a different set of hops to investigate. To compare address families, trace the same hostname twice and select IPv4 on one trace and IPv6 on the other.
 
 ## Share an incident
 
-Drag across the incident, then choose **Trace actions → Export focus as CSV** or **Save replayable incident**. Both commands capture the active target and the time range used for the hop table. **Focus → All** exports its whole recording. CSV contains exact UTC timestamps, per-hop RTTs or timeouts, responder addresses, destination flags, annotations and probe settings. Each actual probe appears once.
+Drag across the incident, then choose **Trace actions → Export focus as CSV** or **Save replayable incident**. Both commands capture the active target and every selected comparison destination over the same focus interval. **Focus → All** uses the active recording’s full time span. CSV rows identify the trace, target, IP family, location, probe settings and UTC timestamp. Each real probe appears once, with its responder and RTT or timeout. Notes retain their source trace and timestamp. Recorded service and interface observations appear in the `diagnostic_json` column.
 
-Open a portable recording with **Trace actions → Open incident**, the empty window’s **Open incident** button, or the command below. A separate offline window opens at the saved interval with the original settings and annotations. Its temporary database is discarded when you close it.
+Open a portable recording with **Trace actions → Open incident**, the empty window’s **Open incident** button, or the command below. A separate offline window opens at the saved interval with the primary trace, comparison destinations, pinned hops, settings, measurements and annotations. Single-trace incidents from version 0.3 also open. Its temporary database is discarded when you close it.
 
 ```sh
 ./build/hopline --replay outage.hopline
@@ -88,6 +98,8 @@ A writer batches samples into SQLite WAL transactions. An independent reader com
 ```sh
 bin/test
 python3 tests/replay-cli.py
+python3 tests/telemetry.py --viewer build-tests/integration/integration_test
+python3 tests/diagnostics-loopback.py
 tests/probe-netns.sh
 python3 tests/background-recorder.py
 build-tests/history/history_test --benchmark
@@ -98,3 +110,17 @@ QT_QPA_PLATFORMTHEME=generic QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software
 The recorder test checks background close, relaunch and restart against loopback. Add `--notifications` to test delivery through a private D-Bus daemon with dbus-python and PyGObject installed.
 
 The regular suite checks historical statistics, reroutes, notes, session state and the real Qt window. The namespace test sets up an isolated two-hop network and checks IPv4, IPv6, ICMP, fixed-port UDP, open and refused TCP connections, interface selection, link-local addressing and timeout accounting through the CLI. It requires user/network namespaces, iproute2, util-linux and Python 3. The last test replays 25 hours of recorded observations with 24 hours visible, repeatedly changes historical focus, captures rendered frames, and measures the spacing of two simultaneous live loopback traces.
+
+## Linux VM collectors
+
+Run the headless collector on each VM and send its locally configured IPv4 or IPv6 traces to the same receiver over TLS. Open the receiver's history in Hopline. **Trace actions → Remote sources** shows original capture times, upload freshness and clock estimates. Choose **Compare…** to view a destination from several locations. The [deployment guide](docs/telemetry.md) covers site credentials, clock alignment, disconnected recording and systemd.
+
+## Service timing and local interface activity
+
+Open **Trace actions → Service and interface** on a local trace. Enter an HTTP or HTTPS URL and choose its check interval, or select a network interface. Save and start or resume the trace. The settings persist with that trace. Clear the URL or choose **Off** to end either measurement independently.
+
+Each service check makes one fresh HEAD request, using the trace’s IP-family choice and outgoing interface. The four lines show name lookup, TCP connection, TLS handshake, and the wait from transfer readiness to the first response byte. Hover for the contacted IP, address family, HTTP status, cumulative time to first byte (TTFB), total time and any error. Literal IPs skip DNS and plain HTTP skips TLS. A missing phase appears as a dash. Redirect responses are recorded at the requested endpoint. Checks use direct connections and verify HTTPS certificates against the system trust store.
+
+The interface graph samples Linux device counters roughly every two seconds. RX and TX show bytes per second for all traffic on the device. Markers identify observed carrier or Wi-Fi access-point changes and increases in drop or error counters. First samples, collection gaps and counter resets leave a break in the rates. BSSID readings use the driver’s wireless interface or NetworkManager when available. Transitions shorter than the sample interval can go unobserved.
+
+The tracks share the RTT timeline’s cursor, time window and drag-to-zoom gesture. In long windows each column retains an observed peak and the most recent event marker in that column. Hover over a marker for its sample. Replays use the recorded observations.

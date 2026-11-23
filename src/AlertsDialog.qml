@@ -27,7 +27,7 @@ C.Dialog {
         traceId = backend.sessionId
         target = ""
         for (const trace of backend.sessions)
-            if (trace.id === traceId) target = trace.target
+            if (trace.id === traceId) target = trace.location ? trace.location + " · " + trace.target : trace.target
         const rule = backend.alertRules[String(traceId)]
         latency = rule ? rule.latency : 0
         loss = rule ? rule.loss : 0
@@ -130,7 +130,7 @@ C.Dialog {
                 objectName: "alertEvent" + modelData.id
                 width: events.width - 12
                 implicitHeight: summary.implicitHeight + 14
-                Accessible.name: modelData.target + " " + modelData.label + ", view interval"
+                Accessible.name: (modelData.sourceLabel || modelData.target) + " " + modelData.label + ", view interval"
                 background: Rectangle {
                     color: row.hovered || row.visualFocus ? "#243442" : "#16212b"
                 }
@@ -139,7 +139,7 @@ C.Dialog {
                     spacing: 3
                     Label {
                         Layout.fillWidth: true
-                        text: row.modelData.label + " · " + row.modelData.target
+                        text: row.modelData.label + " · " + (row.modelData.sourceLabel || row.modelData.target)
                         color: row.modelData.recovered ? "#8cdac2" : "#ed9696"
                     }
                     Label {

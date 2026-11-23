@@ -325,6 +325,156 @@ void testUpgrade(const QString &file) {
             "Reconstruct destination and lost rounds");
 }
 
+void testComparisonEvidence(const QTemporaryDir &dir) {
+    const auto db = dir.filePath("group-source.db"), file = dir.filePath("two-locations.hopline");
+    const auto csv = dir.filePath("group.csv");
+    const qint64 t = 1700000000000;
+    History h(db);
+    auto primary = h.createSession("edge.example", 6, 1000, "tcp", 443);
+    auto peer = h.createSession("edge.example", 4, 1000, "udp", 5001);
+    require(h.setSessionOrigin(peer, "Melbourne", "192.0.2.1", -75, 9, t + 2000), "Set collector metadata");
+    require(h.append({{primary, t, 1, "::1", 10, true},
+                      {primary, t + 1000, 1, "::1", 12, true},
+                      {peer, t, 1, "192.0.2.1", 55, true},
+                      {peer, t + 1000, 1, {}, -1, false}}),
+            "Write site probes");
+    require(h.addNote(primary, t + 20, "primary annotation") && h.addNote(peer, t + 120, "peer annotation"),
+            "Write notes");
+    const QVariantMap service{{"kind", "service"},
+                              {"t", t + 400},
+                              {"periodMs", 1000},
+                              {"event", "HTTP 503"},
+                              {"url", "https://edge.example/"},
+                              {"address", "192.0.2.1"},
+                              {"status", 503},
+                              {"family", 4},
+                              {"error", ""},
+                              {"dns", 1.0},
+                              {"connect", 2.0},
+                              {"tls", 3.0},
+                              {"firstByte", 7.0},
+                              {"total", 13.5}};
+    require(h.appendDiagnostic(peer, service), "Write service observation");
+    require(h.saveGroup("Offices", {primary, peer}, {0, 1}) && h.setTabClosed(peer, true),
+            "Save group before archive");
+    History reopened(db);
+    QList<qint64> members;
+    QList<int> hops;
+    require(reopened.groupNames() == QStringList{"Offices"} && reopened.openGroup("Offices", members, hops),
+            "Persist group");
+    require(members == QList<qint64>{primary, peer} && hops == QList<int>{0, 1} &&
+                !reopened.sessions().first().toMap()["closed"].toBool(),
+            "Restore original order and archived member");
+    require(!h.saveGroup("Offices", {primary, 999999}, {0}) && h.openGroup("Offices", members, hops) &&
+                members == QList<qint64>{primary, peer},
+            "Rejected update preserves existing group");
+    require(h.exportIncident(primary, t, t + 1000, file, false, {peer}, {1, 0}), "Export group replay");
+    require(h.exportIncident(primary, t, t + 1000, csv, true, {peer}), "Export marked CSV");
+    QFile readCsv(csv);
+    require(readCsv.open(QIODevice::ReadOnly), "Read comparison CSV");
+    const auto bytes = readCsv.readAll();
+    require(bytes.count("\"probe\"") == 4 && bytes.count("\"note\",\"2023") == 2 &&
+                bytes.contains("Melbourne") && bytes.contains("\"service\",\"2023") &&
+                bytes.contains("HTTP 503"),
+            "CSV includes all tracks, site and service evidence");
+
+    History imported(dir.filePath("combined.db"));
+    const auto existing = imported.createSession("existing", 4, 250);
+    IncidentRange range;
+    QString error;
+    require(importIncident(file, imported, range, error, "London", -100), qPrintable(error));
+    require(range.from == t - 100 && range.through == t + 900 && range.pinnedHops == QList<int>{1, 0} &&
+                range.sessions.size() == 2 && !range.sessions.contains(existing),
+            "Restore imported selection, alignment and pins");
+    const auto sessionRows = imported.sessions();
+    const auto primaryMeta = sessionRows[1].toMap(), peerMeta = sessionRows[0].toMap();
+    require(primaryMeta["location"] == "London" && peerMeta["location"] == "Melbourne" &&
+                peerMeta["resolvedAddress"] == "192.0.2.1" && peerMeta["clockOffsetMs"] == -75 &&
+                peerMeta["clockErrorMs"] == 9 && peerMeta["manualCorrectionMs"] == -100 &&
+                peerMeta["imported"].toBool() && !peerMeta["remoteLive"].toBool(),
+            "Preserve site and distinguish observed versus applied offset");
+    const auto view = imported.view(range.sessions[1], range.from, range.through, range.from, range.through,
+                                    {0}, 200, true);
+    require(view["notes"].toList().first().toMap()["timeMs"] == t + 20 &&
+                view["charts"].toList().first().toMap()["notes"].toList().first().toMap()["text"] ==
+                    "peer annotation",
+            "Peer annotations retain ownership and corrected timestamps");
+    QVariantList diagnostics;
+    require(imported.eachDiagnostic(range.sessions[1], range.from, range.through,
+                                    [&](const auto &v) { diagnostics.append(v); }) &&
+                diagnostics.size() == 1 && diagnostics.first().toMap()["t"] == t + 300 &&
+                diagnostics.first().toMap()["status"] == 503,
+            "Merged historical service check remains aligned");
+
+    QFile malformed(file);
+    require(malformed.open(QIODevice::ReadWrite) && malformed.resize(malformed.size() - 12),
+            "Truncate multi-trace export");
+    malformed.close();
+    require(!importIncident(file, imported, range, error) && imported.sessions() == sessionRows,
+            "Malformed late record cannot leave partial traces in a live workspace");
+    require(reopened.deleteGroup("Offices") && reopened.groupNames().isEmpty() &&
+                reopened.sessions().size() == 2,
+            "Removing a bookmark preserves recordings");
+}
+
+void testPeriodComparison(const QString &file) {
+    History h(file);
+    const auto id = h.createSession("dual.example",6,1000);
+    const qint64 t = 1700000000000;
+    QVector<Sample> batch;
+    for (int i=1; i<=20; ++i) batch.append({id,t+i*1000,1,"2001:db8::a",double(i),true});
+    for (int i=1; i<=6; ++i) {
+        const auto stamp = t + (i <= 3 ? i+20 : i+100) * 1000;
+        batch.append({id,stamp,1,i == 6 ? "2001:db8::b" : "",i == 6 ? 200. : -1.,i == 6});
+    }
+    require(h.append(batch),"Seed baseline percentiles and gaps");
+    const auto rows = h.comparePeriods(id,t,t+20000,t+21000,t+106000,[]{return false;});
+    require(rows.size() == 2,"Compare destination and real hop");
+    const auto row = rows.last().toMap();
+    const auto a = row["baseline"].toMap(), b = row["incident"].toMap();
+    require(a["median"].toDouble()==10.5 && a["p95"].toDouble()==19 && a["sent"]==20,"Exact median and nearest-rank p95");
+    require(b["received"]==1 && b["longest"]==3 && b["median"]==200 && b["p95"]==200 && row["changed"].toBool(),
+            "Loss runs stop at a recording gap and responders change");
+    const auto empty = h.comparePeriods(id,t-3,t-1,t,t+2000,[]{return false;}).first().toMap()["baseline"].toMap();
+    require(empty["sent"]==0 && empty["p95"]==-1 && empty["loss"]==-1,"Distinguish missing period from loss");
+
+    const auto slow = h.createSession("cadence.example", 4, 10000);
+    const auto tail = t + 180000;
+    require(h.append({{slow, t, 1, {}, -1, false},
+                      {slow, t + 10000, 1, {}, -1, false},
+                      {slow, t + 20000, 1, {}, -1, false},
+                      {slow, tail, 1, {}, -1, false},
+                      {slow, tail + 10000, 1, {}, -1, false}}) &&
+                h.setInterval(slow, 250),
+            "Record at ten seconds, then change active setting");
+    auto longest = [&](qint64 session, qint64 first, qint64 last, int hop = 0) {
+        const auto compared = h.comparePeriods(session, first, last, first, last, [] { return false; });
+        for (const auto &value : compared) {
+            const auto row = value.toMap();
+            if (row["hop"].toInt() == hop)
+                return row["incident"].toMap()["longest"].toInt();
+        }
+        return -1;
+    };
+    require(longest(slow, t, tail + 10000) == 3 && longest(slow, t + 10000, t + 20000) == 2,
+            "Old cadence survives a new setting and a selection containing only two rounds");
+    const auto sparse = h.createSession("sparse.example", 4, 10000);
+    require(h.append({{sparse, t, 1, {}, -1, false}, {sparse, t + 10000, 1, {}, -1, false}}),
+            "Write sparse history");
+    require(longest(sparse, t, t + 10000) == 2 && h.setInterval(sparse, 1000) &&
+                longest(sparse, t, t + 10000) == 1,
+            "Use configured cadence when the recording has only two samples");
+    const auto missing = h.createSession("shorter-route.example", 4, 60000);
+    QVector<Sample> partial;
+    for (int i = 0; i < 31; ++i) {
+        partial.append({missing, t + i * 1000, 1, "192.0.2.1", 10, true});
+        if (i % 10 == 0)
+            partial.append({missing, t + i * 1000, 2, {}, -1, false});
+    }
+    require(h.append(partial) && longest(missing, t, t + 30000, 2) == 1,
+            "Absent hops break streaks when faster rounds continue");
+}
+
 void testIncident(const QTemporaryDir &dir) {
     const auto db = dir.filePath("export.db");
     History source(db);
@@ -429,6 +579,8 @@ int main(int argc, char **argv) {
         else {
             test(dir.filePath("history.sqlite"));
             testIncident(dir);
+            testPeriodComparison(dir.filePath("baseline.db"));
+            testComparisonEvidence(dir);
             testRouteChange(dir.filePath("routes.sqlite"));
             testRouteEvents(dir.filePath("route-events.sqlite"));
             testDestinationAlerts(dir.filePath("alerts.sqlite"));

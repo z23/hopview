@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-"$root/build-node"}
+mkdir -p "$out"
+cd "$out"
+if command -v qmake6 >/dev/null; then qmake=qmake6; else qmake=qmake-qt6; fi
+"$qmake" "$root/node.pro" CONFIG+=release
+make -j"${JOBS:-4}"

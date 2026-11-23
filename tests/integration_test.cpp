@@ -1,6 +1,8 @@
 #include "backend.h"
 #include "graph.h"
 #include "history.h"
+#include "diagnostics.h"
+#include <QDateTime>
 #include "incident.h"
 #include <QElapsedTimer>
 #include <QGuiApplication>
@@ -99,15 +101,186 @@ class Integration : public QObject {
   private slots:
     void desktop();
     void alertControls();
+    void diagnosticTracks();
+    void diagnosticLoopback();
     void probeSettings();
     void routeHistory();
     void latencyColors();
     void tabControlsAndScale();
     void rangeSelection();
     void compareTargets();
+    void baselineComparison();
+    void incomingSites();
+    void twoSiteWindow();
+    void savedComparison();
     void saveFocus();
     void replayWhileProbing();
 };
+
+void Integration::diagnosticTracks() {
+    QTemporaryDir dir;
+    const auto path = dir.filePath("diagnostics.sqlite");
+    const auto id = fill(path, 100);
+    History h(path);
+    InterfaceReading first{"test0", "00:11:22:33:44:55", 100, 5, 1, 1000, 100, 0, 0, 0, 0, true};
+    auto latest = first;
+    latest.tick += 2000;
+    latest.rx += 9000;
+    latest.tx += 600;
+    latest.rxErrors += 3;
+    latest.ap = "00:11:22:33:44:66";
+    auto nic = interfaceSample(latest, &first, base + 2000);
+    QCOMPARE(nic["rx"].toDouble(), 4500.);
+    QCOMPARE(nic["tx"].toDouble(), 300.);
+    QCOMPARE(nic["rxErrors"].toInt(), 3);
+    QVERIFY(nic["event"].toString().contains("Wi-Fi"));
+    latest.rx = 10;
+    QVERIFY(interfaceSample(latest, &first, base)["rx"].toDouble() < 0);
+    latest.tick += 10000;
+    QVERIFY(interfaceSample(latest, &first, base)["tx"].toDouble() < 0);
+    QVERIFY(h.appendDiagnostic(id, nic));
+    QVERIFY(h.appendDiagnostic(id, nic));
+    auto service = QVariantMap{{"kind", "service"},   {"url", "https://service.test/"},
+                               {"t", base + 22000},   {"address", "2001:db8::1"},
+                               {"family", 6},         {"periodMs", 5000},
+                               {"dns", 2.},           {"connect", 4.},
+                               {"tls", 6.},           {"firstByte", 90.},
+                               {"total", 102.},       {"status", 503},
+                               {"error", "HTTP 503"}, {"event", "HTTP 503"}};
+    QVERIFY(h.appendDiagnostic(id, service));
+    service["total"] = 103.;
+    QVERIFY(!h.appendDiagnostic(id, service));
+    service["t"] = base + 24000;
+    service["status"] = 200;
+    service["error"] = service["event"] = "";
+    QVERIFY(h.appendDiagnostic(id, service));
+    // A broad viewport uses the stored peaks and retains a lower peak's event.
+    auto longView = h.diagnosticTracks(id, base - 86400000, base + 86400000, 12);
+    QCOMPARE(longView.size(), 2);
+    auto peak = longView.first().toMap()["points"].toList().last().toMap();
+    QCOMPARE(peak["total"].toDouble(), 103.);
+    QCOMPARE(peak["marker"].toMap()["status"].toInt(), 503);
+    auto narrow = h.diagnosticTracks(id, base + 22001, base + 24000, 100);
+    QCOMPARE(narrow.size(), 1);
+    QCOMPARE(narrow.first().toMap()["points"].toList().size(), 1);
+    QVERIFY(!narrow.first().toMap()["points"].toList().first().toMap().contains("marker"));
+
+    const auto control = h.createSession("control.example", 4, 1000);
+    QVERIFY(h.append({{control, base + 22000, 1, "192.0.2.1", 3., true}}));
+    auto controlNic = nic;
+    controlNic["name"] = "control0";
+    QVERIFY(h.appendDiagnostic(control, controlNic));
+    const auto evidence = dir.filePath("multiple.hopline");
+    QVERIFY2(h.exportIncident(id, base, base + 99000, evidence, false, {control}), qPrintable(h.error()));
+    History imported(dir.filePath("imported.db"));
+    IncidentRange clip;
+    QString error;
+    QVERIFY2(importIncident(evidence, imported, clip, error), qPrintable(error));
+    QCOMPARE(clip.sessions.size(), 2);
+    for (int i = 0; i < 2; ++i) {
+        const auto originalId = i ? control : id;
+        QCOMPARE(imported.diagnosticTracks(clip.sessions[i], base, base + 99000, 256),
+                 h.diagnosticTracks(originalId, base, base + 99000, 256));
+    }
+    QVERIFY(imported.diagnosticsSettings().isEmpty());
+    Backend b(path);
+    b.selectSession(id);
+    b.zoomToRange(base, base + 99000);
+    Window ui(b);
+    QVERIFY(ui.win &&
+            waitFor([&] { return findItem(ui.win->contentItem(), "serviceDiagnosticGraph") && fresh(b); }));
+    const auto screenshot = qEnvironmentVariable("HOPLINE_DIAGNOSTIC_SCREENSHOT");
+    if (!screenshot.isEmpty()) {
+        QTest::qWait(70);
+        QVERIFY(ui.win->grabWindow().save(screenshot));
+    }
+    ui.win->resize(ui.win->minimumWidth(), ui.win->minimumHeight());
+    QTest::qWait(70);
+    auto *graph = findItem(ui.win->contentItem(), "serviceDiagnosticGraph");
+    // The tracks scroll vertically at the minimum window size.
+    QVERIFY(graph && graph->width() > 100);
+    ui.win->resize(1220, 800);
+    QTest::qWait(50);
+    auto mousePosition = [&](double fraction) {
+        return graph->mapToScene({graph->width() * fraction, graph->height() / 2}).toPoint();
+    };
+    QTest::mousePress(ui.win, Qt::LeftButton, Qt::NoModifier, mousePosition(.17));
+    QTest::mouseMove(ui.win, mousePosition(.31));
+    QTest::mouseRelease(ui.win, Qt::LeftButton, Qt::NoModifier, mousePosition(.31));
+    QVERIFY(waitFor([&] { return fresh(b) && b.viewSeconds() < 18; }));
+    auto *settings = ui.win->findChild<QObject *>("diagnosticSettings");
+    QVERIFY(settings && QMetaObject::invokeMethod(settings, "open"));
+    auto *url = findItem(ui.win->contentItem(), "serviceUrl");
+    auto *save = findItem(ui.win->contentItem(), "saveDiagnostics");
+    QVERIFY(url && save && url->setProperty("text", "file:///tmp/invalid"));
+    QVERIFY(QMetaObject::invokeMethod(save, "click"));
+    QVERIFY(waitFor([&] { return !settings->property("problem").toString().isEmpty(); }));
+    QVERIFY(url->setProperty("text", "https://service.test/"));
+    QVERIFY(QMetaObject::invokeMethod(save, "click"));
+    QVERIFY(waitFor([&] { return !settings->property("visible").toBool(); }));
+    QCOMPARE(h.diagnosticsSettings()[QString::number(id)].toMap()["url"].toString(),
+             QString("https://service.test/"));
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
+void Integration::diagnosticLoopback() {
+    if (!qEnvironmentVariableIsSet("HOPLINE_DIAG_TLS"))
+        QSKIP("Run python3 tests/diagnostics-loopback.py to start private HTTP and HTTPS fixtures.");
+    const auto https = qEnvironmentVariable("HOPLINE_DIAG_TLS");
+    const auto http = qEnvironmentVariable("HOPLINE_DIAG_HTTP");
+    const auto https6 = qEnvironmentVariable("HOPLINE_DIAG_TLS6");
+    const auto ca = qgetenv("HOPLINE_DIAG_CA");
+    const std::atomic_bool cancel{false};
+    for (const int family : {4, 6}) {
+        const auto record = measureService(family == 4 ? https : https6, family, "", 5, cancel, ca);
+        QVERIFY2(record["error"].toString().isEmpty(), qPrintable(record["error"].toString()));
+        QCOMPARE(record["status"].toInt(), 200);
+        QCOMPARE(record["family"].toInt(), family);
+        QVERIFY(!record["address"].toString().isEmpty());
+        for (const auto key : {"dns", "connect", "tls", "firstByte", "total"})
+            QVERIFY(record[key].toDouble() >= 0);
+        QVERIFY(record["firstByte"].toDouble() >= 20);
+        QVERIFY(record["total"].toDouble() >= record["firstByte"].toDouble());
+    }
+    auto untrusted = measureService(https, 4, "", 5, cancel);
+    QVERIFY(!untrusted["error"].toString().isEmpty() && untrusted["tls"].toDouble() < 0);
+    QCOMPARE(untrusted["status"].toInt(), 0);
+    auto failure = measureService(http + "failure", 4, "", 5, cancel);
+    QCOMPARE(failure["status"].toInt(), 503);
+    QCOMPARE(failure["error"].toString(), QString("HTTP 503"));
+    QCOMPARE(failure["tls"].toDouble(), -1.);
+    QCOMPARE(failure["dns"].toDouble(), -1.);
+
+    QTemporaryDir temp;
+    const auto path = temp.filePath("collect.sqlite");
+    History storage(path);
+    const auto id = storage.createSession("127.0.0.1", 4, 250);
+    Backend b(path);
+    b.setDiagnostics(id, http, "lo", 5);
+    QVERIFY(waitFor([&] { return !b.diagnosticsSettings().isEmpty(); }));
+    b.toggleRunning();
+    auto observations = [&] {
+        QVariantList rows;
+        storage.eachDiagnostic(id, 0, QDateTime::currentMSecsSinceEpoch(),
+                               [&](const QVariantMap &r) { rows << r; });
+        return rows;
+    };
+    auto completed = [&] {
+        bool service = false, interface = false;
+        for (const auto &v : observations()) {
+            const auto r = v.toMap();
+            service |= r["kind"] == "service" && r["status"].toInt() == 200;
+            interface |= r["kind"] == "interface" && r["rx"].toDouble() > 0;
+        }
+        return service && interface;
+    };
+    QVERIFY(waitFor(completed, 12000));
+    b.toggleRunning();
+    QTest::qWait(200);
+    auto paused = observations().size();
+    QTest::qWait(2300);
+    QCOMPARE(observations().size(), paused);
+}
 
 void Integration::probeSettings() {
     QTemporaryDir dir;
@@ -364,6 +537,125 @@ void Integration::routeHistory() {
     QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
 }
 
+void Integration::baselineComparison() {
+    QTemporaryDir dir;
+    const auto db = dir.filePath("baseline.sqlite");
+    QVERIFY(fill(db, 150) > 0);
+    Backend b(db);
+    Window ui(b);
+    QVERIFY(ui.win);
+    ui.win->resize(ui.win->minimumSize());
+    QVERIFY(waitFor([&] { return ui.win->isExposed(); }));
+    ui.win->requestActivate();
+    QTest::keyClick(ui.win, Qt::Key_0, Qt::ControlModifier);
+    for (int i = 0; i < 8; ++i)
+        QTest::keyClick(ui.win, Qt::Key_Plus, Qt::ControlModifier);
+    QCOMPARE(ui.win->property("uiScale").toReal(), 2.0);
+    b.zoomToRange(base, base + 10000);
+    b.markBaseline();
+    b.zoomToRange(base + 20000, base + 30000);
+    auto *dialog = ui.win->findChild<QObject *>("baselineDialog");
+    QVERIFY(dialog);
+    QSignalSpy response(&b, &Backend::comparisonReady);
+    QVERIFY(QMetaObject::invokeMethod(dialog, "open"));
+    QVERIFY(waitFor(
+        [&] { return !response.isEmpty() && dialog->property("results").toList().size() == hops + 1; }));
+    const auto result = response.takeFirst();
+    QCOMPARE(result[1].toLongLong(), base);
+    QCOMPARE(result[2].toLongLong(), base + 10000);
+    QCOMPARE(result[3].toLongLong(), base + 20000);
+    QCOMPARE(result[4].toLongLong(), base + 30000);
+    QVERIFY(dialog->property("compact").toBool());
+    auto *list = findItem(ui.win->contentItem(), "periodRows");
+    QVERIFY(list && list->height() > 0);
+    QVERIFY(QMetaObject::invokeMethod(list, "positionViewAtIndex", Q_ARG(int, 0), Q_ARG(int, 2)));
+    QVERIFY(waitFor([&] {
+        auto *value = findItem(ui.win->contentItem(), "compactIncident0_4");
+        if (!value || !value->isVisible() || value->width() < value->implicitWidth())
+            return false;
+        const auto center = value->mapToItem(list, value->boundingRect().center());
+        return list->boundingRect().contains(center) &&
+               QRect(QPoint(), ui.win->size())
+                   .contains(value->mapToScene(value->boundingRect().center()).toPoint());
+    }));
+    QVERIFY(QMetaObject::invokeMethod(dialog, "close"));
+    QTest::keyClick(ui.win, Qt::Key_0, Qt::ControlModifier);
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
+void Integration::twoSiteWindow() {
+    const auto db = qEnvironmentVariable("HOPLINE_REMOTE_DB");
+    if (db.isEmpty())
+        QSKIP("Run tests/telemetry.py with --viewer for two live remote senders.");
+    Backend b(db);
+    Window ui(b);
+    QVERIFY(ui.win && waitFor([&] { return ui.win->isExposed(); }));
+    QFile ready(QFileInfo(db).dir().filePath("ui.ready"));
+    QVERIFY(ready.open(QIODevice::WriteOnly));
+    ready.close();
+    qint64 office = 0, branch = 0;
+    QVERIFY(waitFor(
+        [&] {
+            for (const auto &value : b.sessions()) {
+                const auto trace = value.toMap();
+                if (trace["family"].toInt() != 4 || !trace["remoteLive"].toBool() ||
+                    trace["clockErrorMs"].toInt() < 0)
+                    continue;
+                if (trace["location"] == "office")
+                    office = trace["id"].toLongLong();
+                if (trace["location"] == "branch")
+                    branch = trace["id"].toLongLong();
+            }
+            return office && branch;
+        },
+        45000));
+    b.selectSession(office);
+    b.toggleComparison(branch);
+    QVERIFY(waitFor([&] {
+        const auto charts = b.snapshot()["charts"].toList();
+        return charts.size() == 2 && charts.last().toMap()["location"] == "branch" &&
+               !charts.first().toMap()["buckets"].toList().isEmpty() &&
+               !charts.last().toMap()["buckets"].toList().isEmpty();
+    }));
+    const auto received = b.viewEnd();
+    QVERIFY(waitFor([&] { return b.viewEnd() > received; }));
+    QVERIFY(!ui.win->grabWindow().isNull());
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
+void Integration::incomingSites() {
+    QTemporaryDir dir;
+    const auto db=dir.filePath("sites.sqlite");
+    Backend b(db);
+    Window ui(b);
+    QVERIFY(ui.win);
+    History receiver(db);
+    const auto a=receiver.receiverSession("london","r1","service.example",4,1000,"tcp",443,"");
+    const auto c=receiver.receiverSession("melbourne","r2","service.example",4,1000,"tcp",443,"");
+    QVERIFY(a>0 && c>0);
+    QVERIFY(receiver.append({{a,base,1,"192.0.2.1",5,true},{c,base,1,"192.0.2.1",90,true}}));
+    QVERIFY(receiver.setSessionOrigin(a,"london","192.0.2.1",5,2,base+100));
+    QVERIFY(receiver.setSessionOrigin(c,"melbourne","192.0.2.1",-8,3,base+100));
+    QVERIFY(waitFor([&]{return b.sessions().size()==2 && b.sessionId()>0;}));
+    b.selectSession(a);
+    b.toggleRunning();
+    QVERIFY(!b.running());
+    b.toggleComparison(c);
+    b.zoomToRange(base-1000,base);
+    QVERIFY(waitFor([&]{return fresh(b) && b.snapshot()["charts"].toList().size()==2;}));
+    const auto peer=b.snapshot()["charts"].toList().last().toMap();
+    QCOMPARE(peer["location"].toString(),QString("melbourne"));
+    QCOMPARE(peer["clockErrorMs"].toInt(),3);
+    auto *pause=findItem(ui.win->contentItem(),"pauseButton");
+    QVERIFY(pause && !pause->isVisible());
+    // A delayed batch changes a historical window without moving its pinned bounds.
+    QVERIFY(receiver.append({{c,base-500,1,"192.0.2.1",120,true}}));
+    QVERIFY(receiver.setSessionOrigin(c,"melbourne","192.0.2.1",-8,3,base+3000));
+    QVERIFY(waitFor([&]{return b.snapshot()["timeMax"].toDouble()==120;}));
+    QCOMPARE(b.viewEnd(),base);
+    QVERIFY2(ui.warnings.isEmpty(),qPrintable(ui.warnings.join('\n')));
+}
+
 void Integration::saveFocus() {
     QTemporaryDir dir;
     const auto file = dir.filePath("source.db");
@@ -432,6 +724,69 @@ void Integration::saveFocus() {
     const auto session = replay.sessions().first().toMap();
     QCOMPARE(session["startMs"].toLongLong(), base + 10000);
     QCOMPARE(session["endMs"].toLongLong(), base + 14000);
+}
+
+void Integration::savedComparison() {
+    QTemporaryDir dir;
+    const auto file = dir.filePath("groups.db");
+    const auto incident = dir.filePath("office.hopline");
+    const auto primary = fill(file, 80);
+    History writer(file);
+    const auto peer = writer.createSession("isp.example", 4, 1000);
+    QVERIFY(writer.append({{peer, base + 1000, 1, "192.0.2.3", 9, true}}));
+    {
+        Backend b(file);
+        b.selectSession(primary);
+        b.zoomToRange(base+500,base+4200);
+        Window ui(b);
+        QVERIFY(ui.win && waitFor([&] { return ui.win->isExposed(); }));
+        auto item = [&](const QString &key) { return findItem(ui.win->contentItem(), key); };
+        auto click = [&](QQuickItem *control) {
+            QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                              control->mapToScene(control->boundingRect().center()).toPoint());
+        };
+        QVERIFY(item("compareTargets"));
+        click(item("compareTargets"));
+        const auto choice = "compareChoice" + QString::number(peer);
+        QVERIFY(waitFor([&] { return item(choice) && item(choice)->isVisible(); }));
+        click(item(choice));
+        QVERIFY(waitFor([&] { return item("groupName") && item("groupName")->isVisible(); }));
+        QVERIFY(item("groupName")->setProperty("text", "Gateway, ISP and service"));
+        click(item("saveGroup"));
+        QVERIFY(waitFor([&] { return b.groupNames().size() == 1; }));
+        QTest::keyClick(ui.win, Qt::Key_Escape);
+        b.closeSession(peer);
+        QVERIFY(waitFor([&] { return b.sessions().size() == 1; }));
+        QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+    }
+    Backend b(file);
+    b.openGroup("Gateway, ISP and service");
+    QVERIFY(waitFor([&] { return b.sessionId() == primary && b.comparisonIds() == QVariantList{peer}; }));
+    QVERIFY(!b.running() && !b.live() && b.sessions().size() == 2);
+    QCOMPARE(b.viewStart(),base+500);
+    QCOMPARE(b.viewEnd(),base+4200);
+    QSignalSpy saved(&b, &Backend::incidentExported);
+    b.exportIncident(primary, base, base + 3000, QUrl::fromLocalFile(incident), false, {peer}, {0, 3});
+    QVERIFY(waitFor([&] { return !saved.isEmpty(); }));
+    QVERIFY(saved.first()[0].toBool());
+    QSignalSpy added(&b, &Backend::incidentAdded);
+    b.addIncident(QUrl::fromLocalFile(incident), "Offsite", 500);
+    QVERIFY(waitFor([&] { return !added.isEmpty(); }));
+    QVERIFY2(added.first()[0].toBool(), qPrintable(added.first()[1].toString()));
+    QCOMPARE(b.sessionId(), primary);
+    QCOMPARE(b.viewStart(), base + 500);
+    QCOMPARE(b.viewEnd(), base + 3500);
+    QCOMPARE(b.comparisonIds().size(), 3);
+    QCOMPARE(b.sessions().size(), 4);
+    const auto imported = b.comparisonIds().last().toLongLong();
+    b.selectSession(imported);
+    b.toggleRunning();
+    QVERIFY(!b.running());
+    Window ui(b);
+    QVERIFY(ui.win);
+    auto *pause = findItem(ui.win->contentItem(), "pauseButton");
+    QVERIFY(pause && !pause->isVisible());
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
 }
 
 void Integration::compareTargets() {

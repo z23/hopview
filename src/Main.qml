@@ -41,6 +41,14 @@ C.ApplicationWindow {
     }
     readonly property var rows: backend.snapshot.rows || []
     readonly property var charts: backend.snapshot.charts || []
+    readonly property var diagnosticTracks: {
+        const tracks = Array.from(backend.snapshot.diagnostics || [])
+        const settings = backend.diagnosticsSettings[String(backend.sessionId)] || {}
+        for (const key of ["service", "interface"])
+            if ((key === "service" ? settings.url : settings.interface) && !tracks.some(t => t.kind === key))
+                tracks.push({kind:key, points:[]})
+        return tracks
+    }
     readonly property var currentSession: {
         for (const s of backend.sessions)
             if (s.id === backend.sessionId) return s
@@ -78,6 +86,10 @@ C.ApplicationWindow {
     property double rangeAnchorMs: -1
     property double rangeEndMs: -1
     readonly property bool selectingRange: rangeAnchorMs >= 0 && rangeEndMs >= 0
+    function sourceLabel(info) {
+        if (!info) return ""
+        return info.location ? info.location + " · " + info.target : info.target
+    }
     property bool inputError: false
     property string exportStatus: ""
 
@@ -131,9 +143,16 @@ C.ApplicationWindow {
         if (!backend.sessionId) return
         exportDialog.open()
     }
+    function correctionText(trace) {
+        if (!trace || !trace.imported) return ""
+        const ms = trace.manualCorrectionMs || 0
+        return qsTr("UTC adjustment %1 ms").arg((ms > 0 ? "+" : "") + ms)
+    }
     function chooseIncident(csv) {
         incidentDialog.csv = csv
         incidentDialog.session = backend.sessionId
+        incidentDialog.peers = Array.from(backend.comparisonIds)
+        incidentDialog.hops = Array.from(backend.selectedHops)
         incidentDialog.fromMs = Math.max(0, backend.focusStart)
         incidentDialog.throughMs = backend.focusEnd
         incidentDialog.open()
@@ -279,7 +298,7 @@ C.ApplicationWindow {
                     padding: 0
                     width: Math.min(280, tabName.implicitWidth + 66)
                     hoverEnabled: true
-                    Accessible.name: modelData.target + ", " + app.timeText(modelData.startMs, true)
+                    Accessible.name: app.sourceLabel(modelData) + ", " + app.timeText(modelData.startMs, true)
                     onClicked: backend.selectSession(modelData.id)
                     background: Rectangle {
                         color: tab.active ? app.panel : tab.hovered ? "#1b2934" : "transparent"
@@ -289,7 +308,7 @@ C.ApplicationWindow {
                         leftPadding: 12
                         spacing: 7
                         Rectangle { width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: tab.modelData.running ? app.accent : app.faint }
-                        Caption { id: tabName; width: Math.min(210, implicitWidth); anchors.verticalCenter: parent.verticalCenter; color: tab.active ? app.ink : app.mute; text: tab.modelData.target }
+                        Caption { id: tabName; width: Math.min(210, implicitWidth); anchors.verticalCenter: parent.verticalCenter; color: tab.active ? app.ink : app.mute; text: app.sourceLabel(tab.modelData) }
                     }
                     TapHandler {
                         enabled: !backend.replayMode
@@ -321,6 +340,7 @@ C.ApplicationWindow {
                     C.ToolTip.visible: hovered && !closeTab.hovered
                     C.ToolTip.delay: 600
                     C.ToolTip.text: modelData.target + " · " + app.timeText(modelData.startMs, true)
+                                    + (modelData.imported ? "\n" + app.correctionText(modelData) : "")
                                     + "\n" + (modelData.protocol || "auto").toUpperCase()
                                     + (modelData.protocol === "auto" ? " (UDP/" + modelData.port + " fallback)" : modelData.port ? "/" + modelData.port : "")
                                     + (modelData.interfaceName ? " · " + modelData.interfaceName : "")
@@ -406,7 +426,9 @@ C.ApplicationWindow {
                 Caption { text: "Enter a hostname or IP address to compare latency and loss at each hop."; anchors.horizontalCenter: parent.horizontalCenter }
                 Row {
                     anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
+                    TraceButton { visible: backend.groupNames.length > 0; text: qsTr("Saved comparisons…"); onClicked: compareDialog.open() }
                     TraceButton { text: "Open incident…"; onClicked: openIncident.open() }
+                    TraceButton { visible: !backend.replayMode; text: qsTr("Remote sources…"); onClicked: sourcesDialog.open() }
                     TraceButton { visible: backend.backgroundAvailable; text: "Recording and alerts…"; onClicked: alertsDialog.open() }
                 }
             }
@@ -445,12 +467,17 @@ C.ApplicationWindow {
                                 y: actionsButton.height
                                 width: 230
                                 background: Rectangle { color: app.panel; border.color: app.edge; radius: 5 }
+                                ActionItem { visible: !backend.replayMode; text: qsTr("Remote sources…"); onTriggered: sourcesDialog.open() }
+                                ActionItem { text: qsTr("Compare time ranges…"); onTriggered: baselineDialog.open() }
+                                ActionItem { text: qsTr("Mark focus as baseline"); onTriggered: backend.markBaseline() }
+                                ActionItem { objectName: "diagnosticsAction"; text: qsTr("Service and interface…"); enabled: !backend.replayMode && !!app.currentSession && !app.currentSession.remote && !app.currentSession.imported; onTriggered: diagnosticSettings.open() }
                                 ActionItem { text: "Route history…"; onTriggered: routeHistory.open() }
                                 ActionItem { text: "Recording and alerts…"; enabled: backend.backgroundAvailable; onTriggered: alertsDialog.open() }
                                 C.MenuSeparator {}
                                 ActionItem { text: "Save graph as PNG…"; onTriggered: app.chooseExport() }
                                 ActionItem { text: "Export focus as CSV…"; onTriggered: app.chooseIncident(true) }
                                 ActionItem { objectName: "saveIncidentAction"; text: "Save replayable incident…"; onTriggered: app.chooseIncident(false) }
+                                ActionItem { text: qsTr("Add recording to comparison…"); onTriggered: addRecording.open() }
                                 ActionItem { text: "Open incident…"; onTriggered: openIncident.open() }
                             }
                         }
@@ -463,7 +490,7 @@ C.ApplicationWindow {
                             onActivated: i => backend.setFocusSeconds(app.focusOptions[i])
                             hint: "Time window used for hop statistics"
                         }
-                        TraceButton { objectName: "pauseButton"; visible: !backend.replayMode; text: backend.running ? "Pause" : "Resume"; onClicked: backend.toggleRunning(); hint: backend.running ? "Pause collection" : "Resume collection for this target" }
+                        TraceButton { objectName: "pauseButton"; visible: !backend.replayMode && !app.currentSession?.remoteLive && !app.currentSession?.imported; text: backend.running ? "Pause" : "Resume"; onClicked: backend.toggleRunning(); hint: backend.running ? "Pause collection" : "Resume collection for this target" }
                     }
                     Rectangle {
                         Layout.fillWidth: true; implicitHeight: 29
@@ -620,7 +647,7 @@ C.ApplicationWindow {
                         Item { Layout.fillWidth: true }
                         TraceButton {
                             objectName: "compareTargets"
-                            visible: backend.sessions.length > 1
+                            visible: backend.sessions.length > 1 || backend.groupNames.length > 0
                             text: backend.comparisonIds.length ? "Compare (" + backend.comparisonIds.length + ")" : "Compare…"
                             onClicked: compareDialog.open()
                         }
@@ -671,12 +698,12 @@ C.ApplicationWindow {
                                     readonly property var cursorSample: app.cursorSample(modelData.buckets, intervalMs)
                                     readonly property string trackKey: peer ? "peer" + modelData.comparisonId : "hop" + modelData.hop
                                     width: trackColumn.width
-                                    height: Math.max(76, tracks.height / Math.max(1, app.charts.length))
+                                    height: Math.max(76, tracks.height / Math.max(1, app.charts.length + app.diagnosticTracks.length))
                                     Rectangle { anchors.fill: parent; color: app.well }
                                     Caption {
                                         x: 7; y: 8; width: app.chartLabelWidth - 13
-                                        text: track.peer ? "Comparison · " + (track.modelData.family ? "IPv" + track.modelData.family : "Auto IP")
-                                            : track.modelData.destination ? "Destination" : "Hop " + track.modelData.hop
+                                        text: track.peer ? (track.modelData.location || qsTr("Comparison")) + " · " + (track.modelData.family ? "IPv" + track.modelData.family : "Auto IP")
+                                            : track.modelData.destination ? (app.currentSession?.location || qsTr("Destination")) : "Hop " + track.modelData.hop
                                         color: app.ink; font.weight: Font.DemiBold
                                     }
                                     Caption {
@@ -718,7 +745,7 @@ C.ApplicationWindow {
                                             maxGap: Math.max(3, app.chartWidth * track.intervalMs * 3 / app.viewSpan)
                                         }
                                         Repeater {
-                                            model: track.peer ? [] : backend.snapshot.notes || []
+                                            model: track.peer ? (track.modelData.notes || []) : (backend.snapshot.notes || [])
                                             Rectangle {
                                                 required property var modelData
                                                 x: (modelData.timeMs - backend.viewStart) / app.viewSpan * plotArea.width
@@ -801,17 +828,27 @@ C.ApplicationWindow {
                                                 if (e.modifiers & Qt.ControlModifier) { app.moveZoom(e.angleDelta.y > 0 ? -1 : 1); e.accepted = true }
                                                 else e.accepted = false
                                             }
-                                            C.ToolTip.visible: !track.peer && containsMouse && app.nearbyNote(app.cursorFraction) !== null && !noteDialog.visible
+                                            C.ToolTip.visible: containsMouse && app.nearbyNote(app.cursorFraction, track.peer ? track.modelData.notes || [] : backend.snapshot.notes) !== null && !noteDialog.visible
                                             C.ToolTip.delay: 350
-                                            C.ToolTip.text: { const n = app.nearbyNote(app.cursorFraction); return n ? n.text : "" }
+                                            C.ToolTip.text: { const n = app.nearbyNote(app.cursorFraction, track.peer ? track.modelData.notes || [] : backend.snapshot.notes); return n ? n.text : "" }
                                         }
                                     }
                                     Rule { anchors.bottom: parent.bottom; width: parent.width; height: 1 }
                                 }
                             }
+                            Repeater {
+                                model: app.diagnosticTracks.length
+                                DiagnosticTrack {
+                                    required property int index
+                                    host: app
+                                    series: app.diagnosticTracks[index] || ({kind:"service",points:[]})
+                                    width: trackColumn.width; labelWidth: app.chartLabelWidth; plotWidth: app.chartWidth
+                                    height: Math.max(82, tracks.height / Math.max(1, app.charts.length + app.diagnosticTracks.length))
+                                }
+                            }
                         }
                         Caption {
-                            anchors.centerIn: parent; visible: app.charts.length === 0
+                            anchors.centerIn: parent; visible: app.charts.length + app.diagnosticTracks.length === 0
                             text: app.rows.length ? "Select a hop in the route profile to view its timeline." : "Waiting for timeline data…"
                         }
                     }
@@ -853,7 +890,7 @@ C.ApplicationWindow {
                 Caption { visible: app.currentSession !== null && workspace.width >= 820 && app.cursorFraction < 0; text: "Click to focus  ·  Drag to zoom  ·  Shift-drag to pan  ·  Right-click to annotate"; font.pixelSize: 11 }
                 Caption { visible: !!app.currentSession; text: "Interval"; font.pixelSize: 11 }
                 TraceCombo {
-                    enabled: !backend.replayMode; visible: !!app.currentSession; implicitHeight: 26; implicitWidth: 77
+                    enabled: !backend.replayMode && !app.currentSession?.remoteLive && !app.currentSession?.imported; visible: !!app.currentSession; implicitHeight: 26; implicitWidth: 77
                     readonly property var choices: [250, 500, 1000, 2500, 5000]
                     model: ["0.25 s", "0.5 s", "1 s", "2.5 s", "5 s"]
                     currentIndex: app.currentSession ? choices.indexOf(app.currentSession.intervalMs) : 2
@@ -864,10 +901,10 @@ C.ApplicationWindow {
             }
         }
     }
-    function nearbyNote(fraction) {
+    function nearbyNote(fraction, notes = backend.snapshot.notes) {
         if (fraction < 0) return null
         const stamp = timeAt(fraction), radius = 7 * viewSpan / chartWidth
-        for (const n of (backend.snapshot.notes || []))
+        for (const n of (notes || []))
             if (Math.abs(n.timeMs - stamp) <= radius) return n
         return null
     }
@@ -916,7 +953,10 @@ C.ApplicationWindow {
         contentItem: Caption { text: action.text; color: action.enabled ? app.ink : app.faint; leftPadding: 8 }
         background: Rectangle { color: action.highlighted ? "#344552" : "transparent" }
     }
+    DiagnosticSettings { id: diagnosticSettings; uiScale: app.uiScale }
     AlertsDialog { id: alertsDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    RemoteSources { id: sourcesDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    BaselineDialog { id: baselineDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
     RouteHistory { id: routeHistory; parent: C.Overlay.overlay; uiScale: app.uiScale }
     C.Dialog {
         id: compareDialog
@@ -929,9 +969,15 @@ C.ApplicationWindow {
         contentItem: ColumnLayout {
             spacing: 10
             Heading { text: "Compare destinations" }
+            RowLayout {
+                visible: backend.groupNames.length > 0
+                TraceCombo { id: groupPicker; objectName: "savedGroupPicker"; model: backend.groupNames; Layout.fillWidth: true; hint: qsTr("Saved comparison groups") }
+                TraceButton { text: qsTr("Open group"); onClicked: { backend.openGroup(groupPicker.currentText); compareDialog.close() } }
+                TraceButton { text: qsTr("Remove"); hint: qsTr("Remove this group from saved comparisons"); onClicked: backend.deleteGroup(groupPicker.currentText) }
+            }
             ListView {
                 Layout.fillWidth: true
-                Layout.preferredHeight: Math.min(contentHeight, app.height / app.uiScale * 0.5)
+                Layout.preferredHeight: Math.min(contentHeight, Math.max(70, app.height / app.uiScale - 230))
                 clip: true
                 model: backend.sessions.filter(s => s.id !== backend.sessionId)
                 C.ScrollBar.vertical: C.ScrollBar {}
@@ -941,18 +987,36 @@ C.ApplicationWindow {
                     objectName: "compareChoice" + modelData.id
                     width: ListView.view.width
                     checked: backend.comparisonIds.includes(modelData.id)
-                    text: modelData.target + "  ·  " + (modelData.family ? "IPv" + modelData.family : "Auto IP")
+                    text: app.sourceLabel(modelData) + "  ·  " + (modelData.family ? "IPv" + modelData.family : "Auto IP")
                     Accessible.name: text
                     onClicked: backend.toggleComparison(modelData.id)
                     background: Rectangle { color: peerChoice.hovered ? "#344552" : app.well }
                     contentItem: Column {
                         leftPadding: 6
                         Caption { text: peerChoice.text; color: app.ink; width: peerChoice.width - 60 }
-                        Caption { text: app.timeText(peerChoice.modelData.startMs, true); font.pixelSize: 11 }
+                        Caption { text: app.timeText(peerChoice.modelData.startMs, true) + (peerChoice.modelData.imported ? "  ·  " + app.correctionText(peerChoice.modelData) : ""); font.pixelSize: 11 }
                     }
                 }
             }
-            TraceButton { text: "Done"; Layout.alignment: Qt.AlignRight; onClicked: compareDialog.close() }
+            RowLayout {
+                visible: !backend.replayMode && backend.comparisonIds.length > 0
+                C.TextField {
+                    id: groupName; objectName: "groupName"; Layout.fillWidth: true; maximumLength: 96
+                    placeholderText: qsTr("Name this comparison"); color: app.ink; placeholderTextColor: app.faint
+                    background: Rectangle { radius: 4; color: app.well; border.color: app.edge }
+                    onAccepted: if (text.trim()) backend.saveGroup(text.trim())
+                }
+                TraceButton {
+                    objectName: "saveGroup"; enabled: groupName.text.trim().length > 0
+                    text: backend.groupNames.includes(groupName.text.trim()) ? qsTr("Update group") : qsTr("Save group")
+                    onClicked: backend.saveGroup(groupName.text.trim())
+                }
+            }
+            RowLayout {
+                TraceButton { text: qsTr("Add recording…"); onClicked: { compareDialog.close(); addRecording.open() } }
+                Item { Layout.fillWidth: true }
+                TraceButton { text: "Done"; onClicked: compareDialog.close() }
+            }
         }
     }
     Dialogs.FileDialog {
@@ -960,13 +1024,58 @@ C.ApplicationWindow {
         objectName: "incidentExportDialog"
         property bool csv: false
         property double session
+        property var peers: []
+        property var hops: [0]
         property double fromMs
         property double throughMs
         fileMode: Dialogs.FileDialog.SaveFile
         title: (csv ? "Export CSV" : "Save incident") + " · " + app.timeText(fromMs, false) + " – " + app.timeText(throughMs, false)
         nameFilters: csv ? ["CSV data (*.csv)"] : ["Hopline incident (*.hopline)"]
         defaultSuffix: csv ? "csv" : "hopline"
-        onAccepted: backend.exportIncident(session, fromMs, throughMs, selectedFile, csv)
+        onAccepted: backend.exportIncident(session, fromMs, throughMs, selectedFile, csv, peers, hops)
+    }
+    Dialogs.FileDialog {
+        id: addRecording
+        title: qsTr("Add recording to this comparison")
+        nameFilters: ["Hopline incident (*.hopline)", "All files (*)"]
+        onAccepted: {
+            alignment.file = selectedFile
+            fallbackSite.text = ""
+            adjustment.text = "0"
+            alignment.open()
+        }
+    }
+    C.Dialog {
+        id: alignment
+        objectName: "recordingAlignment"
+        property url file
+        modal: true; focus: true; parent: C.Overlay.overlay; anchors.centerIn: parent
+        width: Math.min(460, app.width / app.uiScale - 30); padding: 16; scale: app.uiScale
+        background: Rectangle { color: app.panel; border.color: app.edge; radius: 6 }
+        contentItem: ColumnLayout {
+            spacing: 8
+            Heading { text: qsTr("Align recording") }
+            Caption { text: qsTr("Site name for traces without a recorded location") }
+            C.TextField {
+                id: fallbackSite; Layout.fillWidth: true; maximumLength: 255
+                placeholderText: qsTr("e.g. Melbourne office"); color: app.ink; placeholderTextColor: app.faint
+                background: Rectangle { radius: 4; color: app.well; border.color: app.edge }
+            }
+            Caption { text: qsTr("Add to recorded UTC timestamps (milliseconds)") }
+            C.TextField {
+                id: adjustment; Layout.fillWidth: true; text: "0"; color: app.ink; maximumLength: 16
+                validator: RegularExpressionValidator { regularExpression: /[+-]?[0-9]{1,14}/ }
+                background: Rectangle { radius: 4; color: app.well; border.color: app.edge }
+            }
+            RowLayout {
+                Item { Layout.fillWidth: true }
+                TraceButton { text: qsTr("Cancel"); onClicked: alignment.close() }
+                TraceButton {
+                    text: qsTr("Add to comparison"); enabled: adjustment.acceptableInput
+                    onClicked: { backend.addIncident(alignment.file, fallbackSite.text.trim(), Number(adjustment.text)); alignment.close() }
+                }
+            }
+        }
     }
     Dialogs.FileDialog {
         id: openIncident
@@ -976,6 +1085,7 @@ C.ApplicationWindow {
     }
     Connections {
         target: backend
+        function onIncidentAdded(ok, message) { app.exportStatus = message; exportMessageTimer.restart() }
         function onIncidentExported(ok, message) { app.exportStatus = message; exportMessageTimer.restart() }
     }
     Dialogs.FileDialog {

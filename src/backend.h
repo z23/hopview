@@ -10,12 +10,16 @@
 #include <QUrl>
 #include <memory>
 #include <mutex>
+#include <atomic>
 
+struct IncidentRange;
 class History;
 class Probe;
+class Diagnostics;
 
 class Backend : public QObject {
     Q_OBJECT
+    Q_PROPERTY(QVariantMap diagnosticsSettings READ diagnosticsSettings NOTIFY diagnosticsChanged)
     Q_PROPERTY(bool backgroundAvailable READ backgroundAvailable NOTIFY monitoringChanged)
     Q_PROPERTY(bool backgroundEnabled READ backgroundEnabled NOTIFY monitoringChanged)
     Q_PROPERTY(QVariantMap alertRules READ alertRules NOTIFY monitoringChanged)
@@ -33,13 +37,18 @@ class Backend : public QObject {
     Q_PROPERTY(bool live READ live NOTIFY viewportChanged)
     Q_PROPERTY(qreal viewSeconds READ viewSeconds NOTIFY viewportChanged)
     Q_PROPERTY(int focusSeconds READ focusSeconds NOTIFY viewportChanged)
+    Q_PROPERTY(QVariantMap savedBaseline READ savedBaseline NOTIFY baselineChanged)
+    Q_PROPERTY(QString databasePath READ databasePath CONSTANT)
     Q_PROPERTY(bool replayMode READ replayMode CONSTANT)
+    Q_PROPERTY(QStringList groupNames READ groupNames NOTIFY groupsChanged)
     Q_PROPERTY(QVariantList comparisonIds READ comparisonIds NOTIFY viewportChanged)
     Q_PROPERTY(QVariantList selectedHops READ selectedHops NOTIFY viewportChanged)
   public:
     Q_INVOKABLE QStringList interfaceNames() const;
     explicit Backend(const QString &file, QObject *parent = nullptr);
     ~Backend() override;
+    QVariantMap diagnosticsSettings() const { return m_diagnosticsSettings; }
+    Q_INVOKABLE void setDiagnostics(qint64 id, QString url, QString interfaceName, int seconds);
     void enableRecorder();
     void setWindowVisible(bool visible);
     bool backgroundAvailable() const { return m_recorderAvailable; }
@@ -63,11 +72,23 @@ class Backend : public QObject {
     qreal viewSeconds() const { return m_spanMs / 1000.0; }
     int focusSeconds() const { return m_focusSecs; }
     QVariantList selectedHops() const;
+    QString databasePath() const { return m_historyPath; }
     bool replayMode() const { return m_replayMode; }
+    QStringList groupNames() const { return m_groupNames; }
+    void restoreIncident(const IncidentRange &range);
+    Q_INVOKABLE void saveGroup(QString name);
+    Q_INVOKABLE void openGroup(QString name);
+    Q_INVOKABLE void deleteGroup(QString name);
+    Q_INVOKABLE void addIncident(QUrl file, QString site, qint64 correctionMs);
     void setReplayMode() { m_replayMode = true; }
+    QVariantMap savedBaseline() const;
+    Q_INVOKABLE void markBaseline();
+    Q_INVOKABLE void compareFocus(bool previous);
+    Q_INVOKABLE void cancelBaseline() { ++m_baselineVersion; }
     QVariantList comparisonIds() const;
     Q_INVOKABLE void toggleComparison(qint64 id);
-    Q_INVOKABLE void exportIncident(qint64 session, qint64 from, qint64 through, QUrl file, bool csv);
+    Q_INVOKABLE void exportIncident(qint64 session, qint64 from, qint64 through, QUrl file, bool csv,
+                                    QVariantList peers = {}, QVariantList hops = {0});
     Q_INVOKABLE void openReplay(QUrl file);
 
     Q_INVOKABLE void startTrace(QString target, int family, int intervalMs, QString protocol = QStringLiteral("auto"),
@@ -89,6 +110,10 @@ class Backend : public QObject {
     Q_INVOKABLE void goLive();
     Q_INVOKABLE void setPixels(int pixels);
   signals:
+    void diagnosticsChanged();
+    void diagnosticSettingsSaved(qint64 id, QString error);
+    void baselineChanged();
+    void comparisonReady(QVariantList rows, qint64 from, qint64 through, qint64 incidentFrom, qint64 incidentEnd, QString error);
     void monitoringChanged();
     void alertsChanged();
     void destinationAlert(QVariantMap event);
@@ -98,6 +123,8 @@ class Backend : public QObject {
     void routeHistoryPage(QVariantList events, bool finished, QString error);
     void statusChanged();
     void viewportChanged();
+    void groupsChanged();
+    void incidentAdded(bool ok, QString message);
     void incidentExported(bool ok, QString message);
 
   private:
@@ -106,6 +133,10 @@ class Backend : public QObject {
     void fetchView();
     void runSession(qint64 id);
     void changeTabVisibility(qint64 id, bool closed, qint64 from = 0, qint64 through = 0);
+    void syncDiagnostics(qint64 id);
+    QVariantMap m_diagnosticsSettings;
+    QThread m_diagnosticThread;
+    Diagnostics *m_diagnostics = nullptr;
     void persistRecordingSet();
     QVariantMap m_alertRules;
     QVariantList m_alertEvents, m_resumeSessions;
@@ -119,9 +150,14 @@ class Backend : public QObject {
     quint64 m_routeRequest = 0;
     void resolveNames();
     void refreshNames();
+    QStringList m_groupNames;
+    void displayComparison(const QList<qint64> &members, const QList<int> &hops);
     QVariantMap sessionInfo(qint64 id) const;
     qint64 latest() const;
     qint64 earliest() const;
+    QHash<qint64, QVariantMap> m_baselines;
+    std::atomic<quint64> m_baselineVersion{0};
+    QThreadPool m_baselinePool;
     const QString m_historyPath;
     QThreadPool m_exports;
     QThread m_collectorThread, m_writerThread, m_readThread;
@@ -164,7 +200,12 @@ class Backend : public QObject {
     std::mutex m_batchMutex;
     QVector<Sample> m_waitingSamples;
     bool m_flushScheduled = false, m_queueOverflow = false;
-    QTimer m_refresh, m_coalesce;
+    void pollReceiver();
+    QVariantMap labelAlert(QVariantMap event) const;
+    void publishAlerts(const QVariantList &events);
+    bool m_remoteBusy = false;
+    qint64 m_receiverVersion = -1; // Owned by the history reader thread.
+    QTimer m_refresh, m_coalesce, m_remotePoll;
     qint64 m_session = 0, m_viewEnd = 0, m_focusCenter = 0;
     qint64 m_spanMs = 300000;
     int m_focusSecs = 60, m_pixels = 1000;

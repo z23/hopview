@@ -92,6 +92,19 @@ CREATE TABLE IF NOT EXISTS sessions(
 CREATE TABLE IF NOT EXISTS session_probe(
  session INTEGER PRIMARY KEY REFERENCES sessions(id),protocol TEXT NOT NULL,port INTEGER NOT NULL,
  interface_name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_origin(
+ session INTEGER PRIMARY KEY REFERENCES sessions(id),location TEXT NOT NULL,resolved_address TEXT NOT NULL,
+ clock_offset_ms INTEGER NOT NULL,clock_error_ms INTEGER NOT NULL,received_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS receiver_streams(
+ location TEXT NOT NULL,stream TEXT NOT NULL,session INTEGER NOT NULL UNIQUE REFERENCES sessions(id),
+ PRIMARY KEY(location,stream)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS imported_sessions(
+ session INTEGER PRIMARY KEY REFERENCES sessions(id), correction_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS comparison_groups(name TEXT PRIMARY KEY, view_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS comparison_members(
+ name TEXT NOT NULL REFERENCES comparison_groups(name) ON DELETE CASCADE,
+ position INTEGER NOT NULL, session INTEGER NOT NULL REFERENCES sessions(id),
+ PRIMARY KEY(name,position), UNIQUE(name,session)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS closed_tabs(
  session INTEGER PRIMARY KEY REFERENCES sessions(id));
 CREATE TABLE IF NOT EXISTS notes(
@@ -246,6 +259,25 @@ void upgradeRollups(sqlite3 *db) {
     for (size_t i = 0; i < spans.size(); ++i)
         flush(i);
 }
+qint64 insertSession(sqlite3 *db, const QString &target, int family, int intervalMs,
+                     const QString &protocol, int port, const QString &interfaceName) {
+    const ProbeOptions options{protocol, port, interfaceName};
+    if (!options.valid()) throw std::runtime_error("Invalid probe protocol or destination port");
+    Statement q(db, "INSERT INTO sessions(target,family,interval_ms,created_ms) VALUES(?,?,?,?)");
+    q.string(1, target);
+    q.integer(2, family);
+    q.integer(3, intervalMs);
+    q.integer(4, QDateTime::currentMSecsSinceEpoch());
+    q.next();
+    const auto id = sqlite3_last_insert_rowid(db);
+    Statement probe(db, "INSERT INTO session_probe(session,protocol,port,interface_name) VALUES(?,?,?,?)");
+    probe.integer(1, id);
+    probe.string(2, protocol);
+    probe.integer(3, options.destinationPort());
+    probe.string(4, interfaceName);
+    probe.next();
+    return id;
+}
 } // namespace
 
 History::History(QString path) : path_(std::move(path)) {
@@ -277,6 +309,7 @@ bool History::open() {
         Transaction tx(db_, true);
         execute(db_, schema);
         createMonitoringTables();
+        createDiagnosticTables();
         upgradeRollups(db_);
         tx.commit();
         return true;
@@ -294,27 +327,77 @@ qint64 History::createSession(QString target, int family, int intervalMs, QStrin
         return 0;
     error_.clear();
     try {
-        const ProbeOptions options{protocol, port, interfaceName};
-        if (!options.valid()) throw std::runtime_error("Invalid probe protocol or destination port");
         Transaction tx(db_, true);
-        Statement q(db_, "INSERT INTO sessions(target,family,interval_ms,created_ms) VALUES(?,?,?,?)");
-        q.string(1, target);
-        q.integer(2, family);
-        q.integer(3, intervalMs);
-        q.integer(4, QDateTime::currentMSecsSinceEpoch());
-        q.next();
-        const auto id = sqlite3_last_insert_rowid(db_);
-        Statement probe(db_, "INSERT INTO session_probe(session,protocol,port,interface_name) VALUES(?,?,?,?)");
-        probe.integer(1, id);
-        probe.string(2, protocol);
-        probe.integer(3, options.destinationPort());
-        probe.string(4, interfaceName);
-        probe.next();
+        const auto id = insertSession(db_, target, family, intervalMs, protocol, port, interfaceName);
         tx.commit();
         return id;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
         return 0;
+    }
+}
+
+qint64 History::receiverSession(const QString &location, const QString &stream, const QString &target,
+                                int family, int intervalMs, const QString &protocol, int port,
+                                const QString &interfaceName) {
+    if (!open()) return 0;
+    error_.clear();
+    try {
+        Transaction tx(db_, true);
+        Statement lookup(db_, "SELECT session FROM receiver_streams WHERE location=? AND stream=?");
+        lookup.string(1, location);
+        lookup.string(2, stream);
+        if (lookup.next()) {
+            auto id = lookup.integer(0);
+            tx.commit();
+            return id;
+        }
+        const auto id = insertSession(db_, target, family, intervalMs, protocol, port, interfaceName);
+        Statement bind(db_, "INSERT INTO receiver_streams(location,stream,session) VALUES(?,?,?)");
+        bind.string(1, location);
+        bind.string(2, stream);
+        bind.integer(3, id);
+        bind.next();
+        tx.commit();
+        return id;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return 0;
+    }
+}
+
+bool History::setSessionOrigin(qint64 id, const QString &location, const QString &resolvedAddress,
+                               qint64 clockOffsetMs, qint64 clockErrorMs, qint64 lastReceivedMs, qint64 sampleThroughMs) {
+    if (!open()) return false;
+    error_.clear();
+    try {
+        Transaction tx(db_, true);
+        // Retried or backfilled samples can predate the last clock estimate already visible in this stream.
+        if (sampleThroughMs >= 0) {
+            Statement old(db_, "UPDATE session_origin SET received_ms=max(received_ms,?1) WHERE session=?2 "
+                               "AND (SELECT last_ms FROM sessions WHERE id=?2)>?3");
+            old.integer(1, lastReceivedMs);
+            old.integer(2, id);
+            old.integer(3, sampleThroughMs);
+            old.next();
+            if (sqlite3_changes(db_)) {
+                tx.commit();
+                return true;
+            }
+        }
+        Statement bind(db_, "INSERT OR REPLACE INTO session_origin VALUES(?,?,?,?,?,?)");
+        bind.integer(1, id);
+        bind.string(2, location);
+        bind.string(3, resolvedAddress);
+        bind.integer(4, clockOffsetMs);
+        bind.integer(5, clockErrorMs);
+        bind.integer(6, lastReceivedMs);
+        bind.next();
+        tx.commit();
+        return true;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return false;
     }
 }
 
@@ -376,22 +459,34 @@ bool History::addNote(qint64 id, qint64 timeMs, QString text) {
     }
 }
 
-QVariantList History::sessions() {
+QVariantList History::sessions(bool remoteOnly) {
     QVariantList list;
     if (!open())
         return list;
     error_.clear();
     try {
-        Statement q(db_, "SELECT id,target,family,interval_ms,coalesce(first_ms,created_ms),"
+        QByteArray query = "SELECT id,target,family,interval_ms,coalesce(first_ms,created_ms),"
                          "coalesce(last_ms,created_ms),closed_tabs.session IS NOT NULL,"
-                         "coalesce(p.protocol,'auto'),coalesce(p.port,33434),coalesce(p.interface_name,'') "
+                         "coalesce(p.protocol,'auto'),coalesce(p.port,33434),coalesce(p.interface_name,''),"
+                         "coalesce(o.location,r.location,''),coalesce(o.resolved_address,''),coalesce(o.clock_offset_ms,0),"
+                         "coalesce(o.clock_error_ms,-1),coalesce(o.received_ms,0),r.session IS NOT NULL, i.session IS NOT NULL, coalesce(i.correction_ms,0) "
                          "FROM sessions LEFT JOIN session_probe p ON p.session=sessions.id "
-                         "LEFT JOIN closed_tabs ON closed_tabs.session=sessions.id ORDER BY id DESC");
+                         "LEFT JOIN imported_sessions i ON i.session=sessions.id "
+                         "LEFT JOIN receiver_streams r ON r.session=sessions.id "
+                         "LEFT JOIN session_origin o ON o.session=sessions.id "
+                         "LEFT JOIN closed_tabs ON closed_tabs.session=sessions.id ";
+        if (remoteOnly) query += "WHERE r.session IS NOT NULL ";
+        query += "ORDER BY id DESC";
+        Statement q(db_, query.constData());
         while (q.next())
             list << QVariantMap{{"id", q.integer(0)},      {"target", q.string(1)},
                                 {"family", q.integer(2)},  {"intervalMs", q.integer(3)},
                                 {"startMs", q.integer(4)}, {"endMs", q.integer(5)}, {"closed", bool(q.integer(6))},
-                                {"protocol", q.string(7)}, {"port", q.integer(8)}, {"interfaceName", q.string(9)}};
+                                {"protocol", q.string(7)}, {"port", q.integer(8)}, {"interfaceName", q.string(9)},
+                                {"location", q.string(10)}, {"resolvedAddress", q.string(11)}, {"clockOffsetMs", q.integer(12)},
+                                {"clockErrorMs", q.integer(13)}, {"lastReceivedMs", q.integer(14)},
+                                {"remote", !q.string(10).isEmpty()}, {"remoteLive", bool(q.integer(15))},
+                                {"imported", bool(q.integer(16))}, {"manualCorrectionMs", q.integer(17)}};
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
         list.clear();
@@ -642,9 +737,15 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
         note.integer(2, start);
         note.integer(3, end);
         QVariantList notes;
-        while (!timelinesOnly && note.next())
+        while (note.next())
             notes << QVariantMap{{"timeMs", note.integer(0)}, {"text", note.string(1)}};
         tx.commit();
+        if (timelinesOnly && !notes.isEmpty()) {
+            if (charts.isEmpty()) charts.append(QVariantMap{{"buckets", QVariantList{}}, {"destination", true}});
+            auto chart = charts.first().toMap();
+            chart["notes"] = notes;
+            charts[0] = chart;
+        }
         result["notes"] = notes;
         result["rows"] = rows;
         result["charts"] = charts;

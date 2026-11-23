@@ -106,6 +106,44 @@ bool seedExample(const QString &file) {
             batch.push_back({id, stamp, hop, lost ? QString() : address,
                              lost ? -1.0 : rtt, hop == 9 && !lost});
         }
+        if (round % 5 == 0) {
+            const bool slow = round >= 1660 && round < 1682;
+            const double connect = slow ? 195. : 23.;
+            const double wait = slow ? 220. : 32.;
+            const double elapsed = connect * 2 + 2 + wait;
+            const bool failed = round == 1670;
+            const auto event = failed ? QString("HTTP 503") : QString{};
+            if (!h.appendDiagnostic(id, {{"kind", "service"},
+                                         {"t", stamp},
+                                         {"url", "https://edge.example.net/"},
+                                         {"address", "2001:db8:9::1"},
+                                         {"family", 6},
+                                         {"periodMs", 5000},
+                                         {"status", failed ? 503 : 200},
+                                         {"event", event},
+                                         {"error", event},
+                                         {"dns", 2.},
+                                         {"connect", connect},
+                                         {"tls", connect},
+                                         {"firstByte", wait},
+                                         {"ttfb", elapsed},
+                                         {"total", elapsed}}))
+                return false;
+            if (!h.appendDiagnostic(id, {{"kind", "interface"},
+                                         {"t", stamp},
+                                         {"name", "eth0"},
+                                         {"periodMs", 5000},
+                                         {"carrier", 1},
+                                         {"ap", ""},
+                                         {"rx", 85000. + 10000. * std::sin(round * 0.1)},
+                                         {"tx", 43000.},
+                                         {"rxDrops", 0},
+                                         {"txDrops", 0},
+                                         {"rxErrors", 0},
+                                         {"txErrors", 0},
+                                         {"event", ""}}))
+                return false;
+        }
         if (batch.size() >= 900) {
             if (!h.append(batch))
                 return false;
@@ -142,7 +180,7 @@ int main(int argc, char **argv) {
     else
         app = std::make_unique<QCoreApplication>(argc, argv);
     app->setApplicationName("hopline");
-    app->setApplicationVersion("0.3.0");
+    app->setApplicationVersion("0.4.0");
     QCommandLineParser parser;
     parser.setApplicationDescription("Hopline — continuous IPv4 and IPv6 path monitoring");
     parser.addHelpOption();
@@ -233,7 +271,7 @@ int main(int argc, char **argv) {
     Backend backend(file);
     if (parser.isSet("replay")) {
         backend.setReplayMode();
-        backend.zoomToRange(incident.from, std::max(incident.from + 1, incident.through));
+        backend.restoreIncident(incident);
     }
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("backend", &backend);

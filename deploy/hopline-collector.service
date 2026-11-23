@@ -1,0 +1,20 @@
+[Unit]
+Description=Hopline outbound path telemetry collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/hopline-node collect /etc/hopline/collector.json
+User=hopline
+Group=hopline
+StateDirectory=hopline-collector
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

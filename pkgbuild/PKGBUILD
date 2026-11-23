@@ -1,9 +1,9 @@
 pkgname=hopline
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Native IPv4 and IPv6 network path monitor with interactive history"
 arch=('x86_64' 'aarch64')
-depends=('glibc' 'libgcc' 'libglvnd' 'libstdc++' 'qt6-base' 'qt6-declarative' 'sqlite')
+depends=('curl' 'glibc' 'libgcc' 'libglvnd' 'libstdc++' 'qt6-base' 'qt6-declarative' 'sqlite')
 makedepends=('pkgconf')
 options=('!debug')
 source=("hopline-${pkgver}.tar.gz")
@@ -16,6 +16,13 @@ build() {
 }
 package() {
     cd "$srcdir/hopline"
+    install -Dm755 build-node/hopline-node "$pkgdir/usr/bin/hopline-node"
+    install -Dm644 deploy/hopline-sysusers.conf "$pkgdir/usr/lib/sysusers.d/hopline.conf"
+    for mode in collector receiver; do
+        install -Dm644 "deploy/hopline-$mode.service" "$pkgdir/usr/lib/systemd/system/hopline-$mode.service"
+        install -Dm644 "deploy/$mode.example.json" "$pkgdir/usr/share/doc/hopline/$mode.example.json"
+    done
+    install -Dm644 docs/telemetry.md "$pkgdir/usr/share/doc/hopline/telemetry.md"
     install -Dm755 build/hopline "$pkgdir/usr/bin/hopline"
     install -Dm644 pkgbuild/hopline.desktop "$pkgdir/usr/share/applications/hopline.desktop"
     install -Dm644 pkgbuild/hopline.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/hopline.svg"

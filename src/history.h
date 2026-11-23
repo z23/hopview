@@ -4,6 +4,8 @@
 #include <QList>
 #include <QSet>
 #include <optional>
+#include <functional>
+#include <functional>
 #include <QVariantMap>
 
 struct sqlite3;
@@ -21,11 +23,25 @@ class History {
     QString error() const;
     qint64 createSession(QString target, int family, int intervalMs, QString protocol = QStringLiteral("auto"),
                        int port = 0, QString interfaceName = {});
-    QVariantList sessions();
+    qint64 dataVersion();
+    QVariantList sessions(bool remoteOnly = false);
+    qint64 receiverSession(const QString &location, const QString &stream, const QString &target,
+                           int family, int intervalMs, const QString &protocol, int port, const QString &interfaceName);
+    bool setSessionOrigin(qint64 session, const QString &location, const QString &resolvedAddress,
+                          qint64 clockOffsetMs = 0, qint64 clockErrorMs = -1, qint64 lastReceivedMs = 0,
+                          qint64 sampleThroughMs = -1);
+    QVariantList comparePeriods(qint64 id, qint64 baselineFrom, qint64 baselineThrough, qint64 incidentFrom,
+                                qint64 incidentThrough, const std::function<bool()> &cancel);
     bool setTabClosed(qint64 session, bool closed);
     bool setInterval(qint64 session, int intervalMs);
     bool addNote(qint64 session, qint64 timeMs, QString text);
     bool append(const QVector<Sample> &samples, QList<qint64> *newEvents = nullptr);
+    QVariantMap diagnosticsSettings();
+    bool saveDiagnostics(qint64 id, const QString &url, const QString &interface, int seconds);
+    bool appendDiagnostic(qint64 id, const QVariantMap &record);
+    bool eachDiagnostic(qint64 id, qint64 from, qint64 through,
+                        const std::function<void(const QVariantMap &)> &visit);
+    QVariantList diagnosticTracks(qint64 id, qint64 from, qint64 through, int pixels);
     QVariantMap monitoringSettings();
     bool saveBackground(bool enabled, const QSet<qint64> &active);
     bool setAlertRule(qint64 id, double latency, double loss, int seconds);
@@ -36,7 +52,14 @@ class History {
                    QVariantList &events, bool &more);
     QVariantMap view(qint64 session, qint64 viewStart, qint64 viewEnd, qint64 focusStart, qint64 focusEnd,
                      QList<int> selectedHops, int pixels, bool timelinesOnly = false);
-    bool exportIncident(qint64 session, qint64 from, qint64 through, const QString &file, bool csv);
+    bool exportIncident(qint64 session, qint64 from, qint64 through, const QString &file, bool csv,
+                        QList<qint64> comparisons = {}, QList<int> pinnedHops = {0});
+    bool markImported(qint64 session, qint64 correction);
+    bool adoptIncident(const QString &database, QList<qint64> &sessions, qint64 from, qint64 through);
+    QStringList groupNames();
+    bool saveGroup(QString name, const QList<qint64> &sessions, const QList<int> &hops, QVariantMap view = {});
+    bool openGroup(const QString &name, QList<qint64> &sessions, QList<int> &hops, QVariantMap *view = nullptr);
+    bool deleteGroup(const QString &name);
 
   private:
     struct AlertState {
@@ -44,6 +67,7 @@ class History {
         double latency, loss, total;
         int candidate;
     };
+    void createDiagnosticTables();
     void createMonitoringTables();
     std::optional<AlertState> loadAlertState(qint64 id);
     void saveAlertState(const AlertState &s);

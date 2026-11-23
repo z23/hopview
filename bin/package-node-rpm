@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Build on the same major Enterprise Linux release as the destination hosts.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+out="${1:-$root/build-rpm}"
+mkdir -p "$out"
+out=$(realpath "$out")
+spec="$root/rpm/hopline-node.spec"
+version=$(awk '/^Version:/ {print $2}' "$spec")
+name="hopline-node-$version"
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+mkdir -p "$work/SOURCES" "$work/BUILD" "$work/BUILDROOT" "$work/SPECS" "$work/SRPMS" "$work/RPMS"
+tar -C "$root" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${SOURCE_DATE_EPOCH:-0}" \
+    --transform "s,^,$name/," -czf "$work/SOURCES/$name.tar.gz" node.pro src deploy docs/telemetry.md
+rpmbuild -ba --define "_topdir $work" "$spec"
+find "$work/RPMS" "$work/SRPMS" -name '*.rpm' -type f -exec cp -t "$out" -- {} +

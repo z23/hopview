@@ -1,10 +1,11 @@
 QT += core gui quick quickcontrols2 qml network dbus
 CONFIG += c++20 link_pkgconfig
-PKGCONFIG += sqlite3
+PKGCONFIG += sqlite3 libcurl
 TEMPLATE = app
 TARGET = hopline
-SOURCES += src/main.cpp src/backend.cpp src/background.cpp src/history.cpp src/incident.cpp \
-           src/monitoring.cpp src/probe.cpp src/routeevents.cpp src/graph.cpp
-HEADERS += src/backend.h src/background.h src/history.h src/incident.h src/probe.h src/probeoptions.h \
-           src/routeevents.h src/sqlhelpers.h src/types.h src/graph.h
+SOURCES += src/main.cpp src/backend.cpp src/background.cpp src/baseline.cpp src/baselineview.cpp \
+           src/diagnostics.cpp src/diagnostichistory.cpp src/graph.cpp src/groups.cpp src/groupview.cpp \
+           src/history.cpp src/incident.cpp src/monitoring.cpp src/probe.cpp src/remotes.cpp src/routeevents.cpp
+HEADERS += src/backend.h src/background.h src/diagnostics.h src/graph.h src/history.h src/incident.h \
+           src/probe.h src/probeoptions.h src/routeevents.h src/sqlhelpers.h src/types.h
 RESOURCES += src/resources.qrc
