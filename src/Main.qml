@@ -11,7 +11,8 @@ C.ApplicationWindow {
     height: 800
     minimumWidth: 760
     minimumHeight: 530
-    visible: true
+    property bool startHidden: false
+    visible: !startHidden
     title: activeTarget.length ? activeTarget + " — Hopline" : "Hopline"
     color: base
     font.family: "Inter"
@@ -60,8 +61,20 @@ C.ApplicationWindow {
     readonly property real profileCeiling: scaleCeiling(rows)
     readonly property real timeCeiling: niceScale(backend.snapshot.timeMax || 0)
     property real cursorFraction: -1
-    property int cursorHop: -1
-    property var cursorBucket: null
+    function cursorSample(series, interval) {
+        if (cursorFraction < 0 || !series.length) return null
+        const pixels = backend.snapshot.pixels || 1
+        const where = cursorFraction * pixels
+        let left = 0, right = series.length
+        while (left < right) {
+            const mid = (left + right) >> 1
+            if (series[mid].x < where) left = mid + 1
+            else right = mid
+        }
+        let sample = series[left]
+        if (left && (!sample || where - series[left - 1].x < sample.x - where)) sample = series[left - 1]
+        return sample && Math.abs(sample.x - where) <= Math.max(1, pixels * interval / (2 * viewSpan)) ? sample : null
+    }
     property double rangeAnchorMs: -1
     property double rangeEndMs: -1
     readonly property bool selectingRange: rangeAnchorMs >= 0 && rangeEndMs >= 0
@@ -101,7 +114,7 @@ C.ApplicationWindow {
         return null
     }
     function selected(hop) {
-        for (const c of charts) if (c.hop === hop) return true
+        for (const c of charts) if (!c.comparisonId && c.hop === hop) return true
         return false
     }
     function moveZoom(direction) {
@@ -118,11 +131,19 @@ C.ApplicationWindow {
         if (!backend.sessionId) return
         exportDialog.open()
     }
+    function chooseIncident(csv) {
+        incidentDialog.csv = csv
+        incidentDialog.session = backend.sessionId
+        incidentDialog.fromMs = Math.max(0, backend.focusStart)
+        incidentDialog.throughMs = backend.focusEnd
+        incidentDialog.open()
+    }
     function launch() {
         let target = destination.text.trim()
         if (!target.length) { inputError = true; destination.forceActiveFocus(); return }
         inputError = false
-        backend.startTrace(target, [0, 4, 6][family.currentIndex], [250, 500, 1000, 2500, 5000][interval.currentIndex])
+        backend.startTrace(target, [0, 4, 6][family.currentIndex], [250, 500, 1000, 2500, 5000][interval.currentIndex],
+                           probeControls.protocol, probeControls.port, probeControls.interfaceName)
     }
     onChartWidthChanged: pixelTimer.restart()
     onUiScaleChanged: pixelTimer.restart()
@@ -201,6 +222,7 @@ C.ApplicationWindow {
                 Rectangle { color: app.edge; Layout.leftMargin: 9; Layout.rightMargin: 8; implicitWidth: 1; implicitHeight: 25 }
                 C.TextField {
                     id: destination
+                    visible: !backend.replayMode
                     objectName: "destinationInput"
                     Layout.fillWidth: true
                     Layout.maximumWidth: 410
@@ -222,10 +244,12 @@ C.ApplicationWindow {
                         border.color: app.inputError ? app.lossColor : destination.activeFocus ? app.accent : "#3a4956"
                     }
                 }
-                TraceCombo { id: family; implicitWidth: 83; model: ["Auto IP", "IPv4", "IPv6"]; hint: "Address family" }
-                TraceCombo { id: interval; implicitWidth: 85; model: ["0.25 s", "0.5 s", "1 s", "2.5 s", "5 s"]; currentIndex: 2; hint: "Interval between trace rounds" }
-                TraceButton { text: "Start trace"; primary: true; accent: app.accent; onClicked: app.launch() }
-                Item { Layout.fillWidth: true; visible: workspace.width > 950 }
+                TraceCombo { id: family; visible: !backend.replayMode; implicitWidth: 83; model: ["Auto IP", "IPv4", "IPv6"]; hint: "Address family" }
+                TraceCombo { id: interval; visible: !backend.replayMode; implicitWidth: 85; model: ["0.25 s", "0.5 s", "1 s", "2.5 s", "5 s"]; currentIndex: 2; hint: "Interval between trace rounds" }
+                ProbeControls { id: probeControls; visible: !backend.replayMode; }
+                TraceButton { text: "Start trace"; visible: !backend.replayMode; primary: true; accent: app.accent; onClicked: app.launch() }
+                Caption { visible: backend.replayMode; text: "Offline incident replay" }
+                Item { Layout.fillWidth: true; visible: workspace.width > 950 || backend.replayMode }
             }
         }
         Rule { Layout.fillWidth: true }
@@ -268,11 +292,13 @@ C.ApplicationWindow {
                         Caption { id: tabName; width: Math.min(210, implicitWidth); anchors.verticalCenter: parent.verticalCenter; color: tab.active ? app.ink : app.mute; text: tab.modelData.target }
                     }
                     TapHandler {
+                        enabled: !backend.replayMode
                         acceptedButtons: Qt.MiddleButton
                         onTapped: backend.closeSession(tab.modelData.id)
                     }
                     C.ToolButton {
                         id: closeTab
+                        visible: !backend.replayMode
                         objectName: "closeTab" + (tab.modelData.id || "")
                         anchors.right: parent.right; anchors.rightMargin: 3; anchors.verticalCenter: parent.verticalCenter
                         width: 25; height: 26
@@ -295,6 +321,9 @@ C.ApplicationWindow {
                     C.ToolTip.visible: hovered && !closeTab.hovered
                     C.ToolTip.delay: 600
                     C.ToolTip.text: modelData.target + " · " + app.timeText(modelData.startMs, true)
+                                    + "\n" + (modelData.protocol || "auto").toUpperCase()
+                                    + (modelData.protocol === "auto" ? " (UDP/" + modelData.port + " fallback)" : modelData.port ? "/" + modelData.port : "")
+                                    + (modelData.interfaceName ? " · " + modelData.interfaceName : "")
                 }
                 WheelHandler {
                     enabled: sessionsList.contentWidth > sessionsList.width
@@ -375,6 +404,11 @@ C.ApplicationWindow {
                 }
                 Heading { text: "Start a trace"; anchors.horizontalCenter: parent.horizontalCenter }
                 Caption { text: "Enter a hostname or IP address to compare latency and loss at each hop."; anchors.horizontalCenter: parent.horizontalCenter }
+                Row {
+                    anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
+                    TraceButton { text: "Open incident…"; onClicked: openIncident.open() }
+                    TraceButton { visible: backend.backgroundAvailable; text: "Recording and alerts…"; onClicked: alertsDialog.open() }
+                }
             }
         }
         C.SplitView {
@@ -402,7 +436,24 @@ C.ApplicationWindow {
                         Caption { visible: workspace.width >= 875; text: backend.live ? app.rows.length + (app.rows.length === 1 ? " hop" : " hops")
                             : app.timeText(backend.focusStart, false) + " – " + app.timeText(backend.focusEnd, false) }
                         Item { Layout.fillWidth: true }
-                        TraceButton { text: "Save PNG"; hint: "Save the visible graphs (Ctrl+Shift+S)"; onClicked: app.chooseExport() }
+                        TraceButton {
+                            id: actionsButton; objectName: "traceActions"
+                            text: "Trace actions ▾"
+                            onClicked: actionsMenu.open()
+                            C.Menu {
+                                id: actionsMenu
+                                y: actionsButton.height
+                                width: 230
+                                background: Rectangle { color: app.panel; border.color: app.edge; radius: 5 }
+                                ActionItem { text: "Route history…"; onTriggered: routeHistory.open() }
+                                ActionItem { text: "Recording and alerts…"; enabled: backend.backgroundAvailable; onTriggered: alertsDialog.open() }
+                                C.MenuSeparator {}
+                                ActionItem { text: "Save graph as PNG…"; onTriggered: app.chooseExport() }
+                                ActionItem { text: "Export focus as CSV…"; onTriggered: app.chooseIncident(true) }
+                                ActionItem { objectName: "saveIncidentAction"; text: "Save replayable incident…"; onTriggered: app.chooseIncident(false) }
+                                ActionItem { text: "Open incident…"; onTriggered: openIncident.open() }
+                            }
+                        }
                         Caption { text: "Focus" }
                         TraceCombo {
                             implicitWidth: 85
@@ -412,7 +463,7 @@ C.ApplicationWindow {
                             onActivated: i => backend.setFocusSeconds(app.focusOptions[i])
                             hint: "Time window used for hop statistics"
                         }
-                        TraceButton { objectName: "pauseButton"; text: backend.running ? "Pause" : "Resume"; onClicked: backend.toggleRunning(); hint: backend.running ? "Pause collection" : "Resume collection for this target" }
+                        TraceButton { objectName: "pauseButton"; visible: !backend.replayMode; text: backend.running ? "Pause" : "Resume"; onClicked: backend.toggleRunning(); hint: backend.running ? "Pause collection" : "Resume collection for this target" }
                     }
                     Rectangle {
                         Layout.fillWidth: true; implicitHeight: 29
@@ -567,6 +618,12 @@ C.ApplicationWindow {
                             text: "■ >200 ms"; color: "#ce9398"
                         }
                         Item { Layout.fillWidth: true }
+                        TraceButton {
+                            objectName: "compareTargets"
+                            visible: backend.sessions.length > 1
+                            text: backend.comparisonIds.length ? "Compare (" + backend.comparisonIds.length + ")" : "Compare…"
+                            onClicked: compareDialog.open()
+                        }
                         Caption { text: "View" }
                         TraceCombo {
                             objectName: "timelineDuration"
@@ -608,27 +665,34 @@ C.ApplicationWindow {
                                     id: track
                                     required property int index
                                     readonly property var modelData: app.charts[index] || ({hop: 0, buckets: []})
-                                    readonly property var info: app.findRow(modelData.hop)
+                                    readonly property bool peer: !!modelData.comparisonId
+                                    readonly property var info: peer ? null : app.findRow(modelData.hop)
+                                    readonly property int intervalMs: modelData.intervalMs || (app.currentSession ? app.currentSession.intervalMs : 1000)
+                                    readonly property var cursorSample: app.cursorSample(modelData.buckets, intervalMs)
+                                    readonly property string trackKey: peer ? "peer" + modelData.comparisonId : "hop" + modelData.hop
                                     width: trackColumn.width
                                     height: Math.max(76, tracks.height / Math.max(1, app.charts.length))
                                     Rectangle { anchors.fill: parent; color: app.well }
                                     Caption {
                                         x: 7; y: 8; width: app.chartLabelWidth - 13
-                                        text: track.modelData.destination ? "Destination" : "Hop " + track.modelData.hop
+                                        text: track.peer ? "Comparison · " + (track.modelData.family ? "IPv" + track.modelData.family : "Auto IP")
+                                            : track.modelData.destination ? "Destination" : "Hop " + track.modelData.hop
                                         color: app.ink; font.weight: Font.DemiBold
                                     }
                                     Caption {
                                         x: 7; y: 28; width: app.chartLabelWidth - 13
-                                        text: track.modelData.destination ? app.activeTarget
+                                        text: track.peer ? track.modelData.target : track.modelData.destination ? app.activeTarget
                                             : track.info ? (track.info.hostname || track.info.address || "No reply") : ""
                                         font.family: "monospace"; font.pixelSize: 11
                                     }
                                     Caption {
                                         x: 7; anchors.bottom: parent.bottom; anchors.bottomMargin: 9
                                         width: app.chartLabelWidth - 13
-                                        text: app.cursorHop === track.modelData.hop && app.cursorBucket
-                                            ? (app.cursorBucket.avg >= 0 ? app.msLabel(+app.cursorBucket.avg.toFixed(1)) : "No reply")
-                                                + "  ·  " + app.percent(app.cursorBucket.loss) + " loss"
+                                        objectName: "cursorValue" + track.trackKey
+                                        text: track.cursorSample
+                                            ? (track.cursorSample.avg >= 0 ? app.msLabel(+track.cursorSample.avg.toFixed(1)) : "No reply")
+                                                + "  ·  " + app.percent(track.cursorSample.loss) + " loss"
+                                            : app.cursorFraction >= 0 ? "No samples"
                                             : "0 – " + app.msLabel(app.timeCeiling)
                                         color: app.faint; font.pixelSize: 11
                                     }
@@ -651,10 +715,10 @@ C.ApplicationWindow {
                                             samples: track.modelData.buckets
                                             pixels: Math.max(1, backend.snapshot.pixels || 1)
                                             ceiling: app.timeCeiling; accent: app.accent
-                                            maxGap: Math.max(3, app.chartWidth * (app.currentSession ? app.currentSession.intervalMs : 1000) * 3 / app.viewSpan)
+                                            maxGap: Math.max(3, app.chartWidth * track.intervalMs * 3 / app.viewSpan)
                                         }
                                         Repeater {
-                                            model: backend.snapshot.notes || []
+                                            model: track.peer ? [] : backend.snapshot.notes || []
                                             Rectangle {
                                                 required property var modelData
                                                 x: (modelData.timeMs - backend.viewStart) / app.viewSpan * plotArea.width
@@ -677,7 +741,7 @@ C.ApplicationWindow {
                                         }
                                         MouseArea {
                                             id: chartMouse
-                                            objectName: "timelineInput" + track.modelData.hop
+                                            objectName: track.peer ? "compareInput" + track.modelData.comparisonId : "timelineInput" + track.modelData.hop
                                             anchors.fill: parent
                                             acceptedButtons: Qt.LeftButton | Qt.RightButton
                                             hoverEnabled: true
@@ -700,22 +764,10 @@ C.ApplicationWindow {
                                             }
                                             function updateCursor(xp) {
                                                 app.cursorFraction = Math.max(0, Math.min(1, xp / width))
-                                                app.cursorHop = track.modelData.hop
-                                                const samples = track.modelData.buckets
-                                                const where = app.cursorFraction * (backend.snapshot.pixels || 1)
-                                                let left = 0, right = samples.length
-                                                while (left < right) {
-                                                    const mid = (left + right) >> 1
-                                                    if (samples[mid].x < where) left = mid + 1
-                                                    else right = mid
-                                                }
-                                                let best = samples[left]
-                                                if (left > 0 && (!best || where - samples[left - 1].x < best.x - where)) best = samples[left - 1]
-                                                app.cursorBucket = best && Math.abs(best.x - where) <= Math.max(3, width * (app.currentSession ? app.currentSession.intervalMs : 1000) / app.viewSpan) ? best : null
                                             }
                                             onPressed: e => {
                                                 startX = e.x; previousX = e.x; mouseDrag = false
-                                                if (e.button === Qt.RightButton) { app.openNote(e.x / width); return }
+                                                if (e.button === Qt.RightButton) { if (!track.peer) app.openNote(e.x / width); return }
                                                 panGesture = !!(e.modifiers & Qt.ShiftModifier)
                                                 pressViewStart = backend.viewStart
                                                 pressSpan = app.viewSpan
@@ -744,12 +796,12 @@ C.ApplicationWindow {
                                                 clearDrag()
                                             }
                                             onCanceled: clearDrag()
-                                            onExited: { app.cursorFraction = -1; app.cursorBucket = null; app.cursorHop = -1 }
+                                            onExited: app.cursorFraction = -1
                                             onWheel: e => {
                                                 if (e.modifiers & Qt.ControlModifier) { app.moveZoom(e.angleDelta.y > 0 ? -1 : 1); e.accepted = true }
                                                 else e.accepted = false
                                             }
-                                            C.ToolTip.visible: containsMouse && app.nearbyNote(app.cursorFraction) !== null && !noteDialog.visible
+                                            C.ToolTip.visible: !track.peer && containsMouse && app.nearbyNote(app.cursorFraction) !== null && !noteDialog.visible
                                             C.ToolTip.delay: 350
                                             C.ToolTip.text: { const n = app.nearbyNote(app.cursorFraction); return n ? n.text : "" }
                                         }
@@ -801,7 +853,7 @@ C.ApplicationWindow {
                 Caption { visible: app.currentSession !== null && workspace.width >= 820 && app.cursorFraction < 0; text: "Click to focus  ·  Drag to zoom  ·  Shift-drag to pan  ·  Right-click to annotate"; font.pixelSize: 11 }
                 Caption { visible: !!app.currentSession; text: "Interval"; font.pixelSize: 11 }
                 TraceCombo {
-                    visible: !!app.currentSession; implicitHeight: 26; implicitWidth: 77
+                    enabled: !backend.replayMode; visible: !!app.currentSession; implicitHeight: 26; implicitWidth: 77
                     readonly property var choices: [250, 500, 1000, 2500, 5000]
                     model: ["0.25 s", "0.5 s", "1 s", "2.5 s", "5 s"]
                     currentIndex: app.currentSession ? choices.indexOf(app.currentSession.intervalMs) : 2
@@ -857,6 +909,74 @@ C.ApplicationWindow {
                 TraceButton { text: "Save"; enabled: noteText.text.trim().length > 0; primary: true; accent: app.accent; onClicked: { backend.saveNote(noteDialog.stamp, noteText.text.trim()); noteDialog.close() } }
             }
         }
+    }
+    component ActionItem: C.MenuItem {
+        id: action
+        implicitHeight: 34
+        contentItem: Caption { text: action.text; color: action.enabled ? app.ink : app.faint; leftPadding: 8 }
+        background: Rectangle { color: action.highlighted ? "#344552" : "transparent" }
+    }
+    AlertsDialog { id: alertsDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    RouteHistory { id: routeHistory; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    C.Dialog {
+        id: compareDialog
+        objectName: "compareDialog"
+        modal: true; focus: true; parent: C.Overlay.overlay
+        anchors.centerIn: parent; scale: app.uiScale
+        width: Math.min(460, app.width / app.uiScale - 30)
+        padding: 16
+        background: Rectangle { color: app.panel; border.color: app.edge; radius: 6 }
+        contentItem: ColumnLayout {
+            spacing: 10
+            Heading { text: "Compare destinations" }
+            ListView {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(contentHeight, app.height / app.uiScale * 0.5)
+                clip: true
+                model: backend.sessions.filter(s => s.id !== backend.sessionId)
+                C.ScrollBar.vertical: C.ScrollBar {}
+                delegate: C.CheckDelegate {
+                    id: peerChoice
+                    required property var modelData
+                    objectName: "compareChoice" + modelData.id
+                    width: ListView.view.width
+                    checked: backend.comparisonIds.includes(modelData.id)
+                    text: modelData.target + "  ·  " + (modelData.family ? "IPv" + modelData.family : "Auto IP")
+                    Accessible.name: text
+                    onClicked: backend.toggleComparison(modelData.id)
+                    background: Rectangle { color: peerChoice.hovered ? "#344552" : app.well }
+                    contentItem: Column {
+                        leftPadding: 6
+                        Caption { text: peerChoice.text; color: app.ink; width: peerChoice.width - 60 }
+                        Caption { text: app.timeText(peerChoice.modelData.startMs, true); font.pixelSize: 11 }
+                    }
+                }
+            }
+            TraceButton { text: "Done"; Layout.alignment: Qt.AlignRight; onClicked: compareDialog.close() }
+        }
+    }
+    Dialogs.FileDialog {
+        id: incidentDialog
+        objectName: "incidentExportDialog"
+        property bool csv: false
+        property double session
+        property double fromMs
+        property double throughMs
+        fileMode: Dialogs.FileDialog.SaveFile
+        title: (csv ? "Export CSV" : "Save incident") + " · " + app.timeText(fromMs, false) + " – " + app.timeText(throughMs, false)
+        nameFilters: csv ? ["CSV data (*.csv)"] : ["Hopline incident (*.hopline)"]
+        defaultSuffix: csv ? "csv" : "hopline"
+        onAccepted: backend.exportIncident(session, fromMs, throughMs, selectedFile, csv)
+    }
+    Dialogs.FileDialog {
+        id: openIncident
+        title: "Open incident"
+        nameFilters: ["Hopline incident (*.hopline)", "All files (*)"]
+        onAccepted: backend.openReplay(selectedFile)
+    }
+    Connections {
+        target: backend
+        function onIncidentExported(ok, message) { app.exportStatus = message; exportMessageTimer.restart() }
     }
     Dialogs.FileDialog {
         id: exportDialog

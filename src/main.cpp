@@ -1,6 +1,9 @@
+#include "probeoptions.h"
 #include "backend.h"
+#include "background.h"
 #include "graph.h"
 #include "history.h"
+#include "incident.h"
 #include "probe.h"
 #include <QCommandLineParser>
 #include <QDateTime>
@@ -28,16 +31,17 @@ int fail(const QString &message) {
     return 1;
 }
 
-int report(QCoreApplication &app, const QString &host, int family, int interval, int seconds) {
+int report(QCoreApplication &app, const QString &host, int family, int interval, int seconds, const ProbeOptions &options) {
     QTemporaryDir dir;
     History history(dir.filePath("report.sqlite"));
     if (!dir.isValid() || !history.open())
         return fail(history.error());
-    const auto session = history.createSession(host, family, interval);
+    const auto session = history.createSession(host, family, interval, options.protocol, options.port, options.interfaceName);
     if (session <= 0)
         return fail(history.error());
     Probe probe;
     QString status;
+    QVariantMap resolved;
     bool fatalError = false;
     auto finish = [&] {
         probe.shutdown();
@@ -49,10 +53,15 @@ int report(QCoreApplication &app, const QString &host, int family, int interval,
             status = "No completed probes. " + status;
         }
         QVariantMap result{
-            {"target", host}, {"family", family}, {"status", status}, {"rows", summary.value("rows")}};
+            {"target", host}, {"family", family}, {"protocol", options.protocol}, {"port", options.destinationPort()},
+            {"interfaceName", options.interfaceName}, {"status", status}, {"rows", summary.value("rows")}};
+        result.insert(resolved);
         QTextStream(stdout) << QJsonDocument::fromVariant(result).toJson(QJsonDocument::Indented);
         app.exit(fatalError ? 1 : 0);
     };
+    QObject::connect(&probe, &Probe::resolved, &app, [&](qint64, QString address, QString method, int port) {
+        resolved = {{"resolvedAddress", address}, {"effectiveProtocol", method}, {"effectivePort", port}};
+    });
     QObject::connect(&probe, &Probe::status, &app, [&](qint64, QString text, bool fatal) {
         status = text;
         if (fatal) {
@@ -67,7 +76,7 @@ int report(QCoreApplication &app, const QString &host, int family, int interval,
             QTimer::singleShot(0, &app, finish);
         }
     });
-    QTimer::singleShot(0, &app, [&] { probe.start(session, host, family, interval); });
+    QTimer::singleShot(0, &app, [&] { probe.start(session, host, family, interval, options.protocol, options.port, options.interfaceName); });
     QObject::connect(&probe, &Probe::finished, &app, [&](qint64) { QTimer::singleShot(0, &app, finish); });
     QTimer::singleShot(seconds * 1000, &app, [&] { probe.finish(session); });
     return app.exec();
@@ -78,6 +87,7 @@ bool seedExample(const QString &file) {
     History h(file);
     if (!h.open())
         return false;
+    const auto gateway = h.createSession("192.0.2.1", 4, 1000);
     const auto id = h.createSession("edge.example.net", 6, 1000);
     if (id <= 0)
         return false;
@@ -85,13 +95,15 @@ bool seedExample(const QString &file) {
     QVector<Sample> batch;
     for (int round = 0; round < 1800; ++round) {
         const auto stamp = end - (1799 - round) * 1000LL;
+        batch.push_back({gateway, stamp, 1, "192.0.2.1", 1.3 + 0.4 * std::sin(round * 0.14), true});
         for (int hop = 1; hop <= 9; ++hop) {
             const bool incident = round >= 1660 && round < 1682 && hop >= 5;
             const auto rtt = 0.55 + 1.7 * hop + 0.13 * hop * hop +
                              1.8 * std::abs(std::sin(round * 0.14 + hop)) +
                              (incident ? 180 + 35 * std::sin(round * 0.4) : 0);
             const auto lost = (incident && round % 5 == 0) || (hop == 3 && round % 11 == 0);
-            batch.push_back({id, stamp, hop, lost ? QString() : QString("2001:db8:%1::1").arg(hop),
+            const auto address = hop == 5 && round < 1660 ? QString("2001:db8:5::2") : QString("2001:db8:%1::1").arg(hop);
+            batch.push_back({id, stamp, hop, lost ? QString() : address,
                              lost ? -1.0 : rtt, hop == 9 && !lost});
         }
         if (batch.size() >= 900) {
@@ -100,7 +112,7 @@ bool seedExample(const QString &file) {
             batch.clear();
         }
     }
-    return true;
+    return h.append(batch) && h.addNote(id,end - 139000, "Upstream latency increased");
 }
 
 QColor desktopAccent(const QString &fileName) {
@@ -120,7 +132,7 @@ int main(int argc, char **argv) {
     bool graphical = true;
     for (int i = 1; i < argc; ++i) {
         const QByteArray arg(argv[i]);
-        if (arg == "--report" || arg.startsWith("--report=") || arg == "--help" || arg == "--help-all" ||
+        if (arg == "--report" || arg.startsWith("--report=") || arg == "--help" || arg == "--help-all" || arg == "--quit" ||
             arg == "-h" || arg == "-v" || arg == "--version")
             graphical = false;
     }
@@ -130,7 +142,7 @@ int main(int argc, char **argv) {
     else
         app = std::make_unique<QCoreApplication>(argc, argv);
     app->setApplicationName("hopline");
-    app->setApplicationVersion("0.2.0");
+    app->setApplicationVersion("0.3.0");
     QCommandLineParser parser;
     parser.setApplicationDescription("Hopline — continuous IPv4 and IPv6 path monitoring");
     parser.addHelpOption();
@@ -140,8 +152,14 @@ int main(int argc, char **argv) {
         {{"report", "Collect a finite trace and print per-hop JSON without opening a window.", "target"},
          {"seconds", "Duration in seconds for a headless report (1–3600).", "seconds", "10"},
          {"family", "Select auto, 4, or 6.", "family", "auto"},
+         {"protocol", "Select auto, icmp, udp, or tcp.", "method", "auto"},
+         {"port", "Fixed destination port for TCP (default 443) or UDP (default 33434).", "port"},
+         {"interface", "Bind probes to this outgoing network interface.", "name"},
          {"interval", "Time between probe rounds in milliseconds (250–60000).", "milliseconds", "1000"},
+         {"background", "Keep recording after window close and start with the window closed."},
+         {"quit", "Shut down the recorder for this database and flush pending samples."},
          {"database", "Open a specific SQLite history file.", "file"},
+         {"replay", "Open an exported incident in an offline window.", "file"},
          {"demo", "Explore an isolated example session without sending probes."}});
     parser.process(*app);
     bool okInterval = false, okDuration = false;
@@ -152,33 +170,71 @@ int main(int argc, char **argv) {
         return fail("Family must be auto, 4, or 6.");
     if (!okInterval || interval < 250 || interval > 60000 || !okDuration || seconds < 1 || seconds > 3600)
         return fail("Interval must be 250–60000 ms and duration must be 1–3600 seconds.");
+    bool okPort = true;
+    const int port = parser.isSet("port") ? parser.value("port").toInt(&okPort) : 0;
+    const ProbeOptions options{parser.value("protocol").toLower(), port, parser.value("interface")};
+    if (!okPort || (parser.isSet("port") && port < 1) || !options.valid())
+        return fail("Use auto, icmp, udp, or tcp. A TCP/UDP port must be between 1 and 65535.");
     const int family = familyText.toInt();
     const auto args = parser.positionalArguments();
     if (args.size() > 1)
         return fail("Supply at most one target.");
+    const bool isolated = parser.isSet("demo") || parser.isSet("replay");
+    if ((parser.isSet("background") || parser.isSet("quit")) && (isolated || parser.isSet("report")))
+        return fail("Recorder options require a regular recording database.");
+    if (parser.isSet("quit") && (!args.isEmpty() || parser.isSet("background")))
+        return fail("Use --quit alone or with --database.");
     if (parser.isSet("report")) {
-        if (!args.isEmpty() || parser.isSet("demo") || parser.isSet("database") ||
+        if (!args.isEmpty() || parser.isSet("demo") || parser.isSet("database") || parser.isSet("replay") ||
             parser.value("report").trimmed().isEmpty())
             return fail("Use --report with a single target and a temporary recording.");
-        return report(*app, parser.value("report"), family, interval, seconds);
+        return report(*app, parser.value("report"), family, interval, seconds, options);
     }
     if (parser.isSet("demo") && (!args.isEmpty() || parser.isSet("database")))
         return fail("Use --demo alone to open a temporary example.");
-    QGuiApplication::setDesktopFileName("hopline");
-    QQuickStyle::setStyle("Basic");
-    qmlRegisterType<GraphView>("Hopline.Graphics", 1, 0, "GraphView");
+    if (parser.isSet("replay") && (!args.isEmpty() || parser.isSet("database") || parser.isSet("demo")))
+        return fail("Use --replay with a single incident file.");
     QString file = parser.value("database");
+    IncidentRange incident;
     std::unique_ptr<QTemporaryDir> demo;
     if (parser.isSet("demo")) {
         demo = std::make_unique<QTemporaryDir>();
         file = demo->filePath("example.sqlite");
         if (!demo->isValid() || !seedExample(file))
             return fail("Could not create the sample recording.");
+    } else if (parser.isSet("replay")) {
+        demo = std::make_unique<QTemporaryDir>();
+        if (!demo->isValid()) return fail(demo->errorString());
+        file = demo->filePath("replay.sqlite");
+        History imported(file);
+        QString error;
+        if (!importIncident(parser.value("replay"), imported, incident, error))
+            return fail(error);
     } else if (file.isEmpty()) {
         const QString path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
         file = QDir(path).filePath("history.sqlite");
     }
+    BackgroundInstance instance;
+    const QString action = parser.isSet("quit") ? "quit" : parser.isSet("background") ? "background" : "show";
+    const QJsonObject request{{"action", action}, {"target", args.value(0)}, {"family", family},
+                              {"interval", interval}, {"protocol", options.protocol},
+                              {"port", options.port}, {"interface", options.interfaceName}};
+    if (!isolated) {
+        QString error;
+        const auto result = instance.acquire(file, request, error);
+        if (result == BackgroundInstance::Failed)
+            return fail(error);
+        if (result == BackgroundInstance::Forwarded)
+            return 0;
+    }
+    QGuiApplication::setDesktopFileName("hopline");
+    QQuickStyle::setStyle("Basic");
+    qmlRegisterType<GraphView>("Hopline.Graphics", 1, 0, "GraphView");
     Backend backend(file);
+    if (parser.isSet("replay")) {
+        backend.setReplayMode();
+        backend.zoomToRange(incident.from, std::max(incident.from + 1, incident.through));
+    }
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("backend", &backend);
     const auto themeDir = QDir::homePath() + "/.local/state/omarchy/current/theme";
@@ -194,10 +250,54 @@ int main(int argc, char **argv) {
     QObject::connect(&watcher, &QFileSystemWatcher::directoryChanged, &engine, applyTheme);
     QObject::connect(&watcher, &QFileSystemWatcher::fileChanged, &engine, applyTheme);
     applyTheme();
+    engine.setInitialProperties({{"startHidden", action == "background"}});
     engine.load(QUrl("qrc:/Main.qml"));
     if (engine.rootObjects().isEmpty())
         return fail("Could not load the Hopline window.");
-    if (!args.isEmpty())
-        QTimer::singleShot(0, &backend, [&] { backend.startTrace(args.first(), family, interval); });
+    auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().front());
+    if (!window)
+        return fail("Could not initialize the Hopline window.");
+    if (!isolated) {
+        backend.enableRecorder();
+        BackgroundInstance::enableGracefulExit();
+        auto updateQuitPolicy = [&] { QGuiApplication::setQuitOnLastWindowClosed(!backend.backgroundEnabled()); };
+        QObject::connect(&backend, &Backend::monitoringChanged, app.get(), updateQuitPolicy);
+        updateQuitPolicy();
+        QObject::connect(window, &QWindow::visibleChanged, &backend, &Backend::setWindowVisible);
+        backend.setWindowVisible(window->isVisible());
+        auto activate = [window] {
+            window->show();
+            window->raise();
+            window->requestActivate();
+        };
+        QObject::connect(&backend, &Backend::destinationAlert, &instance, &BackgroundInstance::notify);
+        QObject::connect(&instance, &BackgroundInstance::openEvent, &backend, [&, activate](QVariantMap e) {
+            activate();
+            backend.showAlert(e["session"].toLongLong(), e["startMs"].toLongLong(), e["endMs"].toLongLong());
+        });
+        auto handle = [&, activate](const QJsonObject &r) {
+            if (r["action"] == "quit") {
+                QTimer::singleShot(0, app.get(), &QCoreApplication::quit);
+                return;
+            }
+            if (r["action"] == "background") {
+                backend.setBackgroundEnabled(true);
+                if (backend.backgroundEnabled())
+                    window->close();
+                else
+                    activate();
+            } else {
+                activate();
+            }
+            const auto target = r["target"].toString().trimmed();
+            if (target.isEmpty())
+                return;
+            ProbeOptions probeOptions{r["protocol"].toString(), r["port"].toInt(), r["interface"].toString()};
+            backend.startTrace(target, r["family"].toInt(), r["interval"].toInt(),
+                               probeOptions.protocol, probeOptions.port, probeOptions.interfaceName, true);
+        };
+        handle(request);
+        instance.handleRequests(handle);
+    }
     return app->exec();
 }

@@ -1,4 +1,7 @@
+#include "probeoptions.h"
 #include "history.h"
+#include "routeevents.h"
+#include "sqlhelpers.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -16,69 +19,11 @@
 #include <utility>
 #include <vector>
 
+using namespace hopline_sql;
+
 namespace {
 constexpr std::array<qint64, 3> spans{10000, 60000, 3600000};
 constexpr qint64 timeLimit = std::numeric_limits<qint64>::max() - 3600001;
-
-void check(sqlite3 *db, int result) {
-    if (result != SQLITE_OK)
-        throw std::runtime_error(sqlite3_errmsg(db));
-}
-
-void execute(sqlite3 *db, const char *sql) {
-    check(db, sqlite3_exec(db, sql, nullptr, nullptr, nullptr));
-}
-
-class Statement {
-  public:
-    Statement(sqlite3 *db, const char *sql) : db_(db) {
-        check(db, sqlite3_prepare_v2(db, sql, -1, &stmt_, nullptr));
-    }
-    ~Statement() { sqlite3_finalize(stmt_); }
-    Statement(const Statement &) = delete;
-    Statement &operator=(const Statement &) = delete;
-    void reset() { check(db_, sqlite3_reset(stmt_)); }
-    void integer(int i, qint64 n) { check(db_, sqlite3_bind_int64(stmt_, i, n)); }
-    void number(int i, double n) { check(db_, sqlite3_bind_double(stmt_, i, n)); }
-    void string(int i, const QString &s) {
-        const auto u = s.toUtf8();
-        check(db_, sqlite3_bind_text(stmt_, i, u.constData(), u.size(), SQLITE_TRANSIENT));
-    }
-    bool next() {
-        const int result = sqlite3_step(stmt_);
-        if (result == SQLITE_ROW)
-            return true;
-        if (result != SQLITE_DONE)
-            check(db_, result);
-        return false;
-    }
-    qint64 integer(int i) const { return sqlite3_column_int64(stmt_, i); }
-    double number(int i) const { return sqlite3_column_double(stmt_, i); }
-    QString string(int i) const {
-        return QString::fromUtf8(reinterpret_cast<const char *>(sqlite3_column_text(stmt_, i)));
-    }
-
-  private:
-    sqlite3 *db_;
-    sqlite3_stmt *stmt_ = nullptr;
-};
-
-class Transaction {
-  public:
-    Transaction(sqlite3 *db, bool writer) : db_(db) { execute(db_, writer ? "BEGIN IMMEDIATE" : "BEGIN"); }
-    ~Transaction() {
-        if (active_)
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-    }
-    void commit() {
-        execute(db_, "COMMIT");
-        active_ = false;
-    }
-
-  private:
-    sqlite3 *db_;
-    bool active_ = true;
-};
 
 // Rollups retain the first and last successful RTT so joining adjacent buckets
 // includes the jitter transition across the boundary. A loss counts as a sent
@@ -144,6 +89,9 @@ constexpr char schema[] = R"SQL(
 CREATE TABLE IF NOT EXISTS sessions(
  id INTEGER PRIMARY KEY,target TEXT NOT NULL,family INTEGER NOT NULL,interval_ms INTEGER NOT NULL,
  created_ms INTEGER NOT NULL,first_ms INTEGER,last_ms INTEGER);
+CREATE TABLE IF NOT EXISTS session_probe(
+ session INTEGER PRIMARY KEY REFERENCES sessions(id),protocol TEXT NOT NULL,port INTEGER NOT NULL,
+ interface_name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS closed_tabs(
  session INTEGER PRIMARY KEY REFERENCES sessions(id));
 CREATE TABLE IF NOT EXISTS notes(
@@ -328,6 +276,7 @@ bool History::open() {
         execute(db_, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON");
         Transaction tx(db_, true);
         execute(db_, schema);
+        createMonitoringTables();
         upgradeRollups(db_);
         tx.commit();
         return true;
@@ -339,18 +288,30 @@ bool History::open() {
     }
 }
 
-qint64 History::createSession(QString target, int family, int intervalMs) {
+qint64 History::createSession(QString target, int family, int intervalMs, QString protocol, int port,
+                              QString interfaceName) {
     if (!open())
         return 0;
     error_.clear();
     try {
+        const ProbeOptions options{protocol, port, interfaceName};
+        if (!options.valid()) throw std::runtime_error("Invalid probe protocol or destination port");
+        Transaction tx(db_, true);
         Statement q(db_, "INSERT INTO sessions(target,family,interval_ms,created_ms) VALUES(?,?,?,?)");
         q.string(1, target);
         q.integer(2, family);
         q.integer(3, intervalMs);
         q.integer(4, QDateTime::currentMSecsSinceEpoch());
         q.next();
-        return sqlite3_last_insert_rowid(db_);
+        const auto id = sqlite3_last_insert_rowid(db_);
+        Statement probe(db_, "INSERT INTO session_probe(session,protocol,port,interface_name) VALUES(?,?,?,?)");
+        probe.integer(1, id);
+        probe.string(2, protocol);
+        probe.integer(3, options.destinationPort());
+        probe.string(4, interfaceName);
+        probe.next();
+        tx.commit();
+        return id;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
         return 0;
@@ -422,12 +383,15 @@ QVariantList History::sessions() {
     error_.clear();
     try {
         Statement q(db_, "SELECT id,target,family,interval_ms,coalesce(first_ms,created_ms),"
-                         "coalesce(last_ms,created_ms),closed_tabs.session IS NOT NULL FROM sessions "
+                         "coalesce(last_ms,created_ms),closed_tabs.session IS NOT NULL,"
+                         "coalesce(p.protocol,'auto'),coalesce(p.port,33434),coalesce(p.interface_name,'') "
+                         "FROM sessions LEFT JOIN session_probe p ON p.session=sessions.id "
                          "LEFT JOIN closed_tabs ON closed_tabs.session=sessions.id ORDER BY id DESC");
         while (q.next())
             list << QVariantMap{{"id", q.integer(0)},      {"target", q.string(1)},
                                 {"family", q.integer(2)},  {"intervalMs", q.integer(3)},
-                                {"startMs", q.integer(4)}, {"endMs", q.integer(5)}, {"closed", bool(q.integer(6))}};
+                                {"startMs", q.integer(4)}, {"endMs", q.integer(5)}, {"closed", bool(q.integer(6))},
+                                {"protocol", q.string(7)}, {"port", q.integer(8)}, {"interfaceName", q.string(9)}};
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
         list.clear();
@@ -435,7 +399,8 @@ QVariantList History::sessions() {
     return list;
 }
 
-bool History::append(const QVector<Sample> &samples) {
+bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
+    if (newEvents) newEvents->clear();
     if (!open())
         return false;
     error_.clear();
@@ -485,6 +450,7 @@ bool History::append(const QVector<Sample> &samples) {
                 it->second.second = s->timeMs;
         }
 
+        QList<qint64> eventIds;
         for (const auto &[key, outcome] : rounds) {
             const auto [id, time] = key;
             setDestination.reset();
@@ -496,6 +462,18 @@ bool History::append(const QVector<Sample> &samples) {
             if (sqlite3_changes(db_))
                 for (const auto span : spans)
                     changed[{id, 0, span, time / span * span}].add(outcome);
+        }
+        for (auto it = rounds.begin(); it != rounds.end();) {
+            const auto id = it->first.first;
+            auto end = it;
+            while (end != rounds.end() && end->first.first == id)
+                ++end;
+            if (auto rule = loadAlertState(id)) {
+                for (; it != end; ++it)
+                    evaluateDestination(*rule, it->first.second, it->second.current, eventIds);
+                saveAlertState(*rule);
+            }
+            it = end;
         }
         Reader reader(db_);
         Statement put(db_, saveBinSql);
@@ -542,6 +520,7 @@ bool History::append(const QVector<Sample> &samples) {
             session.next();
         }
         tx.commit();
+        if (newEvents) *newEvents = std::move(eventIds);
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
@@ -550,7 +529,7 @@ bool History::append(const QVector<Sample> &samples) {
 }
 
 QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart, qint64 focusEnd,
-                          QList<int> selected, int pixels) {
+                          QList<int> selected, int pixels, bool timelinesOnly) {
     pixels = std::clamp(pixels, 1, 8192);
     QVariantMap result{{"rows", QVariantList{}},
                        {"charts", QVariantList{}},
@@ -574,7 +553,7 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
         hops.integer(3, focusStart);
         QVariantList rows, charts;
         double timeMax = 0;
-        while (hops.next()) {
+        while (!timelinesOnly && hops.next()) {
             const int hop = hops.integer(0);
             Stats s;
             reader.range(s, id, hop, focusStart, focusEnd);
@@ -663,7 +642,7 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
         note.integer(2, start);
         note.integer(3, end);
         QVariantList notes;
-        while (note.next())
+        while (!timelinesOnly && note.next())
             notes << QVariantMap{{"timeMs", note.integer(0)}, {"text", note.string(1)}};
         tx.commit();
         result["notes"] = notes;
@@ -674,4 +653,78 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
         error_ = QString::fromUtf8(e.what());
     }
     return result;
+}
+
+// Read bounded time slices through the existing (session,hop,t) primary key. The
+// synthetic target series supplies the round clock, including complete timeouts.
+bool History::routePage(qint64 session, RouteEvents &detector, qint64 &cursor, qint64 &until,
+                        QVariantList &events, bool &more) {
+    constexpr int pageSize = 512;
+    more = false;
+    events.clear();
+    if (!open())
+        return false;
+    error_.clear();
+    try {
+        Transaction tx(db_, false);
+        if (cursor < 0) {
+            Statement end(db_, "SELECT max(t) FROM samples WHERE session=? AND hop=0");
+            end.integer(1, session);
+            end.next();
+            until = end.integer(0);
+        }
+        Statement clock(db_, "SELECT t FROM samples WHERE session=? AND hop=0 AND t>? AND t<=? ORDER BY t LIMIT ?");
+        clock.integer(1, session);
+        clock.integer(2, cursor);
+        clock.integer(3, until);
+        clock.integer(4, pageSize);
+        QVector<RouteRound> rounds;
+        QHash<qint64, int> index;
+        while (clock.next()) {
+            const auto stamp = clock.integer(0);
+            index.insert(stamp, rounds.size());
+            rounds.append({stamp, {}, 0, -1});
+        }
+        if (!rounds.isEmpty()) {
+            const auto start = rounds.front().timeMs, end = rounds.back().timeMs;
+            Statement hops(db_, "SELECT hop FROM hops WHERE session=? AND first_ms<=? AND last_ms>=?");
+            hops.integer(1, session);
+            hops.integer(2, end);
+            hops.integer(3, start);
+            Statement raw(db_, "SELECT t,address,dest,rtt FROM samples WHERE session=? AND hop=? AND t BETWEEN ? AND ? AND rtt>=0");
+            while (hops.next()) {
+                const int ttl = hops.integer(0);
+                raw.reset();
+                raw.integer(1, session);
+                raw.integer(2, ttl);
+                raw.integer(3, start);
+                raw.integer(4, end);
+                while (raw.next()) {
+                    auto it = index.constFind(raw.integer(0));
+                    if (it == index.cend())
+                        continue;
+                    auto &round = rounds[it.value()];
+                    const QString address = raw.string(1);
+                    if (!address.isEmpty())
+                        round.replies.insert(ttl, address);
+                    if (!address.isEmpty() && raw.integer(2) && (!round.destinationHop || ttl < round.destinationHop)) {
+                        round.destinationHop = ttl;
+                        round.destinationRtt = raw.number(3);
+                    }
+                }
+            }
+            for (const auto &round : rounds) {
+                auto event = detector.observe(round);
+                if (!event.isEmpty())
+                    events.append(std::move(event));
+            }
+            cursor = end;
+            more = end < until && rounds.size() == pageSize;
+        }
+        tx.commit();
+        return true;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return false;
+    }
 }

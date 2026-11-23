@@ -1,9 +1,14 @@
+#include "probeoptions.h"
+#include <QNetworkInterface>
 #include "backend.h"
 #include "history.h"
+#include "routeevents.h"
 #include "probe.h"
 #include <QDateTime>
 #include <QHostInfo>
 #include <QHostAddress>
+#include <QProcess>
+#include <QCoreApplication>
 #include <algorithm>
 #include <utility>
 
@@ -18,7 +23,8 @@ QObject *contextOn(QThread &thread) {
 qint64 now() { return QDateTime::currentMSecsSinceEpoch(); }
 } // namespace
 
-Backend::Backend(const QString &file, QObject *parent) : QObject(parent) {
+Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_historyPath(file) {
+    m_exports.setMaxThreadCount(1);
     m_writerContext = contextOn(m_writerThread);
     m_readContext = contextOn(m_readThread);
     m_probe = new Probe;
@@ -30,9 +36,14 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent) {
         [&] {
             m_writer = std::make_unique<History>(file);
             m_ready = m_writer->open();
-            if (m_ready)
+            if (m_ready) {
                 m_sessions = m_writer->sessions();
-            else
+                const auto settings = m_writer->monitoringSettings();
+                m_resumeSessions = settings["active"].toList();
+                m_background = settings["background"].toBool();
+                m_alertRules = settings["rules"].toMap();
+                m_alertEvents = m_writer->alertEvents(-1);
+            } else
                 m_status = m_writer->error();
         },
         Qt::BlockingQueuedConnection);
@@ -69,7 +80,7 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent) {
     connect(&m_coalesce, &QTimer::timeout, this, &Backend::fetchView);
     m_refresh.setInterval(750);
     connect(&m_refresh, &QTimer::timeout, this, [this] {
-        if (!m_session || (!m_dirty && !running()))
+        if (!m_windowVisible || !m_session || (!m_dirty && !running()))
             return;
         m_dirty = false;
         if (m_live) {
@@ -86,6 +97,7 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent) {
 Backend::~Backend() {
     m_refresh.stop();
     m_coalesce.stop();
+    m_exports.waitForDone();
     QMetaObject::invokeMethod(m_probe, [this] { m_probe->shutdown(); }, Qt::BlockingQueuedConnection);
     m_collectorThread.quit();
     m_collectorThread.wait();
@@ -147,18 +159,28 @@ void Backend::flushSamples() {
     }
     if (batch.isEmpty() || !m_writer)
         return;
-    if (!m_writer->append(batch)) {
+    QList<qint64> eventIds;
+    if (!m_writer->append(batch, &eventIds)) {
         const QString error = m_writer->error();
         QMetaObject::invokeMethod(this, [this, error] {
             recordingError(tr("History write failed; collection paused. %1").arg(error));
         });
         return;
     }
+    if (!eventIds.isEmpty()) {
+        auto events = m_writer->alertEvents(eventIds.front() - 1);
+        QMetaObject::invokeMethod(this, [this, events] {
+            m_alertEvents = (events + m_alertEvents).mid(0, 200);
+            emit alertsChanged();
+            for (auto it = events.crbegin(); it != events.crend(); ++it)
+                emit destinationAlert(it->toMap());
+        });
+    }
     QHash<qint64, qint64> ends;
     for (const auto &s : batch)
         ends[s.session] = std::max(ends.value(s.session), s.timeMs);
     QMetaObject::invokeMethod(this, [this, ends = std::move(ends)]() mutable {
-        const bool selectedUpdated = ends.contains(m_session);
+        const bool selectedUpdated = ends.contains(m_session) || std::any_of(m_comparisons.cbegin(), m_comparisons.cend(), [&](qint64 id) { return ends.contains(id); });
         // Most batches belong entirely to open tabs. A final batch may arrive
         // after a tab closes, while its recording is still being flushed.
         for (auto *list : {&m_sessions, &m_closedSessions}) {
@@ -178,7 +200,7 @@ void Backend::flushSamples() {
         }
         if (selectedUpdated) {
             m_dirty = true;
-            if (m_snapshot.isEmpty())
+            if (m_snapshot.isEmpty() && m_windowVisible)
                 scheduleView(false);
         }
     });
@@ -195,10 +217,13 @@ QVariantMap Backend::sessionInfo(qint64 id) const {
 
 qint64 Backend::earliest() const { return sessionInfo(m_session).value("startMs").toLongLong(); }
 qint64 Backend::latest() const {
-    if (running())
-        return now();
-    const auto info = sessionInfo(m_session);
-    return std::max(info.value("startMs").toLongLong(), info.value("endMs").toLongLong());
+    auto end = sessionInfo(m_session).value("endMs").toLongLong();
+    if (running()) return now();
+    for (auto peer : m_comparisons) {
+        if (m_active.contains(peer)) return now();
+        end = std::max(end, sessionInfo(peer).value("endMs").toLongLong());
+    }
+    return end;
 }
 qint64 Backend::focusEnd() const {
     if (m_focusSecs < 0)
@@ -220,6 +245,62 @@ QVariantList Backend::selectedHops() const {
         result.append(hop);
     return result;
 }
+QVariantList Backend::comparisonIds() const {
+    QVariantList ids;
+    for (auto id : m_comparisons)
+        ids.append(id);
+    return ids;
+}
+
+void Backend::toggleComparison(qint64 id) {
+    if (!m_session || id == m_session || sessionInfo(id).isEmpty())
+        return;
+    if (!m_comparisons.removeOne(id))
+        m_comparisons.append(id);
+    if (m_live)
+        m_viewEnd = latest();
+    emit viewportChanged();
+    scheduleView();
+}
+
+void Backend::exportIncident(qint64 id, qint64 from, qint64 through, QUrl file, bool csv) {
+    if (!m_ready || !id || !file.isLocalFile()) {
+        emit incidentExported(false, tr("Choose a local output file."));
+        return;
+    }
+    const auto path = file.toLocalFile();
+    m_exports.start([this, id, from, through, path, csv] {
+        History reader(m_historyPath);
+        const bool ok = reader.exportIncident(id, from, through, path, csv);
+        const auto message = ok ? tr("Saved incident to %1").arg(path) : reader.error();
+        QMetaObject::invokeMethod(this, [this, ok, message] { emit incidentExported(ok, message); });
+    });
+}
+
+void Backend::openReplay(QUrl url) {
+    if (!url.isLocalFile()) {
+        setStatus(tr("Choose a local incident recording."));
+        return;
+    }
+    // An independent window can outlive its launcher. Surface invalid files in the opening window.
+    auto *viewer = new QProcess;
+    connect(viewer, &QProcess::finished, viewer, &QObject::deleteLater);
+    connect(viewer, &QProcess::finished, this, [this, viewer](int code, QProcess::ExitStatus) {
+        if (code)
+            setStatus(tr("Could not open incident: %1")
+                          .arg(QString::fromUtf8(viewer->readAllStandardError()).trimmed().right(500)));
+    });
+    connect(viewer, &QProcess::errorOccurred, viewer, [viewer](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            viewer->deleteLater();
+    });
+    connect(viewer, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            setStatus(tr("Could not launch the incident viewer."));
+    });
+    viewer->start(QCoreApplication::applicationFilePath(), {"--replay", url.toLocalFile()});
+}
+
 void Backend::setStatus(QString message) {
     if (message == m_status)
         return;
@@ -227,7 +308,22 @@ void Backend::setStatus(QString message) {
     emit statusChanged();
 }
 
-void Backend::startTrace(QString target, int family, int intervalMs) {
+QStringList Backend::interfaceNames() const {
+    QStringList names;
+    for (const auto &iface : QNetworkInterface::allInterfaces())
+        if (iface.flags().testFlag(QNetworkInterface::IsUp)) names.append(iface.name());
+    names.sort();
+    return names;
+}
+
+void Backend::startTrace(QString target, int family, int intervalMs, QString protocol, int port, QString interfaceName, bool reuseRunning) {
+    if (m_replayMode) return;
+    const ProbeOptions options{protocol, port, interfaceName};
+    if (!options.valid()) {
+        setStatus(tr("Choose a valid probe protocol and destination port."));
+        return;
+    }
+    port = options.destinationPort();
     target = target.trimmed();
     if (!m_ready)
         return;
@@ -236,11 +332,27 @@ void Backend::startTrace(QString target, int family, int intervalMs) {
         setStatus(tr("Enter a hostname or address and an interval between 0.25 and 60 seconds."));
         return;
     }
-    QMetaObject::invokeMethod(m_writerContext, [this, target, family, intervalMs] {
-        const auto id = m_writer->createSession(target, family, intervalMs);
+    const QVariantList key{target, family, intervalMs, protocol, port, interfaceName};
+    if (reuseRunning) {
+        if (m_pendingStarts.contains(key))
+            return;
+        for (const auto &entry : m_sessions) {
+            const auto trace = entry.toMap();
+            if (trace["running"].toBool() && trace["target"] == target && trace["family"].toInt() == family &&
+                trace["intervalMs"].toInt() == intervalMs && trace["protocol"] == protocol &&
+                trace["port"].toInt() == port && trace["interfaceName"] == interfaceName) {
+                selectSession(trace["id"].toLongLong());
+                return;
+            }
+        }
+    }
+    m_pendingStarts.append(key);
+    QMetaObject::invokeMethod(m_writerContext, [this, target, family, intervalMs, protocol, port, interfaceName, key] {
+        const auto id = m_writer->createSession(target, family, intervalMs, protocol, port, interfaceName);
         const auto error = m_writer->error();
         const auto stamp = now();
-        QMetaObject::invokeMethod(this, [this, id, target, family, intervalMs, error, stamp] {
+        QMetaObject::invokeMethod(this, [this, id, target, family, intervalMs, error, stamp, protocol, port, interfaceName, key] {
+            m_pendingStarts.removeOne(key);
             if (id <= 0) {
                 setStatus(error);
                 return;
@@ -248,6 +360,7 @@ void Backend::startTrace(QString target, int family, int intervalMs) {
             m_sessions.prepend(QVariantMap{{"id", id},
                                            {"target", target},
                                            {"family", family},
+                                           {"protocol", protocol}, {"port", port}, {"interfaceName", interfaceName},
                                            {"intervalMs", intervalMs},
                                            {"startMs", stamp},
                                            {"endMs", stamp},
@@ -270,23 +383,31 @@ void Backend::setActive(qint64 id, bool active) {
         entry = info;
         break;
     }
+    persistRecordingSet();
     emit sessionsChanged();
 }
 void Backend::runSession(qint64 id) {
     const auto info = sessionInfo(id);
-    if (!m_ready || info.isEmpty())
+    if (m_replayMode || !m_ready || info.isEmpty())
         return;
+    QMetaObject::invokeMethod(m_writerContext, [this, id] {
+        if (!m_writer->resetAlertWindow(id)) {
+            auto error = m_writer->error();
+            QMetaObject::invokeMethod(this, [this, error] { setStatus(error); });
+        }
+    });
     setActive(id, true);
     m_messages[id] = tr("Resolving target…");
     setStatus(m_messages[id]);
     goLive();
     QMetaObject::invokeMethod(m_probe, [this, id, info] {
         m_probe->start(id, info.value("target").toString(), info.value("family").toInt(),
-                       info.value("intervalMs").toInt());
+                       info.value("intervalMs").toInt(), info.value("protocol", "auto").toString(),
+                       info.value("port").toInt(), info.value("interfaceName").toString());
     });
 }
 void Backend::setIntervalMs(int intervalMs) {
-    if (!m_session || intervalMs < 250 || intervalMs > 60000)
+    if (m_replayMode || !m_session || intervalMs < 250 || intervalMs > 60000)
         return;
     const qint64 id = m_session;
     QMetaObject::invokeMethod(m_writerContext, [this, id, intervalMs] {
@@ -307,7 +428,8 @@ void Backend::setIntervalMs(int intervalMs) {
                     QMetaObject::invokeMethod(m_probe, [this, id, info, intervalMs] {
                         m_probe->stop(id);
                         m_probe->start(id, info.value("target").toString(), info.value("family").toInt(),
-                                       intervalMs);
+                                       intervalMs, info.value("protocol", "auto").toString(),
+                                       info.value("port").toInt(), info.value("interfaceName").toString());
                     });
                 }
                 emit sessionsChanged();
@@ -350,13 +472,14 @@ void Backend::selectSession(qint64 id) {
     if (id == m_session || (id && sessionInfo(id).isEmpty()))
         return;
     if (m_session)
-        m_views[m_session] = {m_hops, m_spanMs, m_focusSecs, m_live, m_viewEnd, m_focusCenter};
+        m_views[m_session] = {m_hops, m_spanMs, m_focusSecs, m_live, m_viewEnd, m_focusCenter, m_comparisons};
     m_session = id;
     const auto saved = m_views.value(id);
     m_hops = saved.hops;
     m_spanMs = saved.spanMs;
     m_focusSecs = saved.focusSeconds;
     m_live = saved.live;
+    m_comparisons = saved.comparisons;
     m_viewEnd = m_live ? latest() : saved.end;
     m_focusCenter = saved.center;
     m_snapshot.clear();
@@ -375,13 +498,13 @@ void Backend::selectSession(qint64 id) {
 void Backend::closeSession(qint64 id) { changeTabVisibility(id, true); }
 void Backend::reopenSession(qint64 id) { changeTabVisibility(id, false); }
 
-void Backend::changeTabVisibility(qint64 id, bool closed) {
+void Backend::changeTabVisibility(qint64 id, bool closed, qint64 fromMs, qint64 through) {
     if (!m_ready || id <= 0)
         return;
-    QMetaObject::invokeMethod(m_writerContext, [this, id, closed] {
+    QMetaObject::invokeMethod(m_writerContext, [this, id, closed, fromMs, through] {
         const bool ok = m_writer->setTabClosed(id, closed);
         const QString error = m_writer->error();
-        QMetaObject::invokeMethod(this, [this, id, closed, ok, error] {
+        QMetaObject::invokeMethod(this, [this, id, closed, ok, error, fromMs, through] {
             if (!ok) {
                 setStatus(error);
                 return;
@@ -393,14 +516,25 @@ void Backend::changeTabVisibility(qint64 id, bool closed) {
                     continue;
                 auto info = from.takeAt(i).toMap();
                 if (closed && m_active.remove(id)) {
+                    persistRecordingSet();
                     info["running"] = false;
                     m_messages[id] = tr("Paused");
                     QMetaObject::invokeMethod(m_probe, [this, id] { m_probe->stop(id); });
                 }
                 to.prepend(info);
-                if (!closed)
+                if (closed) {
+                    for (auto &saved : m_views)
+                        saved.comparisons.removeAll(id);
+                    if (m_comparisons.removeAll(id)) {
+                        if (m_live) m_viewEnd = latest();
+                        emit viewportChanged();
+                        scheduleView();
+                    }
+                }
+                if (!closed) {
                     selectSession(id);
-                else if (id == m_session) {
+                    if (through > fromMs) zoomToRange(fromMs, through);
+                } else if (id == m_session) {
                     const auto next =
                         from.isEmpty() ? 0
                                        : from.at(std::min(i, from.size() - 1)).toMap().value("id").toLongLong();
@@ -424,7 +558,7 @@ void Backend::toggleHop(int hop) {
     }
     // A destination can time out throughout the focus window.
     for (const auto &chart : m_snapshot.value("charts").toList()) {
-        if (chart.toMap().value("destination").toBool() && chart.toMap().value("hop").toInt() == hop) {
+        if (!chart.toMap().contains("comparisonId") && chart.toMap().value("destination").toBool() && chart.toMap().value("hop").toInt() == hop) {
             hop = 0;
             break;
         }
@@ -445,7 +579,7 @@ void Backend::zoomToRange(qint64 a, qint64 b) {
     if (!m_session || a == b || a < 0 || b < 0)
         return;
     m_viewEnd = std::max(a, b);
-    m_spanMs = std::min(m_viewEnd - std::min(a, b), qint64(7) * 86400000);
+    m_spanMs = m_viewEnd - std::min(a, b);
     m_focusSecs = 0;
     m_focusCenter = 0;
     m_live = false;
@@ -471,7 +605,10 @@ void Backend::panBy(qint64 deltaMs) {
     if (!m_session || !deltaMs)
         return;
     const qint64 end = latest();
-    const auto minEnd = std::min(end, earliest() + m_spanMs);
+    auto first = earliest();
+    for (auto peer : m_comparisons)
+        first = std::min(first, sessionInfo(peer).value("startMs").toLongLong());
+    const auto minEnd = std::min(end, first + m_spanMs);
     m_viewEnd = std::clamp(m_viewEnd + deltaMs, minEnd, end);
     m_focusCenter = 0;
     m_live = false;
@@ -512,44 +649,89 @@ void Backend::fetchView() {
     const auto version = m_version;
     const auto pixels = m_pixels;
     const auto revision = m_revisions.value(id);
-    QMetaObject::invokeMethod(m_readContext, [this, id, start, end, fs, fe, hops, version, pixels, revision] {
-        auto &cache = m_chartCache;
-        const bool reuse = cache.id == id && cache.start == start && cache.end == end && cache.hops == hops &&
-                           cache.pixels == pixels && cache.revision == revision;
-        auto view = m_reader->view(id, start, end, fs, fe, reuse ? QList<int>{} : hops, pixels);
-        if (reuse) {
-            view["charts"] = cache.charts;
-            view["timeMax"] = cache.timeMax;
-        } else if (m_reader->error().isEmpty()) {
-            cache = {id,
-                     start,
-                     end,
-                     pixels,
-                     revision,
-                     hops,
-                     view.value("charts").toList(),
-                     view.value("timeMax").toDouble()};
-        }
-        view["focusStart"] = fs;
-        view["focusEnd"] = fe;
-        view["viewStart"] = start;
-        view["viewEnd"] = end;
-        view["sessionId"] = id;
-        const auto error = m_reader->error();
-        QMetaObject::invokeMethod(this, [this, version, view = std::move(view), error]() mutable {
-            m_busy = false;
-            if (version == m_version) {
-                if (!error.isEmpty())
-                    setStatus(error);
-                m_snapshot = std::move(view);
-                refreshNames();
-                emit snapshotChanged();
-                resolveNames();
+    QVariantList peers;
+    for (auto peer : m_comparisons) {
+        auto info = sessionInfo(peer);
+        info["revision"] = m_revisions.value(peer);
+        peers.append(info);
+    }
+    QMetaObject::invokeMethod(
+        m_readContext, [this, id, start, end, fs, fe, hops, version, pixels, revision, peers] {
+            auto &cache = m_chartCache;
+            const bool reuse = cache.id == id && cache.start == start && cache.end == end &&
+                               cache.hops == hops && cache.pixels == pixels && cache.revision == revision;
+            auto view = m_reader->view(id, start, end, fs, fe, reuse ? QList<int>{} : hops, pixels);
+            if (reuse) {
+                view["charts"] = cache.charts;
+                view["timeMax"] = cache.timeMax;
+            } else if (m_reader->error().isEmpty()) {
+                cache = {id,
+                         start,
+                         end,
+                         pixels,
+                         revision,
+                         hops,
+                         view.value("charts").toList(),
+                         view.value("timeMax").toDouble()};
             }
-            if (m_pending)
-                m_coalesce.start();
+            QString error = m_reader->error();
+            QVariantList charts = view.value("charts").toList();
+            double maximum = view.value("timeMax").toDouble();
+            QHash<qint64, ChartCache> nextCache;
+            for (const auto &value : peers) {
+                const auto peer = value.toMap();
+                const auto peerId = peer.value("id").toLongLong();
+                const auto peerRevision = peer.value("revision").toULongLong();
+                auto entry = m_comparisonCache.take(peerId);
+                if (entry.id != peerId || entry.start != start || entry.end != end ||
+                    entry.pixels != pixels || entry.revision != peerRevision) {
+                    const auto comparison = m_reader->view(peerId, start, end, fs, fe, {0}, pixels, true);
+                    if (!m_reader->error().isEmpty()) {
+                        error = m_reader->error();
+                        break;
+                    }
+                    entry = {peerId,
+                             start,
+                             end,
+                             pixels,
+                             peerRevision,
+                             {0},
+                             comparison.value("charts").toList(),
+                             comparison.value("timeMax").toDouble()};
+                }
+                auto chart = entry.charts.value(0).toMap();
+                chart["comparisonId"] = peerId;
+                chart["target"] = peer.value("target");
+                chart["family"] = peer.value("family");
+                chart["intervalMs"] = peer.value("intervalMs");
+                if (!chart.contains("buckets"))
+                    chart["buckets"] = QVariantList{};
+                charts.append(chart);
+                maximum = std::max(maximum, entry.timeMax);
+                nextCache.insert(peerId, std::move(entry));
+            }
+            m_comparisonCache.swap(nextCache);
+            view["charts"] = charts;
+            view["timeMax"] = maximum;
+            view["focusStart"] = fs;
+            view["focusEnd"] = fe;
+            view["viewStart"] = start;
+            view["viewEnd"] = end;
+            view["sessionId"] = id;
+            QMetaObject::invokeMethod(this, [this, version, view = std::move(view), error]() mutable {
+                m_busy = false;
+                if (version == m_version) {
+                    if (!error.isEmpty())
+                        setStatus(error);
+                    m_snapshot = std::move(view);
+                    refreshNames();
+                    emit snapshotChanged();
+                    resolveNames();
+                }
+                if (m_pending)
+                    m_coalesce.start();
+            });
         });
-    });
 }
 
 void Backend::refreshNames() {
@@ -583,5 +765,123 @@ void Backend::resolveNames() {
             refreshNames();
             emit snapshotChanged();
         });
+    }
+}
+
+struct Backend::RouteScan {
+    quint64 request;
+    qint64 session, cursor = -1, until = 0;
+    RouteEvents detector;
+};
+
+void Backend::cancelRouteHistory() {
+    ++m_routeRequest;
+}
+
+void Backend::requestRouteHistory() {
+    cancelRouteHistory();
+    if (!m_ready || !m_session) {
+        emit routeHistoryPage({}, true, m_ready ? QString{} : m_status);
+        return;
+    }
+    auto scan = std::make_shared<RouteScan>();
+    scan->request = m_routeRequest;
+    scan->session = m_session;
+    readRoutePage(std::move(scan));
+}
+
+void Backend::readRoutePage(std::shared_ptr<RouteScan> scan) {
+    QMetaObject::invokeMethod(m_readContext, [this, scan] {
+        QVariantList events;
+        bool more = false;
+        m_reader->routePage(scan->session, scan->detector, scan->cursor, scan->until, events, more);
+        const QString error = m_reader->error();
+        QMetaObject::invokeMethod(this, [this, scan, events = std::move(events), more, error] {
+            if (scan->request != m_routeRequest || scan->session != m_session)
+                return;
+            emit routeHistoryPage(events, !more || !error.isEmpty(), error);
+            if (more && error.isEmpty() && scan->request == m_routeRequest)
+                readRoutePage(scan);
+        });
+    });
+}
+
+void Backend::enableRecorder() {
+    if (m_recorderAvailable || !m_ready)
+        return;
+    if (m_background) {
+        for (const auto &id : std::as_const(m_resumeSessions))
+            runSession(id.toLongLong());
+    }
+    m_resumeSessions.clear();
+    m_recorderAvailable = true;
+    emit monitoringChanged();
+}
+
+void Backend::persistRecordingSet() {
+    if (!m_recorderAvailable || !m_background)
+        return;
+    QMetaObject::invokeMethod(m_writerContext, [this, active = m_active] {
+        if (!m_writer->saveBackground(true, active)) {
+            auto error = m_writer->error();
+            QMetaObject::invokeMethod(this, [this, error] { setStatus(error); });
+        }
+    });
+}
+
+void Backend::setBackgroundEnabled(bool enabled) {
+    if (!m_recorderAvailable || enabled == m_background)
+        return;
+    QString error;
+    // Ensure a close immediately after changing this preference observes its committed value.
+    QMetaObject::invokeMethod(m_writerContext, [&] {
+        if (!m_writer->saveBackground(enabled, m_active))
+            error = m_writer->error();
+    }, Qt::BlockingQueuedConnection);
+    if (!error.isEmpty()) {
+        setStatus(error);
+        return;
+    }
+    m_background = enabled;
+    emit monitoringChanged();
+}
+
+void Backend::setWindowVisible(bool visible) {
+    m_windowVisible = visible;
+    if (visible && m_session) {
+        if (m_live) {
+            m_viewEnd = latest();
+            emit viewportChanged();
+        }
+        scheduleView();
+    }
+}
+
+void Backend::setAlertRule(qint64 id, double latency, double loss, int seconds) {
+    if (!m_recorderAvailable || sessionInfo(id).isEmpty())
+        return;
+    QMetaObject::invokeMethod(m_writerContext, [this, id, latency, loss, seconds] {
+        if (!m_writer->setAlertRule(id, latency, loss, seconds)) {
+            const auto error = m_writer->error();
+            QMetaObject::invokeMethod(this, [this, error] { setStatus(error); });
+            return;
+        }
+        QMetaObject::invokeMethod(this, [this, id, latency, loss, seconds] {
+            auto key = QString::number(id);
+            if (latency || loss)
+                m_alertRules[key] = QVariantMap{{"latency", latency}, {"loss", loss}, {"seconds", seconds}};
+            else
+                m_alertRules.remove(key);
+            emit monitoringChanged();
+        });
+    });
+}
+
+void Backend::showAlert(qint64 id, qint64 from, qint64 through) {
+    if (sessionInfo(id).isEmpty()) {
+        changeTabVisibility(id, false, from, through);
+    } else {
+        selectSession(id);
+        zoomToRange(from, through);
     }
 }

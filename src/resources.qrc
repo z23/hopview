@@ -1,5 +1,8 @@
 <RCC><qresource prefix="/">
   <file>Main.qml</file>
+  <file>AlertsDialog.qml</file>
+  <file>ProbeControls.qml</file>
+  <file>RouteHistory.qml</file>
   <file>TraceButton.qml</file>
   <file>TraceCombo.qml</file>
 </qresource></RCC>

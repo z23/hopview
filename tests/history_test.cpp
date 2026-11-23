@@ -1,4 +1,7 @@
 #include "history.h"
+#include "incident.h"
+#include <QFile>
+#include "routeevents.h"
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -170,6 +173,129 @@ void testRouteChange(const QString &file) {
     require(!old["rows"].toList()[0].toMap()["routeChanged"].toBool(), "No change before reroute");
 }
 
+void testRouteEvents(const QString &file) {
+    History writer(file);
+    const auto id = writer.createSession("2001:db8::1", 6, 1000);
+    const QString target = "2001:db8::1";
+    QVector<Sample> samples;
+    for (int i = 0; i < 540; ++i) {
+        const qint64 stamp = 10000LL + i * 1000;
+        // One isolated reply, alternation, and a failed two-round candidate.
+        const bool timeout = i == 496 || i == 509;
+        QString first = (i == 487 || (i >= 490 && i <= 499 && i % 2) || i >= 508) ? "new" : "old";
+        samples.append({id, stamp, 1, timeout ? QString() : first, timeout ? -1. : 3., false});
+        const bool shortPath = i >= 520 && i < 529;
+        // The former destination disappears during the extension at round 529.
+        const bool silent = i >= 529 && i < 533;
+        samples.append({id, stamp, 2, shortPath ? target : silent ? QString() : "middle",
+                        silent ? -1. : shortPath ? 18. : 7., shortPath});
+        if (!shortPath) {
+            const bool dropped = (i >= 503 && i <= 505) || i == 508 || i == 510;
+            samples.append({id, stamp, 3, dropped ? QString() : target,
+                            dropped ? -1. : i >= 510 ? 34. : 16., !dropped});
+        }
+    }
+    std::reverse(samples.begin(), samples.end());
+    require(writer.append(samples), "Seed route events");
+    // Reopen as an existing recording and process across a page boundary.
+    History read(file);
+    RouteEvents detector;
+    qint64 cursor = -1, until = 0;
+    bool more = false;
+    QVariantList page, all;
+    require(read.routePage(id, detector, cursor, until, page, more) && more && page.isEmpty(),
+            "Alternation, a one-round switch, and timeouts are not sustained reroutes");
+    const qint64 frozen = until;
+    require(writer.append({{id, until+1000, 1, "later", 2., false}}), "Concurrent append");
+    require(read.routePage(id, detector, cursor, until, page, more) && !more && until == frozen,
+            "Finish snapshot without following later arrivals");
+    all.append(page);
+    require(all.size() == 3, "One sustained responder change plus shorter and longer paths");
+    const auto e = all[0].toMap();
+    require(e["firstMs"].toLongLong() == 520000 && e["confirmedMs"].toLongLong() == 522000 &&
+            e["startMs"].toLongLong() == 517000 && e["changedHops"] == "1", "Sub-page timing and drill window");
+    require(e["beforeRtt"].toDouble() == 16. && e["afterRtt"].toDouble() == 34. &&
+            e["beforeN"].toInt() == 2 && e["afterN"].toInt() == 2, "RTT uses available destination replies");
+    auto first = e["path"].toList().first().toMap();
+    require(first["before"] == "old" && first["after"] == "new" && first["changed"].toBool(),
+            "Stable topology before and after the switch");
+    auto shorter = all[1].toMap()["path"].toList(), longer = all[2].toMap()["path"].toList();
+    require(shorter[1].toMap()["isTarget"].toBool() && !shorter[2].toMap()["inAfter"].toBool(),
+            "Destination confirmation shortens path");
+    require(longer[1].toMap()["wasTarget"].toBool() && longer[1].toMap()["after"].toString().isEmpty() &&
+            longer[2].toMap()["isTarget"].toBool() && !longer[2].toMap()["inBefore"].toBool(),
+            "Silent intermediate TTL in extended path stays unknown");
+
+    RouteEvents interrupted;
+    for (int i = 0; i < 220; ++i) {
+        // Interleaved A/B and A/A/B/B responses cannot establish a new stable path.
+        const QString address = i < 4 ? "a" : i < 100 ? (i % 2 ? "b" : "a")
+                              : i < 218 ? (i % 4 < 2 ? "a" : "b") : "c";
+        require(interrupted.observe({i * 1000LL, {{1,address}, {2,target}}, 2, 5.}).isEmpty(),
+                "Alternating responders do not generate route events");
+    }
+    const qint64 resumed = 24 * 3600000LL;
+    for (int i = 0; i < 3; ++i) {
+        auto event = interrupted.observe({resumed + i*1000, {{1,"c"}, {2,target}}, 2, 10.});
+        if (i < 2)
+            require(event.isEmpty(), "A pause interrupts the in-progress candidate");
+        else
+            require(event["firstMs"].toLongLong() == resumed && event["startMs"].toLongLong() == resumed &&
+                    event["beforeN"].toInt() == 0 && event["afterN"].toInt() == 3,
+                    "Post-resume change has new evidence and no stale RTT comparison");
+    }
+}
+
+void testDestinationAlerts(const QString &file) {
+    History writer(file);
+    const auto id = writer.createSession("target.test", 4, 1000);
+    require(id > 0 && writer.setAlertRule(id, 100, 50, 2), "Enable destination alerts");
+    qint64 t = 10000;
+    QList<qint64> emitted, ids;
+    QVector<Sample> previous;
+    auto window = [&](double rtt) {
+        QVector<Sample> batch;
+        for (int i = 0; i < 3; ++i, t += 1000) {
+            batch.append({id, t, 1, {}, -1, false});  // Upstream loss alone is irrelevant.
+            batch.append({id, t, 2, rtt < 0 ? QString() : "target", rtt, rtt >= 0});
+        }
+        require(writer.append(batch, &emitted), "Record destination alert window");
+        ids.append(emitted);
+        previous = batch;
+    };
+    window(500); window(2); window(500);
+    require(ids.isEmpty(), "Isolated spikes and intermediate loss are quiet");
+    t += 100000;
+    window(400);
+    require(ids.isEmpty(), "A collection gap breaks the candidate");
+    const qint64 onset = t - 3000;
+    window(500); window(500);
+    require(ids.size() == 1, "Two bad windows open exactly one incident");
+    require(writer.append(previous, &emitted) && emitted.isEmpty(), "Replay does not reissue alerts");
+    History reopened(file);
+    require(reopened.open(), "Reopen monitoring history");
+    auto events = reopened.alertEvents(-1);
+    require(events.size() == 1 && events[0].toMap()["label"] == "High latency" &&
+            events[0].toMap()["startMs"].toLongLong() == onset, "Persisted latency event and drill range");
+    window(2); window(500); window(2);
+    require(ids.size() == 1, "One healthy window does not recover a flapping incident");
+    window(2);
+    require(ids.size() == 2 && reopened.alertEvents(-1)[0].toMap()["recovered"].toBool(), "Sustained recovery");
+    window(-1); window(-1);
+    require(ids.size() == 3 && reopened.alertEvents(-1)[0].toMap()["label"] == "Packet loss",
+            "Timeout-only rounds raise destination loss");
+    window(2); window(2);
+    require(ids.size() == 4, "Loss incident recovers");
+    require(writer.setAlertRule(id, 0, 0, 2), "Disable alerts");
+    window(-1); window(-1);
+    require(ids.size() == 4 && reopened.alertEvents(-1).size() == 4, "Disabling keeps evidence and silences new alerts");
+    require(writer.saveBackground(true, {id}), "Enable unattended resume");
+    const auto settings = reopened.monitoringSettings();
+    require(settings["background"].toBool() && settings["active"].toList().contains(id), "Durable recording intent");
+    require(writer.setTabClosed(id, true) && reopened.monitoringSettings()["active"].toList().isEmpty(),
+            "Archived traces stay stopped on restart");
+}
+
 void testUpgrade(const QString &file) {
     qint64 id;
     {
@@ -197,6 +323,54 @@ void testUpgrade(const QString &file) {
     const auto b = charts[0].toMap()["buckets"].toList().first().toMap();
     require(b["sent"].toInt() == 2 && b["avg"].toDouble() == 3 && b["loss"].toDouble() == 50,
             "Reconstruct destination and lost rounds");
+}
+
+void testIncident(const QTemporaryDir &dir) {
+    const auto db = dir.filePath("export.db");
+    History source(db);
+    const auto id = source.createSession("service.example", 6, 250, "tcp", 8443, "eth1");
+    const qint64 t = 1700000000000;
+    require(source.append({{id, t, 1, "::1", 1, false},
+                           {id, t + 250, 1, "::1", 0.25, false},
+                           {id, t + 250, 2, "2001:db8::4", 8.75, true},
+                           {id, t + 500, 1, "", -1, false},
+                           {id, t + 500, 2, "", -1, false},
+                           {id, t + 750, 1, "::1", 1, false}}),
+            "Seed incident");
+    const QString note = "ISP, \"case 12\"\nfollow-up";
+    require(source.addNote(id, t + 275, note) && source.addNote(id, t, "exclude"),
+            "Seed incident annotations");
+    const auto csv = dir.filePath("incident.csv"), recording = dir.filePath("incident.hopline");
+    require(source.exportIncident(id, t + 250, t + 500, csv, true), "Export raw CSV");
+    QFile rows(csv);
+    require(rows.open(QIODevice::ReadOnly), "Open CSV");
+    const auto content = rows.readAll();
+    require(content.count("\"probe\"") == 4 && content.count("\"timeout\"") == 2 &&
+                content.contains("ISP, \"\"case 12\"\"\nfollow-up") && !content.contains("exclude") &&
+                content.contains("2023-11-14T22:13:20.250Z") && content.contains("8443"),
+            "CSV preserves raw probes, quoted annotation and settings");
+    require(!source.exportIncident(id, t, t + 500, db, false), "Cannot replace own history");
+    require(source.exportIncident(id, t + 250, t + 500, recording, false), "Export portable incident");
+    IncidentRange range;
+    QString error;
+    History replay(dir.filePath("replay.db"));
+    require(importIncident(recording, replay, range, error), qPrintable(error));
+    require(range.from == t + 250 && range.through == t + 500, "Replayed selection boundaries");
+    const auto imported = replay.sessions().first().toMap();
+    require(imported["target"] == "service.example" && imported["family"] == 6 && imported["port"] == 8443 &&
+                imported["protocol"] == "tcp" && imported["interfaceName"] == "eth1" &&
+                imported["intervalMs"] == 250,
+            "Replay transport settings");
+    const auto before = source.view(id, t + 250, t + 500, t + 250, t + 500, {0, 1}, 200);
+    const auto after =
+        replay.view(imported["id"].toLongLong(), t + 250, t + 500, t + 250, t + 500, {0, 1}, 200);
+    require(before == after, "Replay reproduces focus statistics, charts and annotations exactly");
+    QFile broken(recording);
+    require(broken.open(QIODevice::ReadWrite) && broken.resize(broken.size() - 8), "Truncate fixture");
+    broken.close();
+    History scratch(dir.filePath("broken.db"));
+    require(!importIncident(recording, scratch, range, error) && !error.isEmpty(),
+            "Reject incomplete replay");
 }
 
 void benchmark(const QString &file) {
@@ -254,7 +428,10 @@ int main(int argc, char **argv) {
             benchmark(dir.filePath("bench.sqlite"));
         else {
             test(dir.filePath("history.sqlite"));
+            testIncident(dir);
             testRouteChange(dir.filePath("routes.sqlite"));
+            testRouteEvents(dir.filePath("route-events.sqlite"));
+            testDestinationAlerts(dir.filePath("alerts.sqlite"));
             testUpgrade(dir.filePath("old.sqlite"));
             std::cout << "History checks passed.\n";
         }

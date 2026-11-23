@@ -1,6 +1,7 @@
 #include "backend.h"
 #include "graph.h"
 #include "history.h"
+#include "incident.h"
 #include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QHostAddress>
@@ -97,11 +98,100 @@ class Integration : public QObject {
     Q_OBJECT
   private slots:
     void desktop();
+    void alertControls();
+    void probeSettings();
+    void routeHistory();
     void latencyColors();
     void tabControlsAndScale();
     void rangeSelection();
+    void compareTargets();
+    void saveFocus();
     void replayWhileProbing();
 };
+
+void Integration::probeSettings() {
+    QTemporaryDir dir;
+    const auto db = dir.filePath("protocol.db");
+    Backend backend(db);
+    Window ui(backend);
+    QVERIFY(ui.win && waitFor([&] { return ui.win->isExposed(); }));
+    auto *controls = findItem(ui.win->contentItem(), "probeControls");
+    QVERIFY(controls);
+    QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                      controls->mapToScene(controls->boundingRect().center()).toPoint());
+    QVERIFY(waitFor([&] { return findItem(ui.win->contentItem(), "probePort"); }));
+    auto *method = findItem(ui.win->contentItem(), "probeProtocol");
+    auto *port = findItem(ui.win->contentItem(), "probePort");
+    auto *iface = findItem(ui.win->contentItem(), "probeInterface");
+    QVERIFY(method && port && iface);
+    QVERIFY(method->setProperty("currentIndex", 3));
+    QVERIFY(QMetaObject::invokeMethod(method, "activated", Q_ARG(int, 3)));
+    QCOMPARE(port->property("value").toInt(), 443);
+    QVERIFY(port->setProperty("value", 8443));
+    QString expectedInterface;
+    const int loopback = backend.interfaceNames().indexOf("lo");
+    if (loopback >= 0) {
+        QVERIFY(iface->setProperty("currentIndex", loopback + 1));
+        expectedInterface = "lo";
+        QCOMPARE(iface->property("currentText").toString(), expectedInterface);
+    }
+    QTest::keyClick(ui.win, Qt::Key_Escape);
+    auto *target = findItem(ui.win->contentItem(), "destinationInput");
+    QVERIFY(target && target->setProperty("text", "127.0.0.1"));
+    QVERIFY(QMetaObject::invokeMethod(target, "accepted"));
+    QVERIFY(waitFor([&] { return !backend.sessions().isEmpty(); }));
+    const auto saved = History(db).sessions().first().toMap();
+    QCOMPARE(saved["protocol"].toString(), QString("tcp"));
+    QCOMPARE(saved["port"].toInt(), 8443);
+    QCOMPARE(saved["interfaceName"].toString(), expectedInterface);
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
+void Integration::alertControls() {
+    QTemporaryDir dir;
+    const auto db = dir.filePath("alerts.db");
+    History h(db);
+    auto id = h.createSession("alert.test", 4, 1000);
+    QVERIFY(h.setAlertRule(id, 100, 50, 1));
+    for (int i = 0; i < 4; ++i)
+        QVERIFY(h.append({{id, base + i * 1000, 1, "target", 200, true}}));
+    QVERIFY(h.setTabClosed(id, true));
+    auto open = h.createSession("another.test", 6, 500);
+    Backend b(db);
+    b.enableRecorder();
+    Window ui(b);
+    QVERIFY(ui.win && waitFor([&] { return ui.win->isExposed(); }));
+    QCOMPARE(b.sessionId(), open);
+    QCOMPARE(b.alertEvents().size(), 1);
+    auto *dialog = ui.win->findChild<QObject *>("alertsDialog");
+    QVERIFY(dialog && QMetaObject::invokeMethod(dialog, "open"));
+    QVERIFY(waitFor([&] { return dialog->property("opened").toBool() && findItem(ui.win->contentItem(), "keepRecording"); }));
+    QSignalSpy rendered(ui.win, &QQuickWindow::frameSwapped);
+    ui.win->requestUpdate();
+    QVERIFY(waitFor([&] { return !rendered.isEmpty(); }));
+    auto click = [&](const char *name) {
+        auto *item = findItem(ui.win->contentItem(), name);
+        if (!item) return false;
+        QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                          item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint());
+        return true;
+    };
+    QVERIFY(click("keepRecording"));
+    QVERIFY(waitFor([&] { return b.backgroundEnabled(); }));
+    QVERIFY(h.monitoringSettings()["background"].toBool());
+    dialog->setProperty("loss", 25);
+    QVERIFY(click("saveAlertThresholds"));
+    QVERIFY(waitFor([&] { return b.alertRules().contains(QString::number(open)); }));
+    QCOMPARE(h.monitoringSettings()["rules"].toMap()[QString::number(open)].toMap()["loss"].toInt(), 25);
+    // The alarm belongs to an archive. Its event opens precisely the historical
+    // evidence without reactivating the collector.
+    QVERIFY(click("alertEvent1"));
+    QVERIFY(waitFor([&] { return b.sessionId() == id && fresh(b); }));
+    QVERIFY(!b.live() && !b.running());
+    QCOMPARE(b.focusStart(), base);
+    QCOMPARE(b.focusEnd(), base + 3000);
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
 
 void Integration::desktop() {
     QTemporaryDir dir;
@@ -243,6 +333,172 @@ void Integration::tabControlsAndScale() {
         QCOMPARE(ui.win->property("uiScale").toReal(), 1.0);
         QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
     }
+}
+
+void Integration::routeHistory() {
+    QTemporaryDir dir;
+    auto db = dir.filePath("routes.db");
+    QVERIFY(fill(db, 150) > 0);
+    Backend b(db);
+    b.setReplayMode();
+    Window ui(b);
+    QVERIFY(ui.win);
+    auto *pause = findItem(ui.win->contentItem(), "pauseButton");
+    QVERIFY(pause && !pause->isVisible() && !b.running());
+    auto *history = ui.win->findChild<QObject *>("routeHistoryDialog");
+    QVERIFY(history);
+    QVERIFY(QMetaObject::invokeMethod(history, "open"));
+    QVERIFY(waitFor([&] { return history->property("eventCount").toInt() == 1 &&
+                                !history->property("scanning").toBool(); }));
+    auto *path = findItem(ui.win->contentItem(), "routePath");
+    QVERIFY(path);
+    QCOMPARE(path->property("count").toInt(), hops);
+    auto *show = findItem(ui.win->contentItem(), "showRouteEvent");
+    QVERIFY(show && show->isEnabled());
+    QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                      show->mapToScene({show->width()/2, show->height()/2}).toPoint());
+    QVERIFY(waitFor([&] { return !b.live() && fresh(b); }));
+    QCOMPARE(b.viewStart(), base + 27000);
+    QCOMPARE(b.viewEnd(), base + 32000);
+    QVERIFY(!history->property("visible").toBool());
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
+void Integration::saveFocus() {
+    QTemporaryDir dir;
+    const auto file = dir.filePath("source.db");
+    const auto id = fill(file, 150);
+    Backend b(file);
+    const auto start = base + 9500, end = base + 14500;
+    b.zoomToRange(start, end);
+    Window ui(b);
+    QVERIFY(ui.win);
+    QVERIFY(waitFor([&] { return ui.win->isExposed() && fresh(b); }));
+    auto *dialog = ui.win->findChild<QObject *>("incidentExportDialog");
+    QVERIFY(dialog && dialog->setProperty("currentFolder", QUrl::fromLocalFile(dir.path())));
+    auto *menu = findItem(ui.win->contentItem(), "traceActions");
+    QVERIFY(menu);
+    QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                      menu->mapToScene(menu->boundingRect().center()).toPoint());
+    auto *save = findItem(ui.win->contentItem(), "saveIncidentAction");
+    QVERIFY(save && save->isVisible());
+    QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                      save->mapToScene(save->boundingRect().center()).toPoint());
+    QVERIFY(waitFor([&] { return dialog->property("visible").toBool(); }));
+    QCOMPARE(dialog->property("fromMs").toLongLong(), start);
+    QCOMPARE(dialog->property("throughMs").toLongLong(), end);
+    QCOMPARE(dialog->property("session").toLongLong(), id);
+    b.goLive(); // The export must keep the range captured when the dialog opened.
+    const auto path = dir.filePath("selected.hopline");
+    QSignalSpy result(&b, &Backend::incidentExported);
+    QQuickItem *name = nullptr;
+    QVERIFY(waitFor([&] {
+        for (auto *window : QGuiApplication::allWindows()) {
+            auto *quick = qobject_cast<QQuickWindow *>(window);
+            if (quick && (name = findItem(quick->contentItem(), "fileNameTextField")) && name->isVisible())
+                return true;
+        }
+        return false;
+    }));
+    auto *picker = name->window();
+    name->forceActiveFocus();
+    QTest::keyClick(name->window(), Qt::Key_A, Qt::ControlModifier);
+    QInputMethodEvent filename;
+    filename.setCommitString("selected.hopline");
+    QGuiApplication::sendEvent(name, &filename);
+    QCOMPARE(name->property("text").toString(), QString("selected.hopline"));
+    // Confirm using the file picker's Save button.
+    QQuickItem *confirm = nullptr;
+    std::function<void(QQuickItem *)> findSave = [&](QQuickItem *control) {
+        if (control->property("text").toString().remove('&') == "Save" && control->isVisible() &&
+            control->metaObject()->indexOfSignal("clicked()") >= 0)
+            confirm = control;
+        for (auto *child : control->childItems())
+            findSave(child);
+    };
+    findSave(picker->contentItem());
+    QVERIFY(confirm && confirm->isEnabled());
+    QTest::mouseClick(picker, Qt::LeftButton, Qt::NoModifier,
+                      confirm->mapToScene(confirm->boundingRect().center()).toPoint());
+    QVERIFY(waitFor([&] { return !result.isEmpty(); }));
+    const auto outcome = result.takeFirst();
+    QVERIFY2(outcome[0].toBool(), qPrintable(outcome[1].toString()));
+    IncidentRange saved;
+    History replay(dir.filePath("replay.db"));
+    QString error;
+    QVERIFY2(importIncident(path, replay, saved, error), qPrintable(error));
+    QCOMPARE(saved.from, start);
+    QCOMPARE(saved.through, end);
+    const auto session = replay.sessions().first().toMap();
+    QCOMPARE(session["startMs"].toLongLong(), base + 10000);
+    QCOMPARE(session["endMs"].toLongLong(), base + 14000);
+}
+
+void Integration::compareTargets() {
+    QTemporaryDir dir;
+    const auto file = dir.filePath("compare.db");
+    const auto id = fill(file, 150);
+    History writer(file);
+    const auto peer = writer.createSession("192.0.2.1", 4, 1000);
+    QVector<Sample> samples;
+    for (int i = 50; i < 150; ++i)
+        samples.append({peer, base + i * 1000, 1, "192.0.2.1", 83, true});
+    QVERIFY(writer.append(samples));
+    Backend b(file);
+    b.selectSession(id);
+    b.zoomToRange(base, base + 149000);
+    Window ui(b);
+    QVERIFY(ui.win);
+    QVERIFY(waitFor([&] { return ui.win->isExposed() && fresh(b); }));
+    auto item = [&](const QString &name) { return findItem(ui.win->contentItem(), name); };
+    auto click = [&](QQuickItem *control) {
+        QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
+                          control->mapToScene(control->boundingRect().center()).toPoint());
+    };
+    QVERIFY(item("compareTargets"));
+    click(item("compareTargets"));
+    const auto peerKey = QString::number(peer);
+    QVERIFY(waitFor([&] { return item("compareChoice" + peerKey) != nullptr; }));
+    click(item("compareChoice" + peerKey));
+    QVERIFY(waitFor(
+        [&] { return b.comparisonIds().contains(peer) && b.snapshot()["charts"].toList().size() == 2; }));
+    QTest::keyClick(ui.win, Qt::Key_Escape);
+    QVERIFY(waitFor([&] {
+        auto *dialog = ui.win->findChild<QObject *>("compareDialog");
+        return dialog && !dialog->property("visible").toBool();
+    }));
+    auto *mouse = item("compareInput" + peerKey);
+    QVERIFY(mouse);
+    const auto point = [&](qreal fraction) {
+        return mouse->mapToScene({fraction * mouse->width(), mouse->height() / 2}).toPoint();
+    };
+    const auto readout = [&](const QString &key) {
+        auto *label = item("cursorValue" + key);
+        return label ? label->property("text").toString() : QString{};
+    };
+    QTest::mouseMove(ui.win, point(0.2));
+    QVERIFY(waitFor(
+        [&] { return readout("peer" + peerKey) == "No samples" && readout("hop12").contains("ms"); }));
+    QTest::mouseMove(ui.win, point(0.75));
+    QVERIFY(waitFor(
+        [&] { return readout("peer" + peerKey).contains("83 ms") && readout("hop12").contains("ms"); }));
+    QTest::mousePress(ui.win, Qt::LeftButton, Qt::NoModifier, point(0.5));
+    QTest::mouseMove(ui.win, point(0.8), 30);
+    QTest::mouseRelease(ui.win, Qt::LeftButton, Qt::NoModifier, point(0.8));
+    QVERIFY(waitFor([&] { return fresh(b) && b.viewSeconds() < 46 && b.viewSeconds() > 44; }));
+    QCOMPARE(b.focusStart(), b.viewStart());
+    const auto charts = b.snapshot()["charts"].toList();
+    QCOMPARE(charts.size(), 2);
+    QCOMPARE(charts[1].toMap()["target"].toString(), QString("192.0.2.1"));
+    QCOMPARE(charts[1].toMap()["buckets"].toList().size(), charts[0].toMap()["buckets"].toList().size());
+    b.selectSession(peer);
+    QVERIFY(b.comparisonIds().isEmpty());
+    b.selectSession(id);
+    QCOMPARE(b.comparisonIds().size(), 1);
+    b.closeSession(peer);
+    QVERIFY(
+        waitFor([&] { return b.comparisonIds().isEmpty() && b.snapshot()["charts"].toList().size() == 1; }));
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
 }
 
 void Integration::rangeSelection() {
