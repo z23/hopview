@@ -6,6 +6,8 @@ Hopview is a native desktop client for continuous traceroute. It records IPv4 an
 
 ## Build and run
 
+Prebuilt desktop and VM collector packages are available in the [Hopview releases](https://github.com/z23/hopview/releases).
+
 Use a C++20 compiler and install the development files for the dependencies listed in the [desktop package manifest](pkgbuild/PKGBUILD). Run these commands from the project directory to build the desktop client and the headless node, then open the client.
 
 ```sh
@@ -115,7 +117,9 @@ For focused checks, run the relevant script from the project directory using the
 
 ## VM collectors
 
-Run the headless collector on each VM and send its locally configured IPv4 or IPv6 traces to the same receiver over TLS. Open the receiver's history in Hopview. **Trace actions → Remote sources** shows original capture times, upload freshness and clock estimates. Choose **Compare…** to view a destination from several locations. For site credentials, clock alignment, disconnected recording and service setup, see the [deployment guide](docs/telemetry.md).
+Open **Collectors** to add a VM. Start a receiver in the desktop or use an existing receiver sharing the same local history. Generate a key for the VM, install the node package and run `hopview-node join RECEIVER` as administrator there. Paste the key when prompted. Hopview discovers the VM by hostname, including while it has no targets.
+
+Select the collector to assign IPv4 or IPv6 targets, see when changes take effect, and inspect its last contact. Open **Compare…** above the timelines to compare a destination from several locations. For EL9 and EL10 packages, enrollment and always-on receiver setup, see the [deployment guide](docs/telemetry.md).
 
 ## Service timing and local interface activity
 
@@ -126,3 +130,7 @@ Each service check makes one fresh HEAD request, using the trace’s IP-family c
 The interface graph samples device counters roughly every two seconds. RX and TX show bytes per second for all traffic on the device. Markers identify observed carrier or wireless access-point changes and increases in drop or error counters. First samples, collection gaps and counter resets leave a break in the rates. Hopview reads the wireless access point’s BSSID from the driver or the system’s network service when available. Transitions shorter than the sample interval can go unobserved.
 
 The tracks share the RTT timeline’s cursor, time window and drag-to-zoom gesture. In long windows each column retains an observed peak and the most recent event marker in that column. Hover over a marker for its sample. Replays use the recorded observations.
+
+## License
+
+Hopview is available under the [MIT License](LICENSE).

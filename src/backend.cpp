@@ -1,6 +1,7 @@
 #include "probeoptions.h"
 #include <QNetworkInterface>
 #include "backend.h"
+#include "collectormanagement.h"
 #include "history.h"
 #include "routeevents.h"
 #include "diagnostics.h"
@@ -125,7 +126,10 @@ Backend::~Backend() {
             m_writer.reset();
         },
         Qt::BlockingQueuedConnection);
-    QMetaObject::invokeMethod(m_readContext, [this] { m_reader.reset(); }, Qt::BlockingQueuedConnection);
+    QMetaObject::invokeMethod(m_readContext, [this] {
+        m_reader.reset();
+        m_management.reset();
+    }, Qt::BlockingQueuedConnection);
     m_writerThread.quit();
     m_readThread.quit();
     m_writerThread.wait();

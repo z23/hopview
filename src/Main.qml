@@ -269,6 +269,11 @@ C.ApplicationWindow {
                 TraceButton { text: "Start trace"; visible: !backend.replayMode; primary: true; accent: app.accent; onClicked: app.launch() }
                 Caption { visible: backend.replayMode; text: "Offline incident replay" }
                 Item { Layout.fillWidth: true; visible: workspace.width > 950 || backend.replayMode }
+                TraceButton {
+                    visible: backend.collectorManagementAvailable && backend.sessions.length > 0 && workspace.width > 950
+                    text: qsTr("Collectors…"); hint: qsTr("Enroll a VM or manage its targets")
+                    onClicked: sourcesDialog.open()
+                }
             }
         }
         Rule { Layout.fillWidth: true }
@@ -428,7 +433,7 @@ C.ApplicationWindow {
                     anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
                     TraceButton { visible: backend.groupNames.length > 0; text: qsTr("Saved comparisons…"); onClicked: compareDialog.open() }
                     TraceButton { text: "Open incident…"; onClicked: openIncident.open() }
-                    TraceButton { visible: !backend.replayMode; text: qsTr("Remote sources…"); onClicked: sourcesDialog.open() }
+                    TraceButton { objectName: "openCollectors"; visible: backend.collectorManagementAvailable; text: qsTr("Collectors…"); onClicked: sourcesDialog.open() }
                     TraceButton { visible: backend.backgroundAvailable; text: "Recording and alerts…"; onClicked: alertsDialog.open() }
                 }
             }
@@ -467,7 +472,7 @@ C.ApplicationWindow {
                                 y: actionsButton.height
                                 width: 230
                                 background: Rectangle { color: app.panel; border.color: app.edge; radius: 5 }
-                                ActionItem { visible: !backend.replayMode; text: qsTr("Remote sources…"); onTriggered: sourcesDialog.open() }
+                                ActionItem { visible: backend.collectorManagementAvailable; text: qsTr("Collectors…"); onTriggered: sourcesDialog.open() }
                                 ActionItem { text: qsTr("Compare time ranges…"); onTriggered: baselineDialog.open() }
                                 ActionItem { text: qsTr("Mark focus as baseline"); onTriggered: backend.markBaseline() }
                                 ActionItem { objectName: "diagnosticsAction"; text: qsTr("Service and interface…"); enabled: !backend.replayMode && !!app.currentSession && !app.currentSession.remote && !app.currentSession.imported; onTriggered: diagnosticSettings.open() }
@@ -955,7 +960,7 @@ C.ApplicationWindow {
     }
     DiagnosticSettings { id: diagnosticSettings; uiScale: app.uiScale }
     AlertsDialog { id: alertsDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
-    RemoteSources { id: sourcesDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    RemoteSources { id: sourcesDialog; parent: C.Overlay.overlay; uiScale: app.uiScale; activeTrace: app.currentSession }
     BaselineDialog { id: baselineDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
     RouteHistory { id: routeHistory; parent: C.Overlay.overlay; uiScale: app.uiScale }
     C.Dialog {

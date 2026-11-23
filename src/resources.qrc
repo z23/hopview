@@ -4,6 +4,7 @@
   <file>DiagnosticSettings.qml</file>
   <file>AlertsDialog.qml</file>
   <file>ProbeControls.qml</file>
+  <file>CollectorTargets.qml</file>
   <file>RemoteSources.qml</file>
   <file>BaselineDialog.qml</file>
   <file>RouteHistory.qml</file>

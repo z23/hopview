@@ -16,6 +16,7 @@ struct IncidentRange;
 class History;
 class Probe;
 class Diagnostics;
+class CollectorManagement;
 
 class Backend : public QObject {
     Q_OBJECT
@@ -26,6 +27,8 @@ class Backend : public QObject {
     Q_PROPERTY(QVariantList alertEvents READ alertEvents NOTIFY alertsChanged)
     Q_PROPERTY(QVariantList sessions READ sessions NOTIFY sessionsChanged)
     Q_PROPERTY(QVariantList closedSessions READ closedSessions NOTIFY sessionsChanged)
+    Q_PROPERTY(bool collectorManagementAvailable READ collectorManagementAvailable CONSTANT)
+    Q_PROPERTY(QVariantList collectors READ collectors NOTIFY collectorsChanged)
     Q_PROPERTY(qint64 sessionId READ sessionId NOTIFY selectionChanged)
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(bool running READ running NOTIFY sessionsChanged)
@@ -60,6 +63,13 @@ class Backend : public QObject {
     Q_INVOKABLE void showAlert(qint64 session, qint64 from, qint64 through);
     QVariantList sessions() const { return m_sessions; }
     QVariantList closedSessions() const { return m_closedSessions; }
+    bool collectorManagementAvailable() const { return !m_temporaryHistory && !m_replayMode; }
+    void setTemporaryHistory() { m_temporaryHistory = true; }
+    QVariantList collectors() const { return m_collectors; }
+    Q_INVOKABLE void refreshCollectors();
+    Q_INVOKABLE QString collectorJoinCommand(const QString &address) const;
+    Q_INVOKABLE void createCollectorKey();
+    Q_INVOKABLE void saveCollectorTargets(QString site, qint64 revision, QVariantList targets);
     qint64 sessionId() const { return m_session; }
     QString status() const { return m_status; }
     bool running() const { return m_active.contains(m_session); }
@@ -118,6 +128,10 @@ class Backend : public QObject {
     void alertsChanged();
     void destinationAlert(QVariantMap event);
     void sessionsChanged();
+    void collectorsChanged();
+    void collectorListError(QString error);
+    void collectorKeyCreated(QString key, QString error);
+    void collectorTargetsSaved(QString site, QString error);
     void selectionChanged();
     void snapshotChanged();
     void routeHistoryPage(QVariantList events, bool finished, QString error);
@@ -204,6 +218,10 @@ class Backend : public QObject {
     QVariantMap labelAlert(QVariantMap event) const;
     void publishAlerts(const QVariantList &events);
     bool m_remoteBusy = false;
+    CollectorManagement &collectorManagement();
+    std::unique_ptr<CollectorManagement> m_management;
+    QVariantList m_collectors;
+    bool m_collectorsLoading = false, m_temporaryHistory = false;
     qint64 m_receiverVersion = -1; // Owned by the history reader thread.
     QTimer m_refresh, m_coalesce, m_remotePoll;
     qint64 m_session = 0, m_viewEnd = 0, m_focusCenter = 0;

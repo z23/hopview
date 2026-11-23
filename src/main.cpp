@@ -2,6 +2,7 @@
 #include "backend.h"
 #include "background.h"
 #include "graph.h"
+#include "localreceiver.h"
 #include "history.h"
 #include "incident.h"
 #include "probe.h"
@@ -180,7 +181,7 @@ int main(int argc, char **argv) {
     else
         app = std::make_unique<QCoreApplication>(argc, argv);
     app->setApplicationName("hopview");
-    app->setApplicationVersion("0.4.0");
+    app->setApplicationVersion("0.5.0");
     QCommandLineParser parser;
     parser.setApplicationDescription("Hopview — continuous IPv4 and IPv6 path monitoring");
     parser.addHelpOption();
@@ -279,8 +280,11 @@ int main(int argc, char **argv) {
             QFile::copy(previous, appearance);
     }
     QQuickStyle::setStyle("Basic");
+    qmlRegisterType<LocalReceiver>("Hopview.Graphics", 1, 0, "LocalReceiver");
     qmlRegisterType<GraphView>("Hopview.Graphics", 1, 0, "GraphView");
     Backend backend(file);
+    if (isolated)
+        backend.setTemporaryHistory();
     if (parser.isSet("replay")) {
         backend.setReplayMode();
         backend.restoreIncident(incident);

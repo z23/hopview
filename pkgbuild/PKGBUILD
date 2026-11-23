@@ -1,9 +1,10 @@
 pkgname=hopview
-pkgver=0.4.0
+pkgver=0.5.0
 pkgrel=1
 pkgdesc="Native IPv4 and IPv6 network path monitor with interactive history"
+license=('MIT')
 arch=('x86_64' 'aarch64')
-depends=('curl' 'glibc' 'libgcc' 'libglvnd' 'libstdc++' 'qt6-base' 'qt6-declarative' 'sqlite')
+depends=('openssl' 'curl' 'glibc' 'libgcc' 'libglvnd' 'libstdc++' 'qt6-base' 'qt6-declarative' 'sqlite')
 makedepends=('pkgconf')
 options=('!debug')
 source=("hopview-${pkgver}.tar.gz")
@@ -16,6 +17,7 @@ build() {
 }
 package() {
     cd "$srcdir/hopview"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/hopview/LICENSE"
     install -Dm755 build-node/hopview-node "$pkgdir/usr/bin/hopview-node"
     install -Dm644 deploy/hopview-sysusers.conf "$pkgdir/usr/lib/sysusers.d/hopview.conf"
     for mode in collector receiver; do

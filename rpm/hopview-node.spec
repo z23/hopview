@@ -1,8 +1,8 @@
 Name:           hopview-node
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Headless IPv4 and IPv6 path telemetry collector and receiver
-License:        LicenseRef-Unspecified
+License:        MIT
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  gcc-c++, make, qt6-qtbase-devel, sqlite-devel, pkgconf-pkg-config
@@ -54,4 +54,5 @@ getent passwd hopview >/dev/null || useradd -r -g hopview -d /var/lib/hopview -s
 %dir %attr(0750,root,hopview) %{_sysconfdir}/hopview
 %config(noreplace) %attr(0640,root,hopview) %{_sysconfdir}/hopview/collector.json
 %config(noreplace) %attr(0640,root,hopview) %{_sysconfdir}/hopview/receiver.json
+%license LICENSE
 %doc docs/telemetry.md

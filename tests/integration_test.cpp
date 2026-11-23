@@ -1,5 +1,14 @@
 #include "backend.h"
+#include "collectormanagement.h"
+#include <QUuid>
 #include "graph.h"
+#include "localreceiver.h"
+#include "collectormanagement.h"
+#include <QTcpServer>
+#include <QStandardPaths>
+#include <QUuid>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include "history.h"
 #include "diagnostics.h"
 #include <QDateTime>
@@ -103,6 +112,7 @@ class Integration : public QObject {
     void alertControls();
     void diagnosticTracks();
     void diagnosticLoopback();
+    void managedDesktopLoopback();
     void probeSettings();
     void routeHistory();
     void latencyColors();
@@ -110,6 +120,7 @@ class Integration : public QObject {
     void rangeSelection();
     void compareTargets();
     void baselineComparison();
+    void collectorControls();
     void incomingSites();
     void twoSiteWindow();
     void savedComparison();
@@ -583,6 +594,81 @@ void Integration::baselineComparison() {
     QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
 }
 
+void Integration::managedDesktopLoopback() {
+    if (!qEnvironmentVariableIsSet("HOPVIEW_MANAGED_TEST"))
+        QSKIP("Set HOPVIEW_MANAGED_TEST and include hopview-node on the executable path.");
+    const QString binary = QStandardPaths::findExecutable("hopview-node");
+    QVERIFY(!binary.isEmpty());
+    for (const auto &bad : {"bad;name", "-f", "1.2.3.4:0", "example.org:65536",
+                            "[127.0.0.1]:8080", "[::1]oops", "host:"}) {
+        telemetry::ReceiverEndpoint endpoint;
+        QVERIFY(!telemetry::parseReceiverEndpoint(bad, endpoint));
+    }
+    telemetry::ReceiverEndpoint ipv6;
+    QVERIFY(telemetry::parseReceiverEndpoint("[2001:db8::2]:443", ipv6));
+    QCOMPARE(ipv6.host, QString("2001:db8::2"));
+    QCOMPARE(ipv6.port, quint16(443));
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const auto db = dir.filePath("desktop.sqlite");
+    Backend backend(db);
+    Window ui(backend);
+    QVERIFY(ui.win);
+    auto *listener = ui.win->findChild<LocalReceiver *>();
+    QVERIFY(listener);
+    QTcpServer reserve;
+    QVERIFY(reserve.listen(QHostAddress::LocalHost, 0));
+    const auto port = reserve.serverPort();
+    reserve.close();
+    const auto endpoint = "127.0.0.1:" + QString::number(port);
+    listener->start(endpoint);
+    QVERIFY2(waitFor([&] { return !listener->busy(); }, 15000) && listener->running(),
+             qPrintable(listener->message()));
+    CollectorManagement admin(db);
+    const auto key = admin.createKey();
+    QCOMPARE(key.split('.').size(), 3);
+    const auto configPath = dir.filePath("collector.json");
+    QFile config(configPath);
+    QVERIFY(config.open(QIODevice::WriteOnly));
+    const QJsonObject fields{{"managed", true}, {"receiver", "127.0.0.1"}, {"port", port},
+                             {"enrollmentKey", key}, {"nodeId", QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                             {"spool", dir.filePath("outbox.sqlite")}};
+    config.write(QJsonDocument(fields).toJson());
+    config.close();
+    QProcess node;
+    node.start(binary, {"collect", configPath});
+    QVERIFY(node.waitForStarted());
+    QVERIFY2(waitFor([&] { return admin.nodes().size() == 1; }, 10000), qPrintable(node.readAllStandardError()));
+    const auto enrolled = admin.nodes().first().toMap();
+    QVERIFY(!enrolled["hostname"].toString().isEmpty());
+    QVERIFY(enrolled["targets"].toList().isEmpty());
+    const auto site = enrolled["site"].toString();
+    const auto version = enrolled["revision"].toLongLong();
+    QVariantMap target{{"target", "127.0.0.1"}, {"family", 4}, {"protocol", "tcp"},
+                       {"port", port}, {"intervalMs", 250}};
+    QVERIFY2(admin.setTargets(site, version, {target}), qPrintable(admin.error()));
+    QVERIFY2(waitFor([&] {
+        const auto row = admin.nodes().value(0).toMap();
+        return row["appliedRevision"].toLongLong() == version + 1 &&
+               !backend.sessions().isEmpty() && backend.sessions().first().toMap()["location"] == site;
+    }, 25000), qPrintable(node.readAllStandardError()));
+    QVERIFY(admin.setTargets(site, version + 1, {}));
+    QVERIFY(waitFor([&] {
+        return admin.nodes().value(0).toMap()["appliedRevision"].toLongLong() == version + 2;
+    }, 15000));
+    QVERIFY(!backend.sessions().isEmpty());
+    node.terminate();
+    QVERIFY(node.waitForFinished(5000) && node.exitCode() == 0);
+    listener->stop();
+    QVERIFY(waitFor([&] { return !listener->running() && !listener->busy(); }));
+    listener->start(endpoint);
+    QVERIFY2(waitFor([&] { return listener->running(); }), qPrintable(listener->message()));
+    QCOMPARE(admin.createKey().section('.', 2), key.section('.', 2));
+    listener->stop();
+    QVERIFY(waitFor([&] { return !listener->busy(); }));
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
 void Integration::twoSiteWindow() {
     const auto db = qEnvironmentVariable("HOPVIEW_REMOTE_DB");
     if (db.isEmpty())
@@ -621,6 +707,107 @@ void Integration::twoSiteWindow() {
     QVERIFY(waitFor([&] { return b.viewEnd() > received; }));
     QVERIFY(!ui.win->grabWindow().isNull());
     QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
+void Integration::collectorControls() {
+    QTemporaryDir dir;
+    const auto file = dir.filePath("collector-controls.sqlite");
+    Backend b(file);
+    Window ui(b);
+    QVERIFY(ui.win);
+    QVERIFY(waitFor([&] { return ui.win->isExposed(); }));
+    const auto item = [&](const QString &name) { return findItem(ui.win->contentItem(), name); };
+    const auto click = [&](const QString &name) {
+        auto *control = item(name);
+        return control && control->isVisible() && control->isEnabled() && QMetaObject::invokeMethod(control, "click");
+    };
+    QVERIFY(click("openCollectors"));
+    auto *dialog = ui.win->findChild<QObject *>("remoteSources");
+    QVERIFY(dialog && waitFor([&] { return dialog->property("opened").toBool(); }));
+    QVERIFY(click("openCollectorJoin"));
+    auto *address = item("collectorReceiverAddress");
+    auto *command = item("collectorJoinCommand");
+    QVERIFY(address && command);
+    QVERIFY(address->setProperty("text", "vm.invalid; echo"));
+    QVERIFY(!item("generateCollectorKey")->isEnabled());
+    QVERIFY(address->setProperty("text", "[2001:db8::1]:8347"));
+    QCOMPARE(command->property("text").toString(), QString("sudo hopview-node join '[2001:db8::1]:8347'"));
+    QVERIFY(address->setProperty("text", "receiver.example"));
+    QSignalSpy created(&b, &Backend::collectorKeyCreated);
+    QVERIFY(click("generateCollectorKey"));
+    QVERIFY(waitFor([&] { return created.size() == 1 && !dialog->property("joinKey").toString().isEmpty(); }));
+    const auto secret = created.first().first().toString().split('.').value(1);
+    QVERIFY(!secret.isEmpty());
+    CollectorManagement receiver(file);
+    const auto nodeId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto enrolled = receiver.enroll(secret, nodeId, "edge-one", {}, 0, {}, QDateTime::currentMSecsSinceEpoch());
+    const auto site = enrolled["site"].toString();
+    QVERIFY(!site.isEmpty());
+    QVERIFY(click("collectorBack"));
+    QVERIFY(dialog->property("joinKey").toString().isEmpty());
+    b.refreshCollectors();
+    QVERIFY(waitFor([&] { return item("editCollector-" + site); }));
+    QVERIFY(b.sessions().isEmpty());
+    QVERIFY(click("editCollector-" + site));
+    QVERIFY(click("collectorAddTarget"));
+    auto *host = item("collectorDestination");
+    QVERIFY(host && host->setProperty("text", "::1"));
+    QVERIFY(item("collectorFamily")->setProperty("currentIndex", 2));
+    QVERIFY(item("collectorProtocol")->setProperty("currentIndex", 3));
+    QVERIFY(item("collectorPort")->setProperty("text", "443"));
+    QVERIFY(item("collectorInterval")->setProperty("text", "500"));
+    QVERIFY(click("collectorStageTarget"));
+    QVERIFY(click("collectorAddTarget"));
+    QVERIFY(host->setProperty("text", "127.0.0.1"));
+    QVERIFY(click("collectorStageTarget"));
+    QSignalSpy saved(&b, &Backend::collectorTargetsSaved);
+    QVERIFY(click("collectorApply"));
+    QVERIFY(waitFor([&] { return saved.size() == 1 && b.collectors().first().toMap()["targets"].toList().size() == 2; }));
+    const auto node = b.collectors().first().toMap();
+    const auto target = node["targets"].toList().first().toMap();
+    QCOMPARE(target["target"].toString(), QString("::1"));
+    QCOMPARE(target["family"].toInt(), 6);
+    QCOMPARE(target["protocol"].toString(), QString("tcp"));
+    QCOMPARE(target["port"].toInt(), 443);
+    QCOMPARE(target["intervalMs"].toInt(), 500);
+    QVERIFY(node["revision"].toInt() > node["appliedRevision"].toInt());
+
+    QVERIFY(click("editCollector-" + site));
+    QVERIFY(click("collectorRemoveTarget0"));
+    QVERIFY(receiver.setTargets(site, node["revision"].toLongLong(), {}));
+    b.refreshCollectors();
+    auto *editor = item("collectorTargetsEditor");
+    QVERIFY(editor && waitFor([&] { return editor->property("stale").toBool(); }));
+    QVERIFY(!item("collectorApply")->isEnabled());
+    QVERIFY(click("collectorReloadTargets"));
+    QVERIFY(!editor->property("stale").toBool());
+    QCOMPARE(editor->property("draft").value<QJSValue>().property("length").toInt(), 0);
+    const auto secondKey = receiver.createKey().section('.', 1, 1);
+    const auto second = receiver.enroll(secondKey, QUuid::createUuid().toString(QUuid::WithoutBraces),
+                                        "edge-two", {}, 0, {}, QDateTime::currentMSecsSinceEpoch());
+    const auto peer = second["site"].toString();
+    QVERIFY(receiver.setTargets(peer, second["revision"].toInteger(), {target}));
+    b.refreshCollectors();
+    QVERIFY(waitFor([&] { return item("collectorCopyTargets") && item("collectorCopyTargets")->isVisible(); }));
+    QVERIFY(click("collectorCopyTargets"));
+    QVERIFY(editor->property("dirty").toBool());
+    for (const auto &entry : receiver.nodes()) {
+        const auto row = entry.toMap();
+        QCOMPARE(row["targets"].toList().size(), row["site"] == peer ? 1 : 0);
+    }
+    QVERIFY(click("collectorApply"));
+    QVERIFY(waitFor([&] { return saved.size() == 2; }));
+    for (const auto &entry : receiver.nodes())
+        QCOMPARE(entry.toMap()["targets"].toList().first().toMap()["target"].toString(), QString("::1"));
+    QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+
+    Backend replay(dir.filePath("replay.db"));
+    replay.setReplayMode();
+    QSignalSpy blocked(&replay, &Backend::collectorKeyCreated);
+    replay.createCollectorKey();
+    QCOMPARE(blocked.size(), 1);
+    QVERIFY(blocked.first().first().toString().isEmpty());
+    QVERIFY(!blocked.first().last().toString().isEmpty());
 }
 
 void Integration::incomingSites() {
@@ -1030,8 +1217,10 @@ int main(int argc, char **argv) {
     if (!config.isValid())
         return 1;
     qputenv("XDG_CONFIG_HOME", QFile::encodeName(config.path()));
+    qputenv("XDG_DATA_HOME", QFile::encodeName(config.filePath("data")));
     QGuiApplication app(argc, argv);
     QQuickStyle::setStyle("Basic");
+    qmlRegisterType<LocalReceiver>("Hopview.Graphics", 1, 0, "LocalReceiver");
     qmlRegisterType<GraphView>("Hopview.Graphics", 1, 0, "GraphView");
     Integration suite;
     return QTest::qExec(&suite, argc, argv);

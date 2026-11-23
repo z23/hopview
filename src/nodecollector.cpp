@@ -1,4 +1,5 @@
 #include "nodeconfig.h"
+#include "nodejoin.h"
 #include "probe.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
@@ -6,6 +7,9 @@
 #include <QEvent>
 #include <QFile>
 #include <QSet>
+#include <QCryptographicHash>
+#include <QHostInfo>
+#include <QUuid>
 #include <QThread>
 #include <QElapsedTimer>
 #include <QFileInfo>
@@ -26,6 +30,27 @@ namespace {
 using namespace hopview_sql;
 qint64 now() { return QDateTime::currentMSecsSinceEpoch(); }
 
+QByteArray identity(const Trace &trace) {
+    return QJsonDocument(traceObject(trace)).toJson(QJsonDocument::Compact);
+}
+
+QList<Trace> readTargets(const QJsonValue &value, bool allowEmpty) {
+    if (!value.isArray() || (!allowEmpty && value.toArray().isEmpty()) || value.toArray().size() > 128)
+        throw Error(allowEmpty ? "Configure at most 128 targets per collector" :
+                                 "Configure 1 through 128 targets per collector");
+    QList<Trace> result;
+    QSet<QByteArray> seen;
+    for (const auto &target : value.toArray()) {
+        const auto trace = parseTrace(target.toObject());
+        const auto key = identity(trace);
+        if (seen.contains(key))
+            throw Error("Duplicate trace configuration");
+        seen.insert(key);
+        result.append(trace);
+    }
+    return result;
+}
+
 class Spool {
   public:
     Spool(const QString &path, const QString &destination, qint64 limit)
@@ -45,7 +70,9 @@ class Spool {
         execute(db,
                 "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;"
                 "CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,body TEXT NOT NULL);"
-                "CREATE TABLE IF NOT EXISTS destination(name TEXT NOT NULL);");
+                "CREATE TABLE IF NOT EXISTS destination(name TEXT NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS assignment(id INTEGER PRIMARY KEY CHECK(id=1),site TEXT NOT NULL,"
+                "revision INTEGER NOT NULL,targets TEXT NOT NULL);");
         Transaction tx(db, true);
         Statement origin(db, "SELECT name FROM destination LIMIT 1");
         if (origin.next()) {
@@ -62,6 +89,20 @@ class Spool {
         tx.commit();
     }
 
+    QJsonObject assignment() const {
+        Statement row(db_.get(), "SELECT site,revision,targets FROM assignment WHERE id=1");
+        if (!row.next())
+            return {};
+        return {{"site", row.string(0)}, {"revision", row.integer(1)},
+                {"targets", QJsonDocument::fromJson(row.string(2).toUtf8()).array()}};
+    }
+    void saveAssignment(const QString &site, qint64 revision, const QJsonArray &targets) {
+        Statement save(db_.get(), "INSERT OR REPLACE INTO assignment(id,site,revision,targets) VALUES(1,?,?,?)");
+        save.string(1, site);
+        save.integer(2, revision);
+        save.string(3, QString::fromUtf8(QJsonDocument(targets).toJson(QJsonDocument::Compact)));
+        save.next();
+    }
     void push(const QJsonObject &body) {
         const auto json = QJsonDocument(body).toJson(QJsonDocument::Compact);
         if (json.size() > maxFrame - 1024)
@@ -127,27 +168,33 @@ class Collector final : public QObject {
     Collector(const QJsonObject &config, const QString &base, const QString &site, const QString &host,
               int port, bool plain, Spool &spool)
         : site_(site), host_(host), port_(port), plain_(plain), spool_(spool) {
-        token_ = QString::fromLatin1(readToken(filePath(base, config, "tokenFile")));
+        managed_ = config.value("managed").toBool();
+        if (managed_) {
+            nodeId_ = config.value("nodeId").toString();
+            if (QUuid(nodeId_).isNull())
+                throw Error("Missing managed collector identity");
+            const auto key = parseEnrollmentKey(config.value("enrollmentKey").toString());
+            token_ = key.secret;
+            pin_ = key.certificateDigest;
+            const auto cached = spool_.assignment();
+            if (!cached.isEmpty()) {
+                site_ = cached["site"].toString();
+                applied_ = integer(cached, "revision", 1, 9007199254740991LL);
+                installTargets(readTargets(cached["targets"], true));
+            }
+        } else {
+            token_ = QString::fromLatin1(readToken(filePath(base, config, "tokenFile")));
+            installTargets(readTargets(config.value("targets"), false));
+        }
         if (!plain_)
             ssl_ = tlsConfig(config, base, false);
-        const auto targets = config.value("targets").toArray();
-        if (targets.isEmpty() || targets.size() > 128)
-            throw Error("Configure 1 through 128 targets per collector");
-        QSet<QByteArray> seen;
-        for (const auto &obj : targets) {
-            auto t = parseTrace(obj.toObject());
-            const auto key = QJsonDocument(traceObject(t)).toJson(QJsonDocument::Compact);
-            if (seen.contains(key))
-                throw Error("Duplicate trace configuration");
-            seen.insert(key);
-            traces_.append(t);
-        }
         probe_ = new Probe;
         probe_->moveToThread(&probeThread_);
         connect(&probeThread_, &QThread::finished, probe_, &QObject::deleteLater);
         connect(probe_, &Probe::resolved, this,
                 [this](qint64 id, const QString &address, const QString &, int) {
-                    addresses_.insert(id, address);
+                    if (traces_.contains(id))
+                        addresses_.insert(id, address);
                 });
         // Disk flushes and receiver backfill run independently of the probe timer.
         connect(probe_, &Probe::samples, probe_, [this](QVector<Sample> samples) {
@@ -174,7 +221,9 @@ class Collector final : public QObject {
             });
         });
         connect(probe_, &Probe::status, this, [this](qint64 id, const QString &message, bool failed) {
-            log(QString("%1: %2").arg(traces_[id - 1].target, message));
+            if (!traces_.contains(id))
+                return;
+            log(QString("%1: %2").arg(traces_.value(id).target, message));
             if (failed)
                 QTimer::singleShot(30000, this, [this, id] { startProbe(id); });
         });
@@ -183,10 +232,10 @@ class Collector final : public QObject {
         connect(&reconnect_, &QTimer::timeout, this, [this] { connectReceiver(); });
         deadline_.setSingleShot(true);
         connect(&deadline_, &QTimer::timeout, this, [this] { lost("Receiver timed out"); });
-        ping_.setInterval(15000);
+        ping_.setInterval(managed_ ? 5000 : 15000);
         connect(&ping_, &QTimer::timeout, this, [this] {
-            if (ready_ && seq_ < 0)
-                send({{"type", "ping"}}, 0);
+            pingPending_ = true;
+            pump();
         });
         connect(qApp, &QCoreApplication::aboutToQuit, this, [this] {
             stopProbes();
@@ -197,8 +246,8 @@ class Collector final : public QObject {
     ~Collector() override { stopProbes(); }
 
     void start() {
-        for (int i = 0; i < traces_.size(); ++i)
-            startProbe(i + 1);
+        for (auto id : active_)
+            startProbe(id);
         connectReceiver();
         ping_.start();
     }
@@ -208,10 +257,45 @@ class Collector final : public QObject {
         log("Collector storage error: " + QString::fromUtf8(e.what()));
         QCoreApplication::exit(1);
     }
-    void startProbe(qint64 id) {
+    void installTargets(const QList<Trace> &targets) {
+        QHash<QByteArray, qint64> next;
+        QList<qint64> added, retired;
+        for (const auto &target : targets) {
+            const auto key = identity(target);
+            auto id = active_.value(key);
+            if (!id) {
+                id = ++nextId_;
+                traces_.insert(id, target);
+                added.append(id);
+            }
+            next.insert(key, id);
+        }
+        for (auto it = active_.cbegin(); it != active_.cend(); ++it)
+            if (!next.contains(it.key()))
+                retired.append(it.value());
+        active_ = std::move(next);
         if (!probe_)
             return;
-        auto t = traces_[id - 1];
+        for (const auto id : retired)
+            QMetaObject::invokeMethod(probe_, [probe = probe_, id] { probe->stop(id); });
+        for (const auto id : added)
+            startProbe(id);
+        if (!added.isEmpty() || !retired.isEmpty()) {
+            // Wait until the worker has installed the revision before acknowledging it.
+            QMetaObject::invokeMethod(probe_, [] {}, Qt::BlockingQueuedConnection);
+            // Keep retired trace metadata available to samples already queued for storage.
+            QMetaObject::invokeMethod(this, [this, retired] {
+                for (const auto id : retired) {
+                    traces_.remove(id);
+                    addresses_.remove(id);
+                }
+            }, Qt::QueuedConnection);
+        }
+    }
+    void startProbe(qint64 id) {
+        if (!probe_ || active_.key(id).isEmpty())
+            return;
+        const auto t = traces_.value(id);
         QMetaObject::invokeMethod(probe_, [probe = probe_, id, t] {
             probe->start(id, t.target, t.family, t.intervalMs, t.probes.protocol, t.probes.port,
                          t.probes.interfaceName);
@@ -228,7 +312,10 @@ class Collector final : public QObject {
 
     void enqueue(const QVector<Sample> &samples) {
         auto id = samples.front().session;
-        const auto &t = traces_[id - 1];
+        const auto it = traces_.constFind(id);
+        if (it == traces_.cend())
+            return;
+        const auto &t = it.value();
         // Expiry and wall-vs-monotonic checks prevent attaching a pre-step estimate to new observations.
         const auto age = estimateAge_.isValid() ? estimateAge_.elapsed() : -1;
         const bool validClock = age >= 0 && age <= 60000 && std::abs(now() - estimateAt_ - age) < 20 &&
@@ -247,8 +334,49 @@ class Collector final : public QObject {
     void connectReceiver() {
         auto *socket = new QSslSocket(this);
         socket_ = socket;
-        socket->setReadBufferSize(4097);
-        auto hello = [this] { send({{"type", "hello"}, {"site", site_}, {"token", token_}}, 0); };
+        socket->setReadBufferSize(managed_ ? maxFrame + 1 : 4097);
+        auto pinned = [this, socket] {
+            const auto cert = socket->peerCertificate();
+            const auto utc = QDateTime::currentDateTimeUtc();
+            return !cert.isNull() && cert.digest(QCryptographicHash::Sha256) == pin_ &&
+                   cert.effectiveDate() <= utc && utc <= cert.expiryDate();
+        };
+        if (!pin_.isEmpty()) {
+            connect(socket, &QSslSocket::sslErrors, this, [socket, pinned](const QList<QSslError> &errors) {
+                if (pinned() && std::all_of(errors.cbegin(), errors.cend(), [](const QSslError &e) {
+                    switch (e.error()) {
+                    case QSslError::SelfSignedCertificate:
+                    case QSslError::SelfSignedCertificateInChain:
+                    case QSslError::UnableToGetIssuerCertificate:
+                    case QSslError::UnableToGetLocalIssuerCertificate:
+                    case QSslError::UnableToVerifyFirstCertificate:
+                    case QSslError::CertificateUntrusted:
+                    case QSslError::HostNameMismatch:
+                        return true;
+                    default:
+                        return false;
+                    }
+                }))
+                    socket->ignoreSslErrors(errors);
+            });
+        }
+        auto hello = [this, pinned] {
+            if (!pin_.isEmpty() && !pinned()) {
+                lost("Receiver certificate does not match the enrollment key");
+                return;
+            }
+            QJsonObject message{{"type", "hello"}, {"token", token_}};
+            if (managed_) {
+                message["managed"] = true;
+                message["nodeId"] = nodeId_;
+                message["hostname"] = QHostInfo::localHostName().left(253);
+                message["appliedRevision"] = applied_;
+                message["applyError"] = applyError_;
+            } else {
+                message["site"] = site_;
+            }
+            send(message, 0);
+        };
         connect(socket, &QSslSocket::errorOccurred, this, [this, socket](QAbstractSocket::SocketError) {
             if (socket_ == socket)
                 lost(socket->errorString());
@@ -302,19 +430,32 @@ class Collector final : public QObject {
     void pump() {
         if (!ready_ || seq_ >= 0)
             return;
+        if (std::exchange(pingPending_, false)) {
+            QJsonObject message{{"type", "ping"}};
+            if (managed_) {
+                message["appliedRevision"] = applied_;
+                message["applyError"] = applyError_;
+            }
+            send(message, 0);
+            return;
+        }
         const auto record = spool_.oldest();
         if (record.first)
             send({{"type", "batch"}, {"body", record.second}}, record.first);
     }
 
     void readAck() {
-        if ((!plain_ && !socket_->isEncrypted()) || seq_ < 0 || socket_->bytesAvailable() > 4096) {
+        const auto limit = managed_ ? maxFrame : 4096;
+        if ((!plain_ && !socket_->isEncrypted()) || seq_ < 0 || socket_->bytesAvailable() > limit) {
             lost("Invalid receiver response");
             return;
         }
-        if (!socket_->canReadLine())
+        if (!socket_->canReadLine()) {
+            if (socket_->bytesAvailable() >= limit)
+                lost("Oversized acknowledgement");
             return;
-        const auto ack = QJsonDocument::fromJson(socket_->readLine(4096)).object();
+        }
+        const auto ack = QJsonDocument::fromJson(socket_->readLine(limit + 1)).object();
         const auto receivedWall = now(), elapsed = sentTimer_.elapsed();
         if (ack.value("v").toInt(-1) != 1 || ack.value("ack").toInteger(-1) != seq_) {
             lost(ack.contains("error") ? ack.value("error").toString().left(240) : "Invalid acknowledgement");
@@ -336,6 +477,32 @@ class Collector final : public QObject {
         }
         deadline_.stop();
         const auto confirmed = std::exchange(seq_, -1);
+        if (managed_ && confirmed == 0) {
+            const auto site = ack["site"].toString();
+            if (!validSite(site) || (!site_.isEmpty() && site_ != site)) {
+                lost("Invalid site identity from receiver");
+                return;
+            }
+            site_ = site;
+            try {
+                const auto revision = integer(ack, "revision", 1, 9007199254740991LL);
+                if (revision != applied_) {
+                    const auto targets = readTargets(ack["targets"], true);
+                    spool_.saveAssignment(site, revision, ack["targets"].toArray());
+                    installTargets(targets);
+                    applied_ = revision;
+                    pingPending_ = true;
+                }
+                applyError_.clear();
+            } catch (const std::exception &e) {
+                const auto reason = QString::fromUtf8(e.what()).left(200);
+                if (reason != applyError_) {
+                    pingPending_ = true;
+                    log("Could not apply assigned targets: " + reason);
+                }
+                applyError_ = reason;
+            }
+        }
         if (!ready_)
             log("Telemetry connection established for " + site_);
         ready_ = true;
@@ -349,7 +516,10 @@ class Collector final : public QObject {
         }
     }
 
-    QString site_, host_, token_;
+    QString site_, host_, token_, nodeId_, applyError_;
+    QByteArray pin_;
+    qint64 applied_ = 0, nextId_ = 0;
+    bool managed_ = false, pingPending_ = false;
     int port_;
     bool plain_;
     Spool &spool_;
@@ -358,7 +528,8 @@ class Collector final : public QObject {
     Probe *probe_ = nullptr;
     std::atomic<qint64> queuedSamples_{0};
     std::atomic_bool overloaded_{false};
-    QList<Trace> traces_;
+    QHash<QByteArray, qint64> active_;
+    QHash<qint64, Trace> traces_;
     QHash<qint64, QString> addresses_;
     QSslSocket *socket_ = nullptr;
     QTimer reconnect_, deadline_, ping_;
@@ -371,12 +542,16 @@ class Collector final : public QObject {
 
 int collect(const QJsonObject &config, const QString &base) {
     auto site = config.value("site").toString(), host = config.value("receiver").toString();
-    if (!validSite(site) || !validText(host, 255))
+    const auto managed = config.value("managed").toBool();
+    if ((!managed && !validSite(site)) || !validText(host, 255))
         throw Error("Configure a site and receiver hostname");
     const auto port = config.contains("port") ? int(integer(config, "port", 1, 65535)) : defaultPort;
     auto plain = plainLoopback(config, host);
     const auto bound = config.contains("spoolMiB") ? integer(config, "spoolMiB", 1, 4096) : 64;
-    const auto dest = QString("%1/%2/%3/%4").arg(site, host).arg(port).arg(plain ? "loopback" : "tls");
+    if (managed && plain)
+        throw Error("Managed collectors require TLS");
+    const auto identity = managed ? "managed:" + config.value("nodeId").toString() : site;
+    const auto dest = QString("%1/%2/%3/%4").arg(identity, host).arg(port).arg(plain ? "loopback" : "tls");
     Spool spool(filePath(base, config, "spool"), dest, bound * 1024 * 1024);
     Collector client(config, base, site, host, port, plain, spool);
     QTimer::singleShot(0, &client, [&client] { client.start(); });

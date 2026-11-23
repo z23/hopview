@@ -1,9 +1,78 @@
 #include "backend.h"
+#include "collectormanagement.h"
 #include "history.h"
+#include "receiverendpoint.h"
 #include "sqlhelpers.h"
 #include <algorithm>
 
 using namespace hopview_sql;
+
+QString Backend::collectorJoinCommand(const QString &address) const {
+    telemetry::ReceiverEndpoint endpoint;
+    if (!collectorManagementAvailable() || !telemetry::parseReceiverEndpoint(address, endpoint))
+        return {};
+    const auto argument = address.startsWith('[') ? "'" + address + "'" : address;
+    return QStringLiteral("sudo hopview-node join ") + argument;
+}
+
+CollectorManagement &Backend::collectorManagement() {
+    // The history reader thread serializes management requests from the desktop.
+    if (!m_management)
+        m_management = std::make_unique<CollectorManagement>(m_historyPath);
+    return *m_management;
+}
+
+void Backend::refreshCollectors() {
+    if (!m_ready || !collectorManagementAvailable() || m_collectorsLoading)
+        return;
+    m_collectorsLoading = true;
+    QMetaObject::invokeMethod(m_readContext, [this] {
+        auto &management = collectorManagement();
+        const auto nodes = management.nodes();
+        const auto error = management.error();
+        QMetaObject::invokeMethod(this, [this, nodes, error] {
+            m_collectorsLoading = false;
+            if (!error.isEmpty()) {
+                emit collectorListError(error);
+                return;
+            }
+            if (nodes != m_collectors) {
+                m_collectors = nodes;
+                emit collectorsChanged();
+            }
+        });
+    });
+}
+
+void Backend::createCollectorKey() {
+    if (!m_ready || !collectorManagementAvailable()) {
+        emit collectorKeyCreated({}, tr("Open the receiver history to enroll a collector."));
+        return;
+    }
+    QMetaObject::invokeMethod(m_readContext, [this] {
+        auto &management = collectorManagement();
+        const auto key = management.createKey();
+        const auto error = management.error();
+        QMetaObject::invokeMethod(this, [this, key, error] { emit collectorKeyCreated(key, error); });
+    });
+}
+
+void Backend::saveCollectorTargets(QString site, qint64 revision, QVariantList targets) {
+    if (!m_ready || !collectorManagementAvailable()) {
+        emit collectorTargetsSaved(site, tr("Open the receiver history to edit collector targets."));
+        return;
+    }
+    QMetaObject::invokeMethod(m_readContext, [this, site, revision, targets] {
+        auto &management = collectorManagement();
+        const bool saved = management.setTargets(site, revision, targets);
+        const auto error = saved ? QString{} : management.error();
+        QMetaObject::invokeMethod(this, [this, site, error] {
+            emit collectorTargetsSaved(site, error);
+            refreshCollectors();
+        });
+    });
+}
+
 qint64 History::dataVersion() {
     if (!open())
         return -1;

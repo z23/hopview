@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/defaults">
+        <file alias="collector.json">../deploy/collector.example.json</file>
+    </qresource>
+</RCC>

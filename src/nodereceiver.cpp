@@ -1,5 +1,6 @@
 #include "nodeconfig.h"
 #include "history.h"
+#include "collectormanagement.h"
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QJsonArray>
@@ -22,8 +23,9 @@ bool tokenMatches(const QByteArray &candidate, const QByteArray &expectedDigest)
 
 class Receiver final : public QTcpServer {
   public:
-    Receiver(History &history, QHash<QString, QByteArray> tokens, bool plain, QSslConfiguration ssl)
-        : history_(history), tokens_(std::move(tokens)), plain_(plain), ssl_(std::move(ssl)) {}
+    Receiver(History &history, CollectorManagement &management, QHash<QString, QByteArray> tokens,
+             bool plain, QSslConfiguration ssl)
+        : history_(history), management_(management), tokens_(std::move(tokens)), plain_(plain), ssl_(std::move(ssl)) {}
 
   private:
     void incomingConnection(qintptr descriptor) override {
@@ -47,7 +49,7 @@ class Receiver final : public QTcpServer {
         deadline->start(10000);
         socket->setReadBufferSize(maxFrame + 1);
         connect(socket, &QSslSocket::disconnected, socket, &QObject::deleteLater);
-        connect(socket, &QSslSocket::readyRead, socket, [this, socket, deadline, site = QString()]() mutable {
+        connect(socket, &QSslSocket::readyRead, socket, [this, socket, deadline, site = QString(), managed = false]() mutable {
             if (!plain_ && !socket->isEncrypted()) {
                 socket->abort();
                 return;
@@ -69,19 +71,41 @@ class Receiver final : public QTcpServer {
                     throw Error("Unsupported protocol");
                 const auto seq = integer(message, "seq", 0, 9007199254740991LL);
                 const auto type = message.value("type").toString();
+                QJsonObject ack;
                 if (site.isEmpty()) {
-                    const auto claim = message.value("site").toString();
-                    auto it = tokens_.constFind(claim);
-                    if (type != "hello" || seq != 0 || it == tokens_.cend() ||
-                        !tokenMatches(message.value("token").toString().toLatin1(), it.value()))
+                    if (type != "hello" || seq != 0)
                         throw Error("Authentication failed");
-                    site = claim;
+                    managed = message.value("managed").toBool();
+                    if (managed) {
+                        if (plain_)
+                            throw Error("Managed enrollment requires TLS");
+                        ack = management_.enroll(message.value("token").toString(), message.value("nodeId").toString(),
+                                                 message.value("hostname").toString(), tokens_.keys(),
+                                                 integer(message, "appliedRevision", 0, 9007199254740991LL),
+                                                 message.value("applyError").toString(), received);
+                        site = ack.value("site").toString();
+                    } else {
+                        const auto claim = message.value("site").toString();
+                        auto it = tokens_.constFind(claim);
+                        if (it == tokens_.cend() ||
+                            !tokenMatches(message.value("token").toString().toLatin1(), it.value()) ||
+                            management_.hasSite(claim))
+                            throw Error("Authentication failed");
+                        site = claim;
+                    }
                 } else if (type == "batch" && seq > 0) {
                     store(site, message.value("body").toObject(), received);
-                } else if (type != "ping" || seq != 0) {
+                } else if (type == "ping" && seq == 0) {
+                    if (managed)
+                        ack = management_.heartbeat(site, integer(message, "appliedRevision", 0, 9007199254740991LL),
+                                                    message.value("applyError").toString(), received);
+                } else {
                     throw Error("Unexpected message");
                 }
-                const QJsonObject ack{{"v", 1}, {"ack", seq}, {"receivedMs", received}, {"sentMs", now()}};
+                ack["v"] = 1;
+                ack["ack"] = seq;
+                ack["receivedMs"] = received;
+                ack["sentMs"] = now();
                 socket->write(QJsonDocument(ack).toJson(QJsonDocument::Compact) + '\n');
                 deadline->start(45000);
             } catch (const std::exception &e) {
@@ -150,6 +174,7 @@ class Receiver final : public QTcpServer {
     }
 
     History &history_;
+    CollectorManagement &management_;
     QHash<QString, QByteArray> tokens_;
     bool plain_;
     QSslConfiguration ssl_;
@@ -175,17 +200,21 @@ int receive(const QJsonObject &config, const QString &base) {
             throw Error("Each site requires a distinct token");
         tokens.insert(it.key(), digest);
     }
-    if (tokens.isEmpty())
-        throw Error("Configure at least one site and token file");
-    History history(filePath(base, config, "database"));
+    const auto database = filePath(base, config, "database");
+    History history(database);
     if (!history.open())
         throw Error(history.error());
-    Receiver server(history, tokens, plain, ssl);
+    CollectorManagement management(database);
+    Receiver server(history, management, tokens, plain, ssl);
     QHostAddress bind;
-    if (!bind.setAddress(host))
-        throw Error("Receiver listen must be a numeric IP address");
+    if (host == "*")
+        bind = QHostAddress::Any;
+    else if (!bind.setAddress(host))
+        throw Error("Receiver listen must be a numeric IP address or *");
     if (!server.listen(bind, port))
         throw Error(server.errorString());
+    const auto fingerprint = ssl.localCertificate().digest(QCryptographicHash::Sha256).toHex();
+    management.setCertificateFingerprint(plain ? QString{} : QString::fromLatin1(fingerprint));
     log(QString("Receiving telemetry on %1 port %2 (%3)")
             .arg(host)
             .arg(port)

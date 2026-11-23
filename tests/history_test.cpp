@@ -1,4 +1,8 @@
 #include "history.h"
+#include "collectormanagement.h"
+#include "sqlhelpers.h"
+#include <QJsonArray>
+#include <QUuid>
 #include "incident.h"
 #include <QFile>
 #include "routeevents.h"
@@ -523,6 +527,65 @@ void testIncident(const QTemporaryDir &dir) {
             "Reject incomplete replay");
 }
 
+void testManagedCollectors(const QString &path) {
+    History history(path);
+    require(history.open(), "Create receiver history");
+    CollectorManagement receiver(path), desktop(path);
+    const auto unpinned = desktop.createKey();
+    require(unpinned.split('.').size() == 2 && desktop.nodes().isEmpty(), "Unused keys do not appear as nodes");
+    const QString fingerprint(64, 'f');
+    receiver.setCertificateFingerprint(fingerprint);
+    const auto key = desktop.createKey().split('.');
+    require(key.size() == 3 && key[0] == "hv1" && key[1].size() == 64 && key[2] == fingerprint,
+            "Key carries the live listener's certificate digest");
+    const auto otherKey = desktop.createKey().split('.');
+    require(otherKey[1] != key[1], "Distinct enrollment secrets");
+    sqlite3 *raw = nullptr;
+    require(sqlite3_open(QFile::encodeName(path).constData(), &raw) == SQLITE_OK, "Open key storage");
+    {
+        hopview_sql::Statement row(raw, "SELECT key_digest FROM managed_collectors");
+        while (row.next()) require(row.string(0).size() == 64 && row.string(0) != key[1],
+                                   "Keep digests instead of enrollment credentials");
+    }
+    sqlite3_close(raw);
+    const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto id2 = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto first = receiver.enroll(key[1], id, "office", {"office"}, 0, {}, 100);
+    const auto site = first["site"].toString();
+    require(site == "office-2" && first["revision"] == 1 && first["targets"].isArray()
+            && first["targets"].toArray().isEmpty(), "Discover unused node without targets or trace history");
+    const auto second = receiver.enroll(otherKey[1], id2, "office", {"office"}, 0, {}, 101);
+    require(second["site"] == "office-3", "Separate VMs with identical hostnames and static site labels");
+    require(history.sessions(true).isEmpty(), "Idle nodes do not create recordings");
+    const auto denied = [&](const QString &secret, const QString &identity) {
+        try { receiver.enroll(secret, identity, "other", {}, 0, {}, 105); }
+        catch (const std::exception &) { return true; }
+        return false;
+    };
+    require(denied(key[1], id2) && denied(unpinned.section('.', 1, 1), id) && denied(QString(64, 'f'), id),
+            "A credential binds to one installation and an installation to one credential");
+    const QVariantMap v4{{"target", "127.0.0.1"}, {"family", 4}, {"protocol", "tcp"}};
+    const QVariantMap v6{{"target", "::1"}, {"family", 6}, {"protocol", "icmp"}};
+    require(!desktop.setTargets(site, 1, {v4,v4}) && !desktop.setTargets(site, 1, {
+                QVariantMap{{"target", "127.0.0.1"}, {"family", 6}}}), "Validate full desired list before changing it");
+    require(desktop.setTargets(site, 1, {v4, v6}) && !desktop.setTargets(site, 1, {}),
+            "Reject outdated edits to the same node");
+    require(desktop.setTargets(site, 2, {v4, v6}), "Resaving a canonical list preserves its revision");
+    const auto retry = receiver.enroll(key[1], id, "renamed", {}, 1, "invalid interface", 110);
+    require(retry["site"] == site && retry["revision"] == 2 && retry["targets"].toArray().size() == 2,
+            "Authenticated reconnect keeps the original site and returns outstanding revision");
+    auto node = desktop.nodes().first().toMap();
+    require(node["applyError"] == "invalid interface" && node["hostname"] == "renamed"
+            && node["appliedRevision"] == 1 && node["lastSeenMs"] == 110, "Record per-node status");
+    const auto ack = receiver.heartbeat(site, 2, {}, 115);
+    require(ack["revision"] == 2 && !ack.contains("targets") && desktop.nodes().first().toMap()["applyError"] == "",
+            "Applied revision heartbeat only contains metadata");
+    require(desktop.setTargets(site, 2, {}), "Clear target list");
+    const auto empty = receiver.heartbeat(site, 2, {}, 120);
+    require(empty["revision"] == 3 && empty["targets"].isArray() && empty["targets"].toArray().isEmpty(),
+            "Deliver an explicitly empty revision");
+}
+
 void benchmark(const QString &file) {
     constexpr qint64 base = 1720012345000;
     constexpr int hops = 15, seconds = 86400;
@@ -579,6 +642,7 @@ int main(int argc, char **argv) {
         else {
             test(dir.filePath("history.sqlite"));
             testIncident(dir);
+            testManagedCollectors(dir.filePath("managed.db"));
             testPeriodComparison(dir.filePath("baseline.db"));
             testComparisonEvidence(dir);
             testRouteChange(dir.filePath("routes.sqlite"));

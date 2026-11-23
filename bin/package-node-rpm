@@ -12,6 +12,6 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/SOURCES" "$work/BUILD" "$work/BUILDROOT" "$work/SPECS" "$work/SRPMS" "$work/RPMS"
 tar -C "$root" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${SOURCE_DATE_EPOCH:-0}" \
-    --transform "s,^,$name/," -czf "$work/SOURCES/$name.tar.gz" node.pro src deploy docs/telemetry.md
+    --transform "s,^,$name/," -czf "$work/SOURCES/$name.tar.gz" node.pro src deploy docs/telemetry.md LICENSE
 rpmbuild -ba --define "_topdir $work" "$spec"
 find "$work/RPMS" "$work/SRPMS" -name '*.rpm' -type f -exec cp -t "$out" -- {} +

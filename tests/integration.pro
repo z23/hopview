@@ -7,5 +7,6 @@ SOURCES += integration_test.cpp ../src/backend.cpp ../src/background.cpp ../src/
            ../src/baselineview.cpp ../src/diagnostics.cpp ../src/diagnostichistory.cpp ../src/graph.cpp \
            ../src/groups.cpp ../src/groupview.cpp ../src/history.cpp ../src/incident.cpp ../src/monitoring.cpp \
            ../src/probe.cpp ../src/remotes.cpp ../src/routeevents.cpp
-HEADERS += ../src/backend.h ../src/background.h ../src/diagnostics.h ../src/probe.h ../src/graph.h ../src/types.h
+SOURCES += ../src/collectormanagement.cpp ../src/localreceiver.cpp ../src/nodeconfig.cpp
+HEADERS += ../src/collectormanagement.h ../src/localreceiver.h ../src/receiverendpoint.h ../src/backend.h ../src/background.h ../src/diagnostics.h ../src/probe.h ../src/graph.h ../src/types.h
 RESOURCES += ../src/resources.qrc
