@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Hopline
+GenericName=Network path monitor
+Comment=Investigate hop latency, packet loss and route history
+Exec=hopline
+Icon=hopline
+Terminal=false
+Categories=Network;Monitor;
+Keywords=ping;traceroute;latency;IPv6;
+StartupWMClass=hopline

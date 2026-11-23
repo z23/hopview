@@ -1,0 +1,22 @@
+pkgname=hopline
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native IPv4 and IPv6 network path monitor with interactive history"
+arch=('x86_64' 'aarch64')
+depends=('glibc' 'libgcc' 'libglvnd' 'libstdc++' 'qt6-base' 'qt6-declarative' 'sqlite')
+makedepends=('pkgconf')
+options=('!debug')
+source=("hopline-${pkgver}.tar.gz")
+# bin/package pins this digest when creating the distributable source package.
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/hopline"
+    bin/build
+}
+package() {
+    cd "$srcdir/hopline"
+    install -Dm755 build/hopline "$pkgdir/usr/bin/hopline"
+    install -Dm644 pkgbuild/hopline.desktop "$pkgdir/usr/share/applications/hopline.desktop"
+    install -Dm644 pkgbuild/hopline.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/hopline.svg"
+}

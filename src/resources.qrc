@@ -1,0 +1,5 @@
+<RCC><qresource prefix="/">
+  <file>Main.qml</file>
+  <file>TraceButton.qml</file>
+  <file>TraceCombo.qml</file>
+</qresource></RCC>

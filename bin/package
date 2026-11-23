@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+stage=$(mktemp -d)
+trap 'rm -rf -- "$stage"' EXIT
+
+# Build from the same, checksummed archive that ships in the source package.
+source "$root/pkgbuild/PKGBUILD"
+archive="$pkgname-$pkgver.tar.gz"
+inputs=(src tests bin hopline.pro pkgbuild/PKGBUILD pkgbuild/hopline.desktop pkgbuild/hopline.svg)
+for doc in README.md LICENSE docs; do
+    if [[ -e "$root/$doc" ]]; then inputs+=("$doc"); fi
+done
+tar -C "$root" --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" \
+    --owner=0 --group=0 --numeric-owner --transform "s,^,$pkgname/," \
+    -czf "$stage/$archive" "${inputs[@]}"
+
+cd "$stage"
+digest=$(sha256sum "$archive")
+sed "s/^sha256sums=.*/sha256sums=('${digest%% *}')/" "$root/pkgbuild/PKGBUILD" > PKGBUILD
+export PKGDEST="$root/pkgbuild" SRCPKGDEST="$root/pkgbuild"
+makepkg --allsource --force
+makepkg --force
