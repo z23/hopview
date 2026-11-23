@@ -3,7 +3,7 @@
 #include "sqlhelpers.h"
 #include <algorithm>
 
-using namespace hopline_sql;
+using namespace hopview_sql;
 qint64 History::dataVersion() {
     if (!open())
         return -1;

@@ -1,13 +1,13 @@
 [Unit]
-Description=Hopline path telemetry receiver
+Description=Hopview outbound path telemetry collector
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/hopline-node receive /etc/hopline/receiver.json
-User=hopline
-Group=hopline
-StateDirectory=hopline-receiver
+ExecStart=/usr/bin/hopview-node collect /etc/hopview/collector.json
+User=hopview
+Group=hopview
+StateDirectory=hopview-collector
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes

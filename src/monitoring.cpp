@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-using namespace hopline_sql;
+using namespace hopview_sql;
 
 namespace {
 constexpr int highLatency = 1;

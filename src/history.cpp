@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-using namespace hopline_sql;
+using namespace hopview_sql;
 
 namespace {
 constexpr std::array<qint64, 3> spans{10000, 60000, 3600000};
@@ -697,7 +697,7 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
             QVector<Stats> points(count);
             if (duration <= qint64(count) * 1000) {
                 // Live views often have only a few hundred probes. One index
-                // scan is cheaper than an SQLite query for each empty pixel.
+                // scan is cheaper than a separate database query for each empty pixel.
                 auto &raw = reader.raw;
                 raw.reset();
                 raw.integer(1, id);

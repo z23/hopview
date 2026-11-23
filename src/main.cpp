@@ -179,10 +179,10 @@ int main(int argc, char **argv) {
         app = std::make_unique<QGuiApplication>(argc, argv);
     else
         app = std::make_unique<QCoreApplication>(argc, argv);
-    app->setApplicationName("hopline");
+    app->setApplicationName("hopview");
     app->setApplicationVersion("0.4.0");
     QCommandLineParser parser;
-    parser.setApplicationDescription("Hopline — continuous IPv4 and IPv6 path monitoring");
+    parser.setApplicationDescription("Hopview — continuous IPv4 and IPv6 path monitoring");
     parser.addHelpOption();
     parser.addVersionOption();
     parser.addPositionalArgument("target", "Start a new trace when the window opens.", "[target]");
@@ -196,7 +196,7 @@ int main(int argc, char **argv) {
          {"interval", "Time between probe rounds in milliseconds (250–60000).", "milliseconds", "1000"},
          {"background", "Keep recording after window close and start with the window closed."},
          {"quit", "Shut down the recorder for this database and flush pending samples."},
-         {"database", "Open a specific SQLite history file.", "file"},
+         {"database", "Open a specific history file.", "file"},
          {"replay", "Open an exported incident in an offline window.", "file"},
          {"demo", "Explore an isolated example session without sending probes."}});
     parser.process(*app);
@@ -251,6 +251,10 @@ int main(int argc, char **argv) {
     } else if (file.isEmpty()) {
         const QString path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
         file = QDir(path).filePath("history.sqlite");
+        const auto previous = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
+                                  .filePath("hopline/history.sqlite");
+        if (!QFileInfo::exists(file) && QFileInfo(previous).isFile())
+            file = previous;
     }
     BackgroundInstance instance;
     const QString action = parser.isSet("quit") ? "quit" : parser.isSet("background") ? "background" : "show";
@@ -265,9 +269,17 @@ int main(int argc, char **argv) {
         if (result == BackgroundInstance::Forwarded)
             return 0;
     }
-    QGuiApplication::setDesktopFileName("hopline");
+    QGuiApplication::setDesktopFileName("hopview");
+    if (!isolated) {
+        const QDir config(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation));
+        const auto previous = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation))
+                                  .filePath("hopline/appearance.ini");
+        const auto appearance = config.filePath("appearance.ini");
+        if (!QFileInfo::exists(appearance) && QFileInfo(previous).isFile() && config.mkpath("."))
+            QFile::copy(previous, appearance);
+    }
     QQuickStyle::setStyle("Basic");
-    qmlRegisterType<GraphView>("Hopline.Graphics", 1, 0, "GraphView");
+    qmlRegisterType<GraphView>("Hopview.Graphics", 1, 0, "GraphView");
     Backend backend(file);
     if (parser.isSet("replay")) {
         backend.setReplayMode();
@@ -291,10 +303,10 @@ int main(int argc, char **argv) {
     engine.setInitialProperties({{"startHidden", action == "background"}});
     engine.load(QUrl("qrc:/Main.qml"));
     if (engine.rootObjects().isEmpty())
-        return fail("Could not load the Hopline window.");
+        return fail("Could not load the Hopview window.");
     auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().front());
     if (!window)
-        return fail("Could not initialize the Hopline window.");
+        return fail("Could not initialize the Hopview window.");
     if (!isolated) {
         backend.enableRecorder();
         BackgroundInstance::enableGracefulExit();

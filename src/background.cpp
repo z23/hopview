@@ -66,6 +66,7 @@ BackgroundInstance::Result BackgroundInstance::acquire(const QString &database, 
     const QString canonical = file.exists() ? file.canonicalFilePath() :
         QDir(file.absoluteDir().canonicalPath()).absoluteFilePath(file.fileName());
     const auto hash = QCryptographicHash::hash(canonical.toUtf8(), QCryptographicHash::Sha256).toHex().left(32);
+    // All recorder versions must use the same lock and socket for a given history.
     const QString name = QDir(runtime).filePath("hopline-" + hash);
     lock_ = std::make_unique<QLockFile>(name + ".lock");
     lock_->setStaleLockTime(0);
@@ -109,7 +110,7 @@ BackgroundInstance::Result BackgroundInstance::acquire(const QString &database, 
         return Failed;
     }
     if (request["action"] == "quit" && originalOwner) {
-        // Ownership is released only after the Probe and SQLite writer have shut down.
+        // The recorder releases ownership after the probe and database writer have shut down.
         // A sequential quit/relaunch must never send the launch to a retiring process.
         QElapsedTimer shutdown;
         shutdown.start();
@@ -169,7 +170,7 @@ void BackgroundInstance::notify(const QVariantMap &event) {
     const auto body = tr("Destination loss %1% · Mean RTT %2")
         .arg(QString::number(event["loss"].toDouble(), 'f', 1),
              latency < 0 ? tr("unavailable") : QString::number(latency, 'f', 1) + " ms");
-    message.setArguments({QStringLiteral("Hopline"), 0u, QStringLiteral("hopline"), summary, body,
+    message.setArguments({QStringLiteral("Hopview"), 0u, QStringLiteral("hopview"), summary, body,
                           QStringList{"default", tr("View interval")}, QVariantMap{}, -1});
     auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(message), this);
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher, event] {

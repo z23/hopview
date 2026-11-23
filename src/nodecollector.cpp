@@ -23,7 +23,7 @@
 
 namespace telemetry {
 namespace {
-using namespace hopline_sql;
+using namespace hopview_sql;
 qint64 now() { return QDateTime::currentMSecsSinceEpoch(); }
 
 class Spool {
@@ -149,7 +149,7 @@ class Collector final : public QObject {
                 [this](qint64 id, const QString &address, const QString &, int) {
                     addresses_.insert(id, address);
                 });
-        // Slow fsync and receiver backfill must leave the probe timer independent of storage latency.
+        // Disk flushes and receiver backfill run independently of the probe timer.
         connect(probe_, &Probe::samples, probe_, [this](QVector<Sample> samples) {
             if (samples.isEmpty())
                 return;

@@ -63,7 +63,7 @@ C.Dialog {
                 }
                 Label {
                     Layout.fillWidth: true
-                    text: "Reopen Hopline to see running traces. Starting it again after exit resumes those traces."
+                    text: "Reopen Hopview to see running traces. Starting it again after exit resumes those traces."
                     color: "#a3b3bf"
                 }
                 Label {
@@ -157,7 +157,7 @@ C.Dialog {
         RowLayout {
             Layout.fillWidth: true
             TraceButton {
-                text: "Quit Hopline"
+                text: "Quit Hopview"
                 hint: "Flush pending samples and exit the recorder"
                 onClicked: Qt.quit()
             }

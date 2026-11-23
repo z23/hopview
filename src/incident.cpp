@@ -12,7 +12,7 @@
 #include <QTemporaryDir>
 #include <cmath>
 
-using namespace hopline_sql;
+using namespace hopview_sql;
 namespace {
 constexpr qint64 maxTime = 253402300799999LL; // Last millisecond of year 9999.
 
@@ -73,7 +73,7 @@ QJsonObject readRecord(QFile &in, int limit) {
     QJsonParseError parse;
     const auto doc = QJsonDocument::fromJson(line, &parse);
     require(line.endsWith('\n') && doc.isObject() && parse.error == QJsonParseError::NoError,
-            "Invalid or incomplete Hopline incident record.");
+            "Invalid or incomplete Hopview incident record.");
     return doc.object();
 }
 struct Counts {
@@ -192,7 +192,8 @@ qint64 addTrace(History &history, QJsonObject meta, const QString &fallback, qin
 
 void parseIncident(QFile &in, History &stage, IncidentRange &range, const QString &site, qint64 correction) {
     const auto header = readRecord(in, 16 * 1024 * 1024);
-    require(header["kind"] == "hopline", "Unsupported Hopline incident format.");
+    const auto kind = header["kind"].toString();
+    require(kind == "hopview" || kind == "hopline", "Unsupported Hopview incident format.");
     const int version = integer(header, "version", 1, 2);
     const auto from = integer(header, "from", 0, maxTime);
     const auto through = integer(header, "through", from, maxTime);
@@ -338,7 +339,7 @@ bool History::exportIncident(qint64 id, qint64 from, qint64 through, const QStri
                          "manual_correction_ms",
                          "diagnostic_json"});
         else
-            jsonLine(out, {{"kind", "hopline"},
+            jsonLine(out, {{"kind", "hopview"},
                            {"version", 2},
                            {"from", from},
                            {"through", through},

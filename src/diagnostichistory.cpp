@@ -8,7 +8,7 @@
 #include <cmath>
 #include <map>
 
-using namespace hopline_sql;
+using namespace hopview_sql;
 namespace {
 constexpr std::array<qint64, 3> binSpans{30000, 300000, 3600000};
 constexpr qint64 maximumTime = 253402300799999LL;

@@ -4,7 +4,7 @@
 #include <sqlite3.h>
 #include <stdexcept>
 
-namespace hopline_sql {
+namespace hopview_sql {
 inline void check(sqlite3 *db, int result) {
     if (result != SQLITE_OK)
         throw std::runtime_error(sqlite3_errmsg(db));
@@ -65,4 +65,4 @@ class Transaction {
     bool active_ = true;
 };
 
-} // namespace hopline_sql
+} // namespace hopview_sql

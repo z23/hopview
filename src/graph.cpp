@@ -19,8 +19,8 @@ constexpr qreal criticalMs = 200;
 enum Layer { Warning, Critical, Grid, Band, Loss, Range, Line, Current, Count };
 using Layers = std::array<Vertices, Count>;
 
-// Rendering stays on Qt Quick's render thread. Each draw layer keeps its node,
-// material and vertex allocation while the viewport moves or new samples arrive.
+// The render thread reuses each layer's node, material and vertex buffer
+// while the viewport moves or new samples arrive.
 class GraphNode : public QSGNode {
 public:
     GraphNode()
@@ -232,7 +232,7 @@ QSGNode *GraphView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
         QColor(215,170,85,22), QColor(203,96,104,32), QColor("#293643"), fill, QColor("#dd686e"), QColor("#8296a5"), m_accent, QColor("#f4c778")
     };
     if (window()->rendererInterface()->graphicsApi() == QSGRendererInterface::Software) {
-        // The Qt software adaptation cannot draw custom geometry nodes.
+        // The software renderer needs a raster image for custom geometry.
         const qreal ratio = window()->effectiveDevicePixelRatio();
         QImage image(QSize(std::ceil(width() * ratio), std::ceil(height() * ratio)), QImage::Format_ARGB32_Premultiplied);
         image.setDevicePixelRatio(ratio);

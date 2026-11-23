@@ -3,7 +3,7 @@
   "port": 8347,
   "certificate": "receiver-chain.pem",
   "privateKey": "receiver-key.pem",
-  "database": "/var/lib/hopline-receiver/history.sqlite",
+  "database": "/var/lib/hopview-receiver/history.sqlite",
   "sites": {
     "melbourne-vm": "melbourne-vm.token",
     "london-vm": "london-vm.token"

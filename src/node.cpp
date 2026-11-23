@@ -17,10 +17,10 @@ int main(int argc, char **argv) {
     if (sigprocmask(SIG_BLOCK, &signalsToHandle, nullptr) != 0)
         return 1;
     QCoreApplication app(argc, argv);
-    app.setApplicationName("hopline-node");
+    app.setApplicationName("hopview-node");
     auto args = app.arguments();
     if (args.size() != 3 || (args[1] != "collect" && args[1] != "receive")) {
-        telemetry::log("Usage: hopline-node collect COLLECTOR.json | receive RECEIVER.json");
+        telemetry::log("Usage: hopview-node collect COLLECTOR.json | receive RECEIVER.json");
         return args.size() == 2 && (args[1] == "--help" || args[1] == "-h") ? 0 : 2;
     }
     try {

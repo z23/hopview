@@ -63,7 +63,7 @@ def verify(binary, work, private_bus=None):
     owner = subprocess.Popen(command + target, env=env)
     try:
         wait_for_rounds(3)
-        run("--background")  # Opt in and close the actual QQuickWindow.
+        run("--background")  # Enable background recording and close the window.
         hidden = count("SELECT count(*) FROM samples WHERE hop=0")
         wait_for_rounds(hidden + 5)
         if private_bus:
@@ -76,7 +76,7 @@ def verify(binary, work, private_bus=None):
                 for _ in range(100):
                     if log.exists():
                         notices = [json.loads(line) for line in log.read_text().splitlines()]
-                        if any(name == "Hopline" and expected in summary and "default" in actions
+                        if any(name == "Hopview" and expected in summary and "default" in actions
                                for name, summary, actions in notices):
                             return
                     time.sleep(.1)
@@ -111,12 +111,12 @@ if __name__ == "__main__":
         serve_notifications(sys.argv[2])
         sys.exit(0)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("binary", nargs="?", default="build/hopline")
+    parser.add_argument("binary", nargs="?", default="build/hopview")
     parser.add_argument("--notifications", action="store_true",
                         help="Also exercise a private D-Bus daemon and notification service (dbus-python, PyGObject).")
     args = parser.parse_args()
     binary = str(Path(args.binary).resolve())
-    with tempfile.TemporaryDirectory(prefix="hopline-recorder-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="hopview-recorder-") as tmp:
         work = Path(tmp)
         if args.notifications:
             address = f"unix:path={work}/bus"

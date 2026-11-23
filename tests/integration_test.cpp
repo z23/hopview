@@ -170,7 +170,7 @@ void Integration::diagnosticTracks() {
     auto controlNic = nic;
     controlNic["name"] = "control0";
     QVERIFY(h.appendDiagnostic(control, controlNic));
-    const auto evidence = dir.filePath("multiple.hopline");
+    const auto evidence = dir.filePath("multiple.hopview");
     QVERIFY2(h.exportIncident(id, base, base + 99000, evidence, false, {control}), qPrintable(h.error()));
     History imported(dir.filePath("imported.db"));
     IncidentRange clip;
@@ -189,7 +189,7 @@ void Integration::diagnosticTracks() {
     Window ui(b);
     QVERIFY(ui.win &&
             waitFor([&] { return findItem(ui.win->contentItem(), "serviceDiagnosticGraph") && fresh(b); }));
-    const auto screenshot = qEnvironmentVariable("HOPLINE_DIAGNOSTIC_SCREENSHOT");
+    const auto screenshot = qEnvironmentVariable("HOPVIEW_DIAGNOSTIC_SCREENSHOT");
     if (!screenshot.isEmpty()) {
         QTest::qWait(70);
         QVERIFY(ui.win->grabWindow().save(screenshot));
@@ -224,12 +224,12 @@ void Integration::diagnosticTracks() {
 }
 
 void Integration::diagnosticLoopback() {
-    if (!qEnvironmentVariableIsSet("HOPLINE_DIAG_TLS"))
+    if (!qEnvironmentVariableIsSet("HOPVIEW_DIAG_TLS"))
         QSKIP("Run python3 tests/diagnostics-loopback.py to start private HTTP and HTTPS fixtures.");
-    const auto https = qEnvironmentVariable("HOPLINE_DIAG_TLS");
-    const auto http = qEnvironmentVariable("HOPLINE_DIAG_HTTP");
-    const auto https6 = qEnvironmentVariable("HOPLINE_DIAG_TLS6");
-    const auto ca = qgetenv("HOPLINE_DIAG_CA");
+    const auto https = qEnvironmentVariable("HOPVIEW_DIAG_TLS");
+    const auto http = qEnvironmentVariable("HOPVIEW_DIAG_HTTP");
+    const auto https6 = qEnvironmentVariable("HOPVIEW_DIAG_TLS6");
+    const auto ca = qgetenv("HOPVIEW_DIAG_CA");
     const std::atomic_bool cancel{false};
     for (const int family : {4, 6}) {
         const auto record = measureService(family == 4 ? https : https6, family, "", 5, cancel, ca);
@@ -414,14 +414,14 @@ void Integration::desktop() {
     b.setIntervalMs(500);
     QVERIFY(waitFor([&] { return b.sessions().last().toMap().value("intervalMs").toInt() == 500; }));
 
-    // Hit test a real QML chart. A click on a spike changes the upper table's time bounds.
+    // Clicking a spike on the chart changes the time bounds of the route table.
     auto *input = findItem(ui.win->contentItem(), "timelineInput12");
     QVERIFY2(input, "Missing destination timeline input");
     const QPointF local(input->width() * .49, input->height() * .5);
     QTest::mouseDClick(ui.win, Qt::LeftButton, Qt::NoModifier, input->mapToScene(local).toPoint());
     QVERIFY(waitFor([&] { return !b.live() && fresh(b); }));
     QVERIFY(rowFor(b, hops).value("max").toDouble() > 75);
-    const auto screenshot = qEnvironmentVariable("HOPLINE_SCREENSHOT");
+    const auto screenshot = qEnvironmentVariable("HOPVIEW_SCREENSHOT");
     if (!screenshot.isEmpty()) {
         QTest::qWait(100);
         QVERIFY(ui.win->grabWindow().save(screenshot));
@@ -584,7 +584,7 @@ void Integration::baselineComparison() {
 }
 
 void Integration::twoSiteWindow() {
-    const auto db = qEnvironmentVariable("HOPLINE_REMOTE_DB");
+    const auto db = qEnvironmentVariable("HOPVIEW_REMOTE_DB");
     if (db.isEmpty())
         QSKIP("Run tests/telemetry.py with --viewer for two live remote senders.");
     Backend b(db);
@@ -681,7 +681,7 @@ void Integration::saveFocus() {
     QCOMPARE(dialog->property("throughMs").toLongLong(), end);
     QCOMPARE(dialog->property("session").toLongLong(), id);
     b.goLive(); // The export must keep the range captured when the dialog opened.
-    const auto path = dir.filePath("selected.hopline");
+    const auto path = dir.filePath("selected.hopview");
     QSignalSpy result(&b, &Backend::incidentExported);
     QQuickItem *name = nullptr;
     QVERIFY(waitFor([&] {
@@ -696,9 +696,9 @@ void Integration::saveFocus() {
     name->forceActiveFocus();
     QTest::keyClick(name->window(), Qt::Key_A, Qt::ControlModifier);
     QInputMethodEvent filename;
-    filename.setCommitString("selected.hopline");
+    filename.setCommitString("selected.hopview");
     QGuiApplication::sendEvent(name, &filename);
-    QCOMPARE(name->property("text").toString(), QString("selected.hopline"));
+    QCOMPARE(name->property("text").toString(), QString("selected.hopview"));
     // Confirm using the file picker's Save button.
     QQuickItem *confirm = nullptr;
     std::function<void(QQuickItem *)> findSave = [&](QQuickItem *control) {
@@ -729,7 +729,7 @@ void Integration::saveFocus() {
 void Integration::savedComparison() {
     QTemporaryDir dir;
     const auto file = dir.filePath("groups.db");
-    const auto incident = dir.filePath("office.hopline");
+    const auto incident = dir.filePath("office.hopview");
     const auto primary = fill(file, 80);
     History writer(file);
     const auto peer = writer.createSession("isp.example", 4, 1000);
@@ -936,8 +936,8 @@ void Integration::latencyColors() {
 }
 
 void Integration::replayWhileProbing() {
-    if (!qEnvironmentVariableIsSet("HOPLINE_LIVE_TEST"))
-        QSKIP("Set HOPLINE_LIVE_TEST=1 for the dual-stack replay benchmark.");
+    if (!qEnvironmentVariableIsSet("HOPVIEW_LIVE_TEST"))
+        QSKIP("Set HOPVIEW_LIVE_TEST=1 for the dual-stack replay benchmark.");
     QTemporaryDir dir;
     const auto file = dir.filePath("bench.db");
     constexpr int rounds = 25 * 3600;
@@ -1032,7 +1032,7 @@ int main(int argc, char **argv) {
     qputenv("XDG_CONFIG_HOME", QFile::encodeName(config.path()));
     QGuiApplication app(argc, argv);
     QQuickStyle::setStyle("Basic");
-    qmlRegisterType<GraphView>("Hopline.Graphics", 1, 0, "GraphView");
+    qmlRegisterType<GraphView>("Hopview.Graphics", 1, 0, "GraphView");
     Integration suite;
     return QTest::qExec(&suite, argc, argv);
 }

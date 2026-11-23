@@ -326,7 +326,7 @@ void testUpgrade(const QString &file) {
 }
 
 void testComparisonEvidence(const QTemporaryDir &dir) {
-    const auto db = dir.filePath("group-source.db"), file = dir.filePath("two-locations.hopline");
+    const auto db = dir.filePath("group-source.db"), file = dir.filePath("two-locations.hopview");
     const auto csv = dir.filePath("group.csv");
     const qint64 t = 1700000000000;
     History h(db);
@@ -490,7 +490,7 @@ void testIncident(const QTemporaryDir &dir) {
     const QString note = "ISP, \"case 12\"\nfollow-up";
     require(source.addNote(id, t + 275, note) && source.addNote(id, t, "exclude"),
             "Seed incident annotations");
-    const auto csv = dir.filePath("incident.csv"), recording = dir.filePath("incident.hopline");
+    const auto csv = dir.filePath("incident.csv"), recording = dir.filePath("incident.hopview");
     require(source.exportIncident(id, t + 250, t + 500, csv, true), "Export raw CSV");
     QFile rows(csv);
     require(rows.open(QIODevice::ReadOnly), "Open CSV");

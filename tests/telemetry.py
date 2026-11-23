@@ -99,7 +99,7 @@ def verify(binary, work, office_node=None, branch_node=None, viewer=None):
     try:
         desktop = None
         if viewer:
-            environment = dict(os.environ, HOPLINE_REMOTE_DB=str(database), QT_QPA_PLATFORM="offscreen",
+            environment = dict(os.environ, HOPVIEW_REMOTE_DB=str(database), QT_QPA_PLATFORM="offscreen",
                                QT_QUICK_BACKEND="software", QT_QPA_PLATFORMTHEME="generic")
             desktop = subprocess.Popen([viewer, "twoSiteWindow"], env=environment)
             children.append(desktop)
@@ -206,7 +206,7 @@ def verify(binary, work, office_node=None, branch_node=None, viewer=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("node", type=Path, nargs="?", default=Path("build-node/hopline-node"))
+    parser.add_argument("node", type=Path, nargs="?", default=Path("build-node/hopview-node"))
     parser.add_argument("--office-node", type=Path, help="Collector executable for the office site")
     parser.add_argument("--branch-node", type=Path, help="Collector executable for the branch site")
     parser.add_argument("--viewer", type=Path, help="Qt integration binary for an open desktop comparison")

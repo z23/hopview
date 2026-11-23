@@ -4,7 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
-using namespace hopline_sql;
+using namespace hopview_sql;
 
 QStringList History::groupNames() {
     QStringList names;

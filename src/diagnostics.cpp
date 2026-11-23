@@ -68,7 +68,7 @@ QString networkManagerAP(const QString &interface) {
 }
 
 QString accessPoint(const QString &interface) {
-    // WEXT exposes the associated BSSID on drivers with wireless compatibility support.
+    // Drivers with wireless compatibility support expose the associated access point's BSSID here.
     const int sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (sock < 0)
         return networkManagerAP(interface);
@@ -204,7 +204,7 @@ QVariantMap measureService(const QString &address, int family, const QString &bi
         curl_easy_setopt(curl, CURLOPT_INTERFACE, device.constData());
     if (!caFile.isEmpty())
         curl_easy_setopt(curl, CURLOPT_CAINFO, caFile.constData());
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Hopline");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Hopview");
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, message);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, stopTransfer);

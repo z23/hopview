@@ -11,7 +11,7 @@
 struct sqlite3;
 class RouteEvents;
 
-// Each worker owns its connection. All timestamps are Unix milliseconds.
+// Each worker owns its connection. Timestamps count milliseconds since 1970-01-01 00:00 UTC.
 class History {
   public:
     explicit History(QString path);

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Exercise Hopline across a virtual router without sending packets to the host network.
-# Requires Linux user/network namespaces, iproute2, util-linux, iputils and Python 3.
+# Exercise Hopview across a virtual router without sending packets to the host network.
+# The test needs unprivileged user and network namespaces to create its isolated links.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-binary=$(realpath "${1:-$root/build/hopline}")
-[[ -x "$binary" ]] || { echo "Build Hopline before running this test." >&2; exit 1; }
+binary=$(realpath "${1:-$root/build/hopview}")
+[[ -x "$binary" ]] || { echo "Build Hopview before running this test." >&2; exit 1; }
 
 unshare --user --map-root-user --net bash -seu -o pipefail -- "$binary" <<'LAB'
 binary=$1
@@ -52,8 +52,7 @@ r sysctl -qw net.ipv6.conf.all.forwarding=1
 
 # Only topology setup needs namespace capabilities. Exercise the real CLI with none.
 trace() { setpriv --bounding-set=-all --no-new-privs "$binary" "$@"; }
-# New namespaces normally deny ping sockets. UDP works with this default.
-# Warm up neighbour discovery using a UDP datagram, which requires no ping socket.
+# New namespaces normally deny ICMP echo sockets, so use a UDP datagram to warm up neighbour discovery.
 python3 -c 'import socket; socket.socket(socket.AF_INET6,socket.SOCK_DGRAM).sendto(b"test",("2001:db8:1::20",33333))'
 sleep 2
 method=auto
@@ -108,7 +107,7 @@ while True:
             proto = "tcp"
         else:
             data, peer = key.fileobj.recvfrom(2048)
-            # This deliberately exercises application responses without an echoed Hopline tag.
+            # This deliberately exercises application responses without an echoed Hopview tag.
             key.fileobj.sendto(data if port == 41236 else b"reply", peer)
             proto = "udp"
         family = "4" if peer[0].startswith("::ffff:") else "6"

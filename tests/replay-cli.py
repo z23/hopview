@@ -10,15 +10,15 @@ import tempfile
 import time
 
 
-def verify(binary, work, grouped=False):
-    source = work / "interval.hopline"
+def verify(binary, work, grouped=False, kind="hopview"):
+    source = work / ("interval." + kind)
     env = dict(os.environ, TMPDIR=str(work), XDG_DATA_HOME=str(work / "data"),
                XDG_CACHE_HOME=str(work / "cache"), XDG_CONFIG_HOME=str(work / "config"),
                QT_QPA_PLATFORM="minimal", QT_QPA_PLATFORMTHEME="generic",
                QT_DEBUG_BACKINGSTORE="1", QT_QUICK_BACKEND="software")
     command = [str(binary), "--replay", str(source)]
     records = [
-        {"kind": "hopline", "version": 1, "from": 1000, "through": 1250,
+        {"kind": kind, "version": 1, "from": 1000, "through": 1250,
          "target": "offline.invalid", "family": 6, "intervalMs": 250, "protocol": "tcp",
          "port": 443, "interfaceName": ""},
         {"kind": "probe", "t": 1000, "hop": 1, "address": "::1", "rtt": 12, "destination": True},
@@ -29,7 +29,7 @@ def verify(binary, work, grouped=False):
         primary = dict(records[0], location="office", resolvedAddress="::1", clockOffsetMs=0,
                        clockErrorMs=-1, lastReceivedMs=0, manualCorrectionMs=0)
         peer = dict(primary, location="branch", clockOffsetMs=8, clockErrorMs=2)
-        records = [{"kind": "hopline", "version": 2, "from": 1000, "through": 1250,
+        records = [{"kind": kind, "version": 2, "from": 1000, "through": 1250,
                     "traces": [primary, peer], "hops": [0]},
                    *(dict(row, trace=0) for row in records[1:]),
                    dict(records[1], trace=1, rtt=65), dict(records[3], trace=1, text="branch note")]
@@ -42,7 +42,7 @@ def verify(binary, work, grouped=False):
     original = source.read_bytes()
     viewer = subprocess.Popen(command, env=env, cwd=work, stderr=subprocess.PIPE)
     try:
-        # The minimal Qt platform dumps the actual window backing store on flush.
+        # The headless display writes an image when the replay window paints its first frame.
         deadline = time.monotonic() + 10
         while not any(work.glob("output*.png")):
             assert viewer.poll() is None, viewer.stderr.read()
@@ -74,8 +74,9 @@ def verify(binary, work, grouped=False):
 
 
 if __name__ == "__main__":
-    binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "build/hopline"
+    binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "build/hopview"
     for grouped in (False, True):
-        with tempfile.TemporaryDirectory() as tmp:
-            verify(binary, Path(tmp), grouped)
+        for kind in ("hopview", "hopline"):
+            with tempfile.TemporaryDirectory() as tmp:
+                verify(binary, Path(tmp), grouped, kind)
     print("Replay CLI checks passed.")

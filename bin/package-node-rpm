@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Build on the same major Enterprise Linux release as the destination hosts.
+# Match the build host's major distribution release to the destination hosts.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="${1:-$root/build-rpm}"
 mkdir -p "$out"
 out=$(realpath "$out")
-spec="$root/rpm/hopline-node.spec"
+spec="$root/rpm/hopview-node.spec"
 version=$(awk '/^Version:/ {print $2}' "$spec")
-name="hopline-node-$version"
+name="hopview-node-$version"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/SOURCES" "$work/BUILD" "$work/BUILDROOT" "$work/SPECS" "$work/SRPMS" "$work/RPMS"

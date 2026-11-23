@@ -3,7 +3,7 @@ import QtQuick.Controls as C
 import QtQuick.Layouts
 import QtCore as Core
 import QtQuick.Dialogs as Dialogs
-import Hopline.Graphics 1.0
+import Hopview.Graphics 1.0
 
 C.ApplicationWindow {
     id: app
@@ -13,7 +13,7 @@ C.ApplicationWindow {
     minimumHeight: 530
     property bool startHidden: false
     visible: !startHidden
-    title: activeTarget.length ? activeTarget + " — Hopline" : "Hopline"
+    title: activeTarget.length ? activeTarget + " — Hopview" : "Hopview"
     color: base
     font.family: "Inter"
     palette.window: base
@@ -237,7 +237,7 @@ C.ApplicationWindow {
                         p.lineTo(17,24.4); p.lineTo(21.6,13); p.lineTo(28.4,13); p.stroke()
                     }
                 }
-                Heading { text: "Hopline"; font.pixelSize: 22 }
+                Heading { text: "Hopview"; font.pixelSize: 22 }
                 Rectangle { color: app.edge; Layout.leftMargin: 9; Layout.rightMargin: 8; implicitWidth: 1; implicitHeight: 25 }
                 C.TextField {
                     id: destination
@@ -1030,14 +1030,14 @@ C.ApplicationWindow {
         property double throughMs
         fileMode: Dialogs.FileDialog.SaveFile
         title: (csv ? "Export CSV" : "Save incident") + " · " + app.timeText(fromMs, false) + " – " + app.timeText(throughMs, false)
-        nameFilters: csv ? ["CSV data (*.csv)"] : ["Hopline incident (*.hopline)"]
-        defaultSuffix: csv ? "csv" : "hopline"
+        nameFilters: csv ? ["CSV data (*.csv)"] : ["Hopview incident (*.hopview)"]
+        defaultSuffix: csv ? "csv" : "hopview"
         onAccepted: backend.exportIncident(session, fromMs, throughMs, selectedFile, csv, peers, hops)
     }
     Dialogs.FileDialog {
         id: addRecording
         title: qsTr("Add recording to this comparison")
-        nameFilters: ["Hopline incident (*.hopline)", "All files (*)"]
+        nameFilters: ["Incident recordings (*.hopview *.hopline)", "All files (*)"]
         onAccepted: {
             alignment.file = selectedFile
             fallbackSite.text = ""
@@ -1080,7 +1080,7 @@ C.ApplicationWindow {
     Dialogs.FileDialog {
         id: openIncident
         title: "Open incident"
-        nameFilters: ["Hopline incident (*.hopline)", "All files (*)"]
+        nameFilters: ["Incident recordings (*.hopview *.hopline)", "All files (*)"]
         onAccepted: backend.openReplay(selectedFile)
     }
     Connections {

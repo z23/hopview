@@ -57,8 +57,8 @@ def run(executable):
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(ca, key)
         with server("127.0.0.1", tls) as v4, server("::1", tls) as v6, server("127.0.0.1") as plain:
-            env = dict(os.environ, HOPLINE_DIAG_CA=str(ca), HOPLINE_DIAG_TLS=f"https://localhost:{v4}/",
-                       HOPLINE_DIAG_TLS6=f"https://localhost:{v6}/", HOPLINE_DIAG_HTTP=f"http://127.0.0.1:{plain}/",
+            env = dict(os.environ, HOPVIEW_DIAG_CA=str(ca), HOPVIEW_DIAG_TLS=f"https://localhost:{v4}/",
+                       HOPVIEW_DIAG_TLS6=f"https://localhost:{v6}/", HOPVIEW_DIAG_HTTP=f"http://127.0.0.1:{plain}/",
                        QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="generic", QT_QUICK_BACKEND="software")
             subprocess.run([executable, "diagnosticLoopback"], env=env, check=True, timeout=30)
 

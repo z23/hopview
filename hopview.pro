@@ -2,7 +2,7 @@ QT += core gui quick quickcontrols2 qml network dbus
 CONFIG += c++20 link_pkgconfig
 PKGCONFIG += sqlite3 libcurl
 TEMPLATE = app
-TARGET = hopline
+TARGET = hopview
 SOURCES += src/main.cpp src/backend.cpp src/background.cpp src/baseline.cpp src/baselineview.cpp \
            src/diagnostics.cpp src/diagnostichistory.cpp src/graph.cpp src/groups.cpp src/groupview.cpp \
            src/history.cpp src/incident.cpp src/monitoring.cpp src/probe.cpp src/remotes.cpp src/routeevents.cpp

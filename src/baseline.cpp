@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <sqlite3.h>
 
-using namespace hopline_sql;
+using namespace hopview_sql;
 namespace {
 struct Period {
     qint64 from, through;
@@ -91,7 +91,7 @@ QVariantMap measure(sqlite3 *db, qint64 id, int hop, const Period &period, Round
     }
     double median = -1, p95 = -1;
     if (replies) {
-        // SQLite may spill this sort to disk. Keep only three order statistics in the client.
+        // The database can sort on disk. Keep only three order statistics in the client.
         Statement sorted(db, "SELECT rtt FROM samples WHERE session=? AND hop=? AND t BETWEEN ? AND ? "
                              "AND rtt>=0 ORDER BY rtt");
         bind(sorted);

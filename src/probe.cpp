@@ -376,7 +376,7 @@ void ProbeSession::sendProbe(qint64 number, Round &r, int hop) {
         packet[0] = ipv6 ? ICMP6_ECHO_REQUEST : ICMP_ECHO;
         std::memcpy(&packet[6], &sequence, sizeof(sequence));
     }
-    // Linux fills in the identifier and checksum on ping sockets.
+    // The kernel fills in the identifier and checksum on ICMP echo sockets.
     qint64 wall = 0;
     Moment sent{};
     if (setsockopt(fd_, level, option, &hop, sizeof(hop)) == 0) {
@@ -479,7 +479,7 @@ void ProbeSession::socketReady(quint16 key) {
     if (it == sockets_.end()) return;
     const int fd = it->second.fd;
     if (method_ == "tcp") {
-        // Linux queues ICMP errors with the responding router during SYN_SENT.
+        // The kernel queues ICMP errors with the responding router while the connection is pending.
         const bool networkError = receive(fd, true, key);
         if (sockets_.contains(key)) {
             int error = 0;
