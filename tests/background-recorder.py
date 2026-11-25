@@ -63,6 +63,23 @@ def verify(binary, work, private_bus=None):
             time.sleep(.1)
         raise AssertionError("collector failed to append loopback rounds")
 
+    def wait_for_exit():
+        # --quit waits for the database lock to be released. The owner might have
+        # exited before we start waiting, so query its actual exit status directly.
+        deadline = time.monotonic() + 5
+        while owner.poll() is None and time.monotonic() < deadline:
+            time.sleep(.05)
+        if owner.returncode is None:
+            if sys.platform == "darwin":
+                # Keep a thread trace in CI when Cocoa or a worker stalls at teardown.
+                trace = work / "shutdown-sample.txt"
+                subprocess.run(["/usr/bin/sample", str(owner.pid), "1", "10", "-file", str(trace)],
+                               timeout=10, check=False)
+                if trace.is_file():
+                    print(trace.read_text(errors="replace")[:24000], file=sys.stderr, flush=True)
+            raise AssertionError(f"recorder {owner.pid} was still running 5 seconds after shutdown")
+        assert owner.returncode == 0, f"recorder exited with status {owner.returncode}"
+
     owner = subprocess.Popen(command + target, env=env)
     try:
         wait_for_rounds(3)
@@ -94,7 +111,7 @@ def verify(binary, work, private_bus=None):
         wait_for_rounds(visible + 4)
         assert count("SELECT count(*) FROM sessions") == 1
         run("--quit")
-        assert owner.wait(timeout=5) == 0
+        wait_for_exit()
         stopped = count("SELECT count(*) FROM samples WHERE hop=0")
         owner = subprocess.Popen(command + ["--background"], env=env)
         wait_for_rounds(stopped + 3)
@@ -104,7 +121,7 @@ def verify(binary, work, private_bus=None):
             run("--quit")  # Popen.terminate() forcibly ends a Windows process.
         else:
             owner.terminate()
-        assert owner.wait(timeout=5) == 0
+        wait_for_exit()
         assert count("PRAGMA integrity_check") == "ok"
     finally:
         if owner.poll() is None:
