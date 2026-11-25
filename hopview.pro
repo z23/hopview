@@ -4,7 +4,12 @@ include(platform.pri)
 win32|macx: QT += widgets
 TEMPLATE = app
 TARGET = hopview
-macx: QMAKE_TARGET_BUNDLE_PREFIX = org.hopview
+macx {
+    QMAKE_TARGET_BUNDLE_PREFIX = org.hopview
+    QMAKE_INFO_PLIST = deploy/Info.plist
+    ICON = deploy/hopview.icns
+}
+win32: RC_ICONS = deploy/hopview.ico
 SOURCES += src/main.cpp src/backend.cpp src/background.cpp src/baseline.cpp src/baselineview.cpp \
            src/diagnostics.cpp src/diagnostichistory.cpp src/graph.cpp src/groups.cpp src/groupview.cpp \
            src/history.cpp src/incident.cpp src/monitoring.cpp src/remotes.cpp src/routeevents.cpp

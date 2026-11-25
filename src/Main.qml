@@ -92,7 +92,7 @@ C.ApplicationWindow {
             "filtered":qsTr("Administratively filtered"), "packet-too-big":qsTr("Packet too big"),
             "icmp-error":qsTr("ICMP error")}[f.kind] || f.kind
         return name + (f.router ? " · " + f.router : "") + (f.type >= 0 ? " · ICMP " + f.type + "/" + f.code : "")
-            + (f.mtu > 0 ? " · MTU " + f.mtu : "") + (f.kind === "local-unsent" ? " · errno " + f.errno : "")
+            + (f.mtu > 0 ? " · MTU " + f.mtu : "") + (f.kind === "local-unsent" && f.errno > 0 ? " · errno " + f.errno : "")
     }
     function sourceLabel(info) {
         if (!info) return ""

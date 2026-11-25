@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise close, reopen and restart with a real loopback trace and a private history."""
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -47,7 +48,7 @@ def verify(binary, work, private_bus=None):
         subprocess.run(command + list(args), env=env, check=True, timeout=8)
 
     def count(sql):
-        with sqlite3.connect(db) as con:
+        with closing(sqlite3.connect(db)) as con:
             return con.execute(sql).fetchone()[0]
 
     def wait_for_rounds(minimum):
@@ -71,7 +72,7 @@ def verify(binary, work, private_bus=None):
         if private_bus:
             # The GUI controls are exercised in Integration::alertControls. Set a threshold
             # below loopback RTT, then above it, so the real recorder produces both transitions.
-            with sqlite3.connect(db) as con:
+            with closing(sqlite3.connect(db)) as con, con:
                 con.execute("INSERT INTO alert_rules(session,latency,loss,seconds) VALUES(1,0.0000001,0,1)")
             def wait_notification(expected):
                 log = work / "notices.jsonl"
@@ -84,7 +85,7 @@ def verify(binary, work, private_bus=None):
                     time.sleep(.1)
                 raise AssertionError(f"notification service did not receive {expected}")
             wait_notification("High latency")
-            with sqlite3.connect(db) as con:
+            with closing(sqlite3.connect(db)) as con, con:
                 con.execute("UPDATE alert_rules SET latency=60000 WHERE session=1")
             wait_notification("Recovered")
             assert count("SELECT count(*) FROM alert_events") == 2

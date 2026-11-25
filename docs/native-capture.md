@@ -4,6 +4,8 @@ Download the artifact for your operating system from a successful [Native deskto
 
 Enter a hostname or IP address and choose **Start trace**. Windows and macOS use ordinary-user ICMP echo for the route and a separate destination probe. The desktop and the bundled headless collector use the same measurement engine. **Recording and alerts** can keep a desktop trace running after the window closes. **Export focus as CSV** and **Save replayable incident** use the same formats as Linux.
 
+When you select a device on your LAN, macOS 15 and later may ask for local network access. You can review Hopview’s access in **System Settings → Privacy & Security → Local Network**. [Apple’s local network privacy guide](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+
 | Local capture option | Windows | macOS |
 | --- | --- | --- |
 | IPv4 and IPv6, including scoped link-local destinations | Yes | Yes |

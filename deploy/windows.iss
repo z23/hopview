@@ -8,6 +8,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\hopview.exe
+SetupIconFile=hopview.ico
 LicenseFile=..\LICENSE
 OutputDir=..\build-native
 OutputBaseFilename=Hopview-Windows-x64

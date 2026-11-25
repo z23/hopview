@@ -1,4 +1,5 @@
 # Shared dependencies and probe source selection for the desktop, node and tests.
+lessThan(QT_MAJOR_VERSION, 6): error(Hopview requires a Qt 6 SDK)
 win32-msvc* {
     # vcpkg installed triplet directory, e.g. C:/vcpkg/installed/x64-windows
     deps = $$(HOPVIEW_DEPS)

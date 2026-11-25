@@ -36,6 +36,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           "HOPVIEW_DEPS=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" >> $env:GITHUB_ENV
       - name: Build and package
+        id: package
         run: python bin/package-native.py
       - name: Verify installed Windows capture and recording
         if: runner.os == 'Windows'
@@ -62,7 +63,7 @@ jobs:
           python3 tests/native-capture.py "$app" "$(dirname "$app")/hopview-node"
           python3 tests/background-recorder.py "$app"
       - name: Verify Windows desktop history and UI
-        if: runner.os == 'Windows'
+        if: "!cancelled() && runner.os == 'Windows' && steps.package.outcome == 'success'"
         shell: cmd
         run: |
           set "PATH=%HOPVIEW_DEPS%\bin;%PATH%"
@@ -77,7 +78,7 @@ jobs:
             popd
           )
       - name: Verify macOS desktop history, UI and ICMP decoding
-        if: runner.os == 'macOS'
+        if: "!cancelled() && runner.os == 'macOS' && steps.package.outcome == 'success'"
         run: |
           for suite in history integration darwinicmp portableprobe; do
             mkdir -p "build-native/$suite"
