@@ -41,7 +41,7 @@ C.Dialog {
         ListView {
             id: eventList
             Layout.fillHeight: true; Layout.fillWidth: true; clip: true
-            model: (backend.snapshot.events || []).slice(0,500)
+            model: dialog.visible ? (backend.snapshot.events || []).slice(0,500) : []
             C.ScrollBar.vertical: C.ScrollBar {}
             delegate: C.ItemDelegate {
                 required property var modelData
@@ -51,7 +51,7 @@ C.Dialog {
             }
             C.Label { visible: !eventList.count; text: qsTr("No recorded events in this interval.") }
         }
-        C.Label { visible: (backend.snapshot.events || []).length > 500; text: qsTr("Latest 500 events. Narrow the interval to see earlier events.") }
+        C.Label { visible: dialog.visible && (backend.snapshot.events || []).length > 500; text: qsTr("Latest 500 events. Narrow the interval to see earlier events.") }
         RowLayout {
             Item { Layout.fillWidth: true }
             TraceButton { text: qsTr("Close"); onClicked: dialog.close() }

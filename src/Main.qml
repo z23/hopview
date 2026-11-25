@@ -446,11 +446,12 @@ C.ApplicationWindow {
                         id: archiveList
                         clip: true
                         keyNavigationEnabled: true
-                        model: backend.closedSessions
+                        model: closedPopup.visible ? backend.closedSessions : []
                         Keys.onReturnPressed: closedPopup.restore(currentIndex)
                         Keys.onEnterPressed: closedPopup.restore(currentIndex)
                         C.ScrollIndicator.vertical: C.ScrollIndicator {}
                         delegate: C.ItemDelegate {
+                            id: archiveItem
                             required property var modelData
                             required property int index
                             objectName: "reopenTrace" + modelData.id
@@ -459,10 +460,10 @@ C.ApplicationWindow {
                             Accessible.name: modelData.target + " " + app.timeText(modelData.startMs, true)
                             onClicked: closedPopup.restore(index)
                             contentItem: RowLayout {
-                                Caption { text: modelData.target; Layout.fillWidth: true; color: app.ink }
-                                Caption { text: app.timeText(modelData.startMs, true); font.pixelSize: 11 }
+                                Caption { text: archiveItem.modelData.target; Layout.fillWidth: true; color: app.ink }
+                                Caption { text: app.timeText(archiveItem.modelData.startMs, true); font.pixelSize: 11 }
                             }
-                            background: Rectangle { radius: 3; color: parent.highlighted || parent.hovered ? "#344552" : "transparent" }
+                            background: Rectangle { radius: 3; color: archiveItem.highlighted || archiveItem.hovered ? "#344552" : "transparent" }
                         }
                     }
                 }
@@ -805,6 +806,7 @@ C.ApplicationWindow {
                                     readonly property var info: peer ? null : app.findRow(modelData.hop)
                                     readonly property int intervalMs: modelData.intervalMs || (app.currentSession ? app.currentSession.intervalMs : 1000)
                                     readonly property var cursorSample: app.cursorSample(modelData.buckets, intervalMs)
+                                    readonly property var trackNotes: peer ? (modelData.notes || []) : (backend.snapshot.notes || [])
                                     readonly property string trackKey: peer ? "peer" + modelData.comparisonId : "hop" + modelData.hop
                                     width: trackColumn.width
                                     height: Math.max(76, tracks.height / Math.max(1, app.charts.length + app.diagnosticTracks.length))
@@ -862,9 +864,10 @@ C.ApplicationWindow {
                                             maxGap: Math.max(3, app.chartWidth * track.intervalMs * 3 / app.viewSpan)
                                         }
                                         Repeater {
-                                            model: track.peer ? (track.modelData.notes || []) : (backend.snapshot.notes || [])
+                                            model: track.trackNotes.length
                                             Rectangle {
-                                                required property var modelData
+                                                required property int index
+                                                readonly property var modelData: track.trackNotes[index] || ({timeMs: 0})
                                                 x: (modelData.timeMs - backend.viewStart) / app.viewSpan * plotArea.width
                                                 width: 1; height: plotArea.height; color: "#d9b47c"
                                                 Rectangle { width: 5; height: 5; color: parent.color }
@@ -945,9 +948,10 @@ C.ApplicationWindow {
                                                 if (e.modifiers & Qt.ControlModifier) { app.moveZoom(e.angleDelta.y > 0 ? -1 : 1); e.accepted = true }
                                                 else e.accepted = false
                                             }
-                                            C.ToolTip.visible: containsMouse && app.nearbyNote(app.cursorFraction, track.peer ? track.modelData.notes || [] : backend.snapshot.notes) !== null && !noteDialog.visible
+                                            readonly property var hoveredNote: containsMouse && !noteDialog.visible ? app.nearbyNote(app.cursorFraction, track.trackNotes) : null
+                                            C.ToolTip.visible: hoveredNote !== null
                                             C.ToolTip.delay: 350
-                                            C.ToolTip.text: { const n = app.nearbyNote(app.cursorFraction, track.peer ? track.modelData.notes || [] : backend.snapshot.notes); return n ? n.text : "" }
+                                            C.ToolTip.text: hoveredNote ? hoveredNote.text : ""
                                         }
                                     }
                                     Rule { anchors.bottom: parent.bottom; width: parent.width; height: 1 }
@@ -980,15 +984,16 @@ C.ApplicationWindow {
                             x: 13 + app.chartLabelWidth; width: app.chartWidth; height: parent.height
                             clip: true
                             Repeater {
-                                model: lane.events.slice(0,500)
+                                model: Math.min(500, lane.events.length)
                                 Rectangle {
                                     id: marker
-                                    required property var modelData
+                                    required property int index
+                                    readonly property var modelData: lane.events[index] || ({t: 0, kind: "", text: ""})
                                     x: (modelData.t - backend.viewStart) / app.viewSpan * (lane.width - 5)
                                     width: 5; height: 12; radius: 2
                                     color: ({route:"#c99bf4",alert:"#ee8581",gap:"#95a2ad",note:"#e5c576",service:"#7dcabb","interface":"#88aedf"})[modelData.kind] || app.faint
                                     C.ToolTip.visible: hoverMarker.hovered
-                                    C.ToolTip.text: new Date(modelData.t).toISOString() + " · " + modelData.text
+                                    C.ToolTip.text: hoverMarker.hovered ? new Date(modelData.t).toISOString() + " · " + modelData.text : ""
                                     HoverHandler { id: hoverMarker }
                                     TapHandler { onTapped: incidentNavigator.openAt(marker.modelData.t) }
                                 }
@@ -1133,7 +1138,7 @@ C.ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.preferredHeight: Math.min(contentHeight, Math.max(70, app.height / app.uiScale - 230))
                 clip: true
-                model: backend.sessions.filter(s => s.id !== backend.sessionId)
+                model: compareDialog.visible ? backend.sessions.filter(s => s.id !== backend.sessionId) : []
                 C.ScrollBar.vertical: C.ScrollBar {}
                 delegate: C.CheckDelegate {
                     id: peerChoice
