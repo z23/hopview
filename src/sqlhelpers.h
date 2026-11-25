@@ -55,6 +55,8 @@ class Transaction {
         if (active_)
             sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
     }
+    Transaction(const Transaction &) = delete;
+    Transaction &operator=(const Transaction &) = delete;
     void commit() {
         execute(db_, "COMMIT");
         active_ = false;
@@ -62,6 +64,31 @@ class Transaction {
 
   private:
     sqlite3 *db_;
+    bool active_ = true;
+};
+
+class OptionalTransaction {
+  public:
+    OptionalTransaction(sqlite3 *db, bool writer) : db_(db), owned_(sqlite3_get_autocommit(db) != 0) {
+        if (owned_)
+            execute(db_, writer ? "BEGIN IMMEDIATE" : "BEGIN");
+    }
+    ~OptionalTransaction() {
+        if (owned_ && active_)
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+    OptionalTransaction(const OptionalTransaction &) = delete;
+    OptionalTransaction &operator=(const OptionalTransaction &) = delete;
+    void commit() {
+        if (owned_) {
+            execute(db_, "COMMIT");
+            active_ = false;
+        }
+    }
+
+  private:
+    sqlite3 *db_;
+    bool owned_;
     bool active_ = true;
 };
 

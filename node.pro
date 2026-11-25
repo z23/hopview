@@ -10,6 +10,6 @@ SOURCES += src/node.cpp src/nodecollector.cpp src/nodereceiver.cpp src/nodeconfi
 SOURCES += src/collectormanagement.cpp src/nodejoin.cpp
 SOURCES += src/routeindex.cpp src/networkidentity.cpp src/storage.cpp
 RESOURCES += src/node-resources.qrc
-HEADERS += src/collectormanagement.h src/nodejoin.h src/receiverendpoint.h src/probe.h src/types.h src/nodeconfig.h src/history.h src/sqlhelpers.h
+HEADERS += src/collectormanagement.h src/nodejoin.h src/receiverendpoint.h src/probe.h src/types.h src/nodeconfig.h src/history.h src/historycache.h src/sqlhelpers.h
 HEADERS += src/diagnostics.h
 SOURCES += src/diagnostichistory.cpp src/diagnostics.cpp src/receiverweb.cpp

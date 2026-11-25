@@ -781,6 +781,84 @@ void operationalHistory(const QTemporaryDir &dir) {
             "Releasing an overlapping pin preserves other protected hours");
 }
 
+void testStorageAndQueryOptimizations(const QTemporaryDir &dir) {
+    const auto file = dir.filePath("opt-checks.sqlite");
+    History h(file);
+    const auto id = h.createSession("2001:db8::9", 6, 1000);
+    require(id > 0, "Create IPv6 optimization check session");
+
+    // 1. Verify alert_events index exists.
+    {
+        sqlite3 *raw = nullptr;
+        require(sqlite3_open(file.toUtf8().constData(), &raw) == SQLITE_OK, "Open raw DB");
+        hopview_sql::Statement idx(raw, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='alert_events_session_end'");
+        const bool hasIdx = idx.next();
+        sqlite3_close(raw);
+        require(hasIdx, "alert_events_session_end index exists");
+    }
+
+    // 2. Verify local-unsent (-2) samples appended after valid samples preserve exact bin stats.
+    const ProbeFailure unsent{"local-unsent", {}, -1, -1, 0, EMSGSIZE};
+    require(h.append({{id, 10000, 0, "2001:db8::9", 5.0, true},
+                      {id, 10000, 1, "2001:db8::1", 1.0, false},
+                      {id, 11000, 0, "2001:db8::9", 7.0, true},
+                      {id, 11000, 1, "2001:db8::1", 3.0, false}}),
+            "Seed valid samples");
+    require(h.append({{id, 12000, 0, {}, -2.0, false, unsent},
+                      {id, 12000, 1, {}, -2.0, false, unsent}}),
+            "Append local-unsent samples");
+    const auto v = h.view(id, 10000, 19999, 10000, 19999, {0, 1}, 10);
+    const auto ep = v["endpoint"].toMap();
+    require(ep["sent"].toInt() == 2 && ep["received"].toInt() == 2 && std::abs(ep["avg"].toDouble() - 6.0) < 1e-8,
+            "local-unsent does not disturb endpoint rollups");
+
+    // 3. Verify IPv6 binary prefix masking (including %iface scope stripping) and cache invalidation on re-import.
+    QFile inv(dir.filePath("v6.tsv"));
+    require(inv.open(QIODevice::WriteOnly), "Create v6 inventory");
+    inv.write("2001:db8:abcd::/48\t64502\tSYD\tTransit\tCKT-1\tlocal\n");
+    inv.close();
+    require(h.importInventory(inv.fileName()), qPrintable(h.error()));
+    const auto m1 = h.networkIdentity(id, "2001:db8:abcd:1234::5");
+    require(m1["asn"] == "AS64502" && m1["pop"] == "SYD", "IPv6 /48 binary mask match");
+    require(h.networkIdentity(id, "2001:db8:abcd:1234::5") == m1, "Cached IPv6 identity hit");
+    require(h.networkIdentity(id, "2001:db8:abce::1").isEmpty(), "Non-matching IPv6 prefix");
+
+    QFile orig1(dir.filePath("orig1.pfx2as"));
+    require(orig1.open(QIODevice::WriteOnly), "Create v6 origin snapshot 1");
+    orig1.write("2001:db8:abcd:1234::\t64\t64599\n");
+    orig1.close();
+    require(h.importInventory(orig1.fileName()), qPrintable(h.error()));
+    const auto m2 = h.networkIdentity(id, "2001:db8:abcd:1234::5");
+    require(m2["asn"] == "AS64599" && m2["originPrefix"] == "2001:db8:abcd:1234::/64",
+            "Re-import invalidates cache and picks more specific /64 origin");
+
+    // 4. Verify routeTransitions() is not truncated by >500 non-route events.
+    const auto rId = h.createSession("routes-busy", 4, 1000);
+    QVector<Sample> routeSamples;
+    for (int i = 0; i < 10; ++i) {
+        const qint64 t = 100000 + i * 1000LL;
+        routeSamples << Sample{rId, t, 1, i < 4 ? "192.0.2.1" : "192.0.2.2", 2.0, false}
+                     << Sample{rId, t, 2, "198.51.100.1", 5.0, true};
+    }
+    require(h.append(routeSamples), "Append route transition");
+    for (int i = 0; i < 520; ++i)
+        require(h.addNote(rId, 110000 + i * 10LL, QString("note-%1").arg(i)), "Add filler notes");
+    const auto allTimeline = h.timelineEvents(rId, 100000, 200000);
+    require(allTimeline.size() == 501, "timelineEvents hits 501 cap");
+    const auto directRoutes = h.routeTransitions(rId, 100000, 200000);
+    require(directRoutes.size() == 1 && directRoutes.first().toMap()["kind"] == "route",
+            "routeTransitions finds transitions despite >500 other events");
+
+    // 5. Verify withWriteTransaction atomicity.
+    const bool failed = h.withWriteTransaction([&] {
+        require(h.addNote(rId, 999999, "should-rollback"), "Add note in tx");
+        throw std::runtime_error("abort tx");
+    });
+    require(!failed, "Aborted write transaction returns false");
+    require(h.view(rId, 999000, 1000000, 999000, 1000000, {}, 1)["notes"].toList().isEmpty(),
+            "Aborted write transaction rolled back");
+}
+
 void benchmark(const QString &file) {
     constexpr qint64 base = 1720012345000;
     constexpr int hops = 15, seconds = 86400;
@@ -837,6 +915,7 @@ int main(int argc, char **argv) {
         else {
             test(dir.filePath("history.sqlite"));
             operationalHistory(dir);
+            testStorageAndQueryOptimizations(dir);
             preservedRouteIndex(dir);
             testIncident(dir);
             testManagedCollectors(dir.filePath("managed.db"));

@@ -3,6 +3,7 @@
 #include "types.h"
 #include <QList>
 #include <QSet>
+#include <memory>
 #include <optional>
 #include <functional>
 #include <QVariantMap>
@@ -13,6 +14,7 @@ class RouteEvents;
 // Each worker owns its connection. Timestamps count milliseconds since 1970-01-01 00:00 UTC.
 class History {
   public:
+    struct Cache;
     explicit History(QString path);
     ~History();
     History(const History &) = delete;
@@ -68,6 +70,8 @@ class History {
     bool captureIdentity(qint64 id, const QString &address, const QVariantMap &info);
     QVariantList responders(qint64 id, int hop, qint64 from, qint64 through);
     QVariantList timelineEvents(qint64 session, qint64 from, qint64 through);
+    QVariantList routeTransitions(qint64 session, qint64 from, qint64 through, int limit = 0);
+    bool withWriteTransaction(const std::function<void()> &work);
     bool advanceRouteIndex(qint64 session,bool &more);
     bool indexedRoutes(qint64 session, qint64 &cursor, QVariantList &events, bool &more);
     bool routePage(qint64 session, RouteEvents &detector, qint64 &cursor, qint64 &until,
@@ -84,6 +88,8 @@ class History {
     bool deleteGroup(const QString &name);
 
   private:
+    Cache &cache();
+    void invalidateIdentityCache();
     struct AlertState {
         qint64 id, intervalMs, durationMs, last, first, sent, received, candidateSince, incidentSince;
         double latency, loss, total;
@@ -98,4 +104,5 @@ class History {
     QString path_;
     QString error_;
     sqlite3 *db_ = nullptr;
+    std::unique_ptr<Cache> cache_;
 };

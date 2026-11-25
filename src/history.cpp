@@ -1,5 +1,6 @@
 #include "probeoptions.h"
 #include "history.h"
+#include "historycache.h"
 #include "routeevents.h"
 #include "sqlhelpers.h"
 
@@ -189,43 +190,163 @@ Stats readBin(const Statement &q) {
     return s;
 }
 
+struct ChartStats {
+    qint64 sent = 0, received = 0;
+    double low = -1, high = -1, sum = 0;
+
+    void add(const ChartStats &after) {
+        if (!after.sent)
+            return;
+        if (!sent) {
+            *this = after;
+            return;
+        }
+        if (after.received) {
+            low = received ? std::min(low, after.low) : after.low;
+            high = std::max(high, after.high);
+            sum += after.sum;
+        }
+        sent += after.sent;
+        received += after.received;
+    }
+
+    void addSample(double r) {
+        if (r == -2)
+            return;
+        ++sent;
+        if (r >= 0) {
+            low = received ? std::min(low, r) : r;
+            high = std::max(high, r);
+            sum += r;
+            ++received;
+        }
+    }
+
+    double loss() const { return sent ? 100.0 * (sent - received) / sent : 0; }
+    double average() const { return received ? sum / received : -1; }
+};
+
 constexpr char binsSql[] =
     "SELECT sent,received,first_ms,last_ms,lo,hi,total,first_rtt,"
-    "last_rtt,current,delta,address,dest,first_address,route_changed FROM bins WHERE session=?1 AND hop=?2 "
+    "last_rtt,current,delta,address,dest,first_address,route_changed,t FROM bins WHERE session=?1 AND hop=?2 "
+    "AND span=?3 AND t>=?4 AND t<=?5 ORDER BY t";
+constexpr char chartBinsSql[] =
+    "SELECT t,sent,received,lo,hi,total FROM bins WHERE session=?1 AND hop=?2 "
     "AND span=?3 AND t>=?4 AND t<=?5 ORDER BY t";
 constexpr char rawSql[] = "SELECT t,rtt,address,dest FROM samples WHERE session=?1 "
                           "AND hop=?2 AND t>=?3 AND t<=?4 ORDER BY t";
+constexpr char chartRawSql[] = "SELECT t,rtt FROM samples WHERE session=?1 "
+                               "AND hop=?2 AND t>=?3 AND t<=?4 ORDER BY t";
 
 struct Reader {
-    explicit Reader(sqlite3 *db) : bins(db, binsSql), raw(db, rawSql) {
-        Statement cut(db,"SELECT raw_before FROM retention WHERE id=1");
-        if (cut.next()) rawBefore = cut.integer(0);
-        if (rawBefore) {
-            archived.emplace(db,"SELECT sent,received,first_ms,last_ms,lo,hi,total,first_rtt,last_rtt,current,delta,address,"
-                             "dest,first_address,route_changed,t FROM bins WHERE session=?1 AND hop=?2 AND span=10000 "
-                             "AND t BETWEEN ?3 AND ?4 AND session NOT IN (SELECT session FROM imported_sessions) "
-                             "AND NOT EXISTS(SELECT 1 FROM retention_pins p WHERE p.session=?1 AND bins.t BETWEEN p.start_ms AND p.end_ms) ORDER BY t");
-        }
+    explicit Reader(History::Cache &cache) : cache_(cache) {
+        auto &cut = cache_.stmt(cache_.watermark, "SELECT raw_before FROM retention WHERE id=1");
+        cut.reset();
+        if (cut.next())
+            rawBefore = cut.integer(0);
+        cut.reset();
     }
-    std::optional<Statement> archived;
+
+    History::Cache &cache_;
     qint64 rawBefore = 0;
+    qint64 sessionId = -1;
+    bool imported = false;
+    QVector<QPair<qint64, qint64>> pins;
+
+    Statement &binsStmt(int level) { return cache_.stmt(cache_.binsLevel[level], binsSql); }
+    Statement &chartBinsStmt(int level) { return cache_.stmt(cache_.chartBinsLevel[level], chartBinsSql); }
+    Statement &rawStmt() { return cache_.stmt(cache_.rawRange, rawSql); }
+    Statement &chartRawStmt() { return cache_.stmt(cache_.chartRawRange, chartRawSql); }
+
+    static ChartStats readChartBin(const Statement &q) {
+        return {q.integer(1), q.integer(2), q.number(3), q.number(4), q.number(5)};
+    }
+
+    void prepareSession(qint64 id) {
+        if (sessionId == id)
+            return;
+        sessionId = id;
+        imported = false;
+        pins.clear();
+        if (!rawBefore)
+            return;
+        auto &imp = cache_.stmt(cache_.isImported, "SELECT 1 FROM imported_sessions WHERE session=?");
+        imp.reset();
+        imp.integer(1, id);
+        imported = imp.next();
+        imp.reset();
+        if (imported)
+            return;
+        auto &pinQ = cache_.stmt(cache_.sessionPins,
+                                 "SELECT start_ms,end_ms FROM retention_pins WHERE session=? ORDER BY start_ms");
+        pinQ.reset();
+        pinQ.integer(1, id);
+        while (pinQ.next()) {
+            const qint64 a = pinQ.integer(0), b = pinQ.integer(1);
+            if (!pins.isEmpty() && a <= pins.back().second + 1)
+                pins.back().second = std::max(pins.back().second, b);
+            else
+                pins.append({a, b});
+        }
+        pinQ.reset();
+    }
+
+    bool isPinned(qint64 t) const {
+        for (const auto &[a, b] : pins) {
+            if (t < a)
+                return false;
+            if (t <= b)
+                return true;
+        }
+        return false;
+    }
+
+    bool hasPinsIn(qint64 from, qint64 to) const {
+        for (const auto &[a, b] : pins) {
+            if (a > to)
+                return false;
+            if (b >= from)
+                return true;
+        }
+        return false;
+    }
+
+    bool isArchived10s(qint64 b) const { return rawBefore > 0 && b < rawBefore && !imported && !isPinned(b); }
 
     // Sub-bin windows plot a retained 10-second aggregate at its midpoint.
-    template<class Visit> void summaries(qint64 id,int hop,qint64 from,qint64 to,Visit visit) {
-        if (!archived || from >= rawBefore) return;
-        archived->reset(); archived->integer(1,id); archived->integer(2,hop);
-        archived->integer(3,from-5000); archived->integer(4,std::min(to-5000,rawBefore-10000));
-        while (archived->next()) visit(archived->integer(15)+5000,readBin(*archived));
+    template <class Visit> void summaries(qint64 id, int hop, qint64 from, qint64 to, Visit visit) {
+        if (!rawBefore || from >= rawBefore)
+            return;
+        prepareSession(id);
+        if (imported)
+            return;
+        const qint64 lo = std::max(0LL, from - 5000);
+        const qint64 hi = std::min(to - 5000, rawBefore - 10000);
+        if (lo > hi)
+            return;
+        auto &q = binsStmt(0);
+        q.reset();
+        q.integer(1, id);
+        q.integer(2, hop);
+        q.integer(3, spans[0]);
+        q.integer(4, lo);
+        q.integer(5, hi);
+        while (q.next()) {
+            const qint64 b = q.integer(15);
+            if (!isPinned(b))
+                visit(b + 5000, readBin(q));
+        }
+        q.reset();
     }
-    Statement bins, raw;
 
     // Each requested range is exactly covered by whole rollups and the raw
-    // samples at its two edges. Complexity depends on pixels, not run length.
+    // samples at its two edges.
     void range(Stats &out, qint64 session, int hop, qint64 from, qint64 to, int level = spans.size() - 1) {
         if (from > to)
             return;
         if (level < 0) {
-            summaries(session,hop,from,to,[&](qint64,const Stats &s){ out.add(s); });
+            summaries(session, hop, from, to, [&](qint64, const Stats &s) { out.add(s); });
+            auto &raw = rawStmt();
             raw.reset();
             raw.integer(1, session);
             raw.integer(2, hop);
@@ -233,6 +354,7 @@ struct Reader {
             raw.integer(4, to);
             while (raw.next())
                 out.add(Stats::sample(raw.integer(0), raw.number(1), raw.string(2), raw.integer(3)));
+            raw.reset();
             return;
         }
         const qint64 span = spans[level];
@@ -244,6 +366,7 @@ struct Reader {
             return;
         }
         range(out, session, hop, from, first - 1, level - 1);
+        auto &bins = binsStmt(level);
         bins.reset();
         bins.integer(1, session);
         bins.integer(2, hop);
@@ -252,7 +375,94 @@ struct Reader {
         bins.integer(5, last - 1);
         while (bins.next())
             out.add(readBin(bins));
+        bins.reset();
         range(out, session, hop, last, to, level - 1);
+    }
+
+    // Single-pass numeric sweep across [start, end] that preserves exact pixel
+    // boundaries without per-pixel SQLite queries or unused string decoding.
+    void sweepChart(QVector<ChartStats> &points, qint64 session, int hop, qint64 start, qint64 end, int count) {
+        const qint64 duration = end - start + 1;
+        auto pixelOf = [&](qint64 t) -> int {
+            return static_cast<int>((static_cast<__int128>(t - start) * count) / duration);
+        };
+        prepareSession(session);
+        if (duration <= qint64(count) * spans[0]) {
+            if (rawBefore > 0 && !imported && start < rawBefore) {
+                const qint64 lo = std::max(0LL, start - 5000);
+                const qint64 hi = std::min(end - 5000, rawBefore - 10000);
+                if (lo <= hi) {
+                    auto &q = chartBinsStmt(0);
+                    q.reset();
+                    q.integer(1, session);
+                    q.integer(2, hop);
+                    q.integer(3, spans[0]);
+                    q.integer(4, lo);
+                    q.integer(5, hi);
+                    while (q.next()) {
+                        const qint64 b = q.integer(0);
+                        if (!isPinned(b))
+                            points[pixelOf(b + 5000)].add(readChartBin(q));
+                    }
+                    q.reset();
+                }
+            }
+            auto &raw = chartRawStmt();
+            raw.reset();
+            raw.integer(1, session);
+            raw.integer(2, hop);
+            raw.integer(3, start);
+            raw.integer(4, end);
+            while (raw.next())
+                points[pixelOf(raw.integer(0))].addSample(raw.number(1));
+            raw.reset();
+            return;
+        }
+        const qint64 perPixel = duration / count;
+        const int topLevel = perPixel >= 3 * spans[2] ? 2 : perPixel >= 3 * spans[1] ? 1 : 0;
+        auto sweep = [&](auto &self, int level, qint64 from, qint64 to) -> void {
+            if (from > to)
+                return;
+            if (level < 0) {
+                auto &raw = chartRawStmt();
+                raw.reset();
+                raw.integer(1, session);
+                raw.integer(2, hop);
+                raw.integer(3, from);
+                raw.integer(4, to);
+                while (raw.next())
+                    points[pixelOf(raw.integer(0))].addSample(raw.number(1));
+                raw.reset();
+                return;
+            }
+            const qint64 span = spans[level];
+            auto &bins = chartBinsStmt(level);
+            bins.reset();
+            bins.integer(1, session);
+            bins.integer(2, hop);
+            bins.integer(3, span);
+            bins.integer(4, (from / span) * span);
+            bins.integer(5, to);
+            while (bins.next()) {
+                const qint64 b = bins.integer(0);
+                const qint64 segLo = std::max(b, from);
+                const qint64 segHi = std::min(b + span - 1, to);
+                if (segLo > segHi)
+                    continue;
+                const int pLo = pixelOf(segLo), pHi = pixelOf(segHi);
+                if (segLo == b && segHi == b + span - 1 && pLo == pHi) {
+                    points[pLo].add(readChartBin(bins));
+                } else if (level == 0 && isArchived10s(b)) {
+                    const qint64 mid = b + 5000;
+                    if (mid >= from && mid <= to)
+                        points[pixelOf(mid)].add(readChartBin(bins));
+                } else {
+                    self(self, level - 1, segLo, segHi);
+                }
+            }
+            bins.reset();
+        };
+        sweep(sweep, topLevel, start, end);
     }
 };
 
@@ -420,11 +630,43 @@ qint64 insertSession(sqlite3 *db, const QString &target, int family, int interva
 History::History(QString path) : path_(std::move(path)) {
 }
 History::~History() {
+    cache_.reset();
     if (db_)
         sqlite3_close(db_);
 }
+History::Cache &History::cache() {
+    if (!cache_)
+        cache_ = std::make_unique<Cache>(db_);
+    return *cache_;
+}
+void History::invalidateIdentityCache() {
+    if (!cache_)
+        return;
+    cache_->identityDataVersion = -1;
+    cache_->lengthsLoaded = false;
+    cache_->inventoryLengths.clear();
+    cache_->originLengths.clear();
+    cache_->identityMap.clear();
+}
 QString History::error() const {
     return error_;
+}
+
+bool History::withWriteTransaction(const std::function<void()> &work) {
+    if (!open())
+        return false;
+    error_.clear();
+    try {
+        OptionalTransaction tx(db_, true);
+        work();
+        tx.commit();
+        return true;
+    } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
+        error_ = QString::fromUtf8(e.what());
+        return false;
+    }
 }
 
 bool History::openReadOnly() {
@@ -434,6 +676,7 @@ bool History::openReadOnly() {
         return true;
     }
     error_ = QString::fromUtf8(sqlite3_errmsg(db_));
+    cache_.reset();
     sqlite3_close(db_);
     db_ = nullptr;
     return false;
@@ -464,6 +707,7 @@ bool History::open() {
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
+        cache_.reset();
         sqlite3_close(db_);
         db_ = nullptr;
         return false;
@@ -492,7 +736,7 @@ qint64 History::receiverSession(const QString &location, const QString &stream, 
     if (!open()) return 0;
     error_.clear();
     try {
-        Transaction tx(db_, true);
+        OptionalTransaction tx(db_, true);
         Statement lookup(db_, "SELECT session FROM receiver_streams WHERE location=? AND stream=?");
         lookup.string(1, location);
         lookup.string(2, stream);
@@ -520,7 +764,7 @@ bool History::setSessionOrigin(qint64 id, const QString &location, const QString
     if (!open()) return false;
     error_.clear();
     try {
-        Transaction tx(db_, true);
+        OptionalTransaction tx(db_, true);
         // Retried or backfilled samples can predate the last clock estimate already visible in this stream.
         if (sampleThroughMs >= 0) {
             Statement old(db_, "UPDATE session_origin SET received_ms=max(received_ms,?1) WHERE session=?2 "
@@ -545,6 +789,8 @@ bool History::setSessionOrigin(qint64 id, const QString &location, const QString
         tx.commit();
         return true;
     } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
         error_ = QString::fromUtf8(e.what());
         return false;
     }
@@ -559,6 +805,8 @@ bool History::setMeasurement(qint64 id, qint64 stamp, const QVariantMap &setting
         q.integer(1, id); q.integer(2, stamp); q.string(3, json); q.next();
         return true;
     } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
         error_ = QString::fromUtf8(e.what());
         return false;
     }
@@ -579,6 +827,8 @@ bool History::setInterval(qint64 id, int intervalMs) {
             throw std::runtime_error("Unknown session");
         return true;
     } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
         error_ = QString::fromUtf8(e.what());
         return false;
     }
@@ -595,6 +845,8 @@ bool History::setTabClosed(qint64 id, bool closed) {
         q.next();
         return true;
     } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
         error_ = QString::fromUtf8(e.what());
         return false;
     }
@@ -617,6 +869,8 @@ bool History::addNote(qint64 id, qint64 timeMs, QString text) {
         q.next();
         return true;
     } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
         error_ = QString::fromUtf8(e.what());
         return false;
     }
@@ -672,11 +926,12 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
     if (samples.isEmpty())
         return true;
     try {
-        Transaction tx(db_, true);
-        Statement insert(db_, "INSERT INTO samples VALUES(?,?,?,?,?,?) ON CONFLICT(session,hop,t) DO NOTHING");
-        Statement failure(db_, "INSERT INTO probe_failures VALUES(?,?,?,?)");
-        Statement setDestination(
-            db_,
+        OptionalTransaction tx(db_, true);
+        auto &c = cache();
+        auto &insert = c.stmt(c.insertSample, "INSERT INTO samples VALUES(?,?,?,?,?,?) ON CONFLICT(session,hop,t) DO NOTHING");
+        auto &failure = c.stmt(c.insertFailure, "INSERT INTO probe_failures VALUES(?,?,?,?)");
+        auto &setDestination = c.stmt(
+            c.setDestination,
             "INSERT INTO samples VALUES(?,0,?,?,?,0) ON CONFLICT(session,hop,t) "
             "DO UPDATE SET rtt=excluded.rtt,address=excluded.address WHERE samples.dest=0 AND samples.rtt<0 AND excluded.rtt>=0");
         std::map<std::pair<qint64, qint64>, Stats> rounds;
@@ -689,14 +944,18 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
         for (const auto &s : samples)
             ordered.push_back(&s);
         std::stable_sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->timeMs < b->timeMs; });
-        Statement watermark(db_,"SELECT raw_before FROM retention WHERE id=1");
+        auto &watermark = c.stmt(c.watermark, "SELECT raw_before FROM retention WHERE id=1");
+        watermark.reset();
         watermark.next();
         const auto expiredBefore = watermark.integer(0);
-        Statement preserved(db_,"SELECT 1 FROM retention_pins WHERE session=? AND ? BETWEEN start_ms AND end_ms");
+        watermark.reset();
+        auto &preserved = c.stmt(c.preserved, "SELECT 1 FROM retention_pins WHERE session=? AND ? BETWEEN start_ms AND end_ms");
         for (const auto *s : ordered) {
             if (s->timeMs < expiredBefore) {
                 preserved.reset(); preserved.integer(1,s->session); preserved.integer(2,s->timeMs);
-                if (!preserved.next()) continue;
+                const bool ok = preserved.next();
+                preserved.reset();
+                if (!ok) continue;
             }
             if (s->timeMs < 0 || s->timeMs > timeLimit || s->hop < 0 || s->hop > 255 ||
                 !std::isfinite(s->rttMs))
@@ -729,8 +988,10 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
                 round = Stats::sample(s->timeMs, s->destination ? s->rttMs : -1,
                                       s->destination ? s->address : QString(), false);
             }
-            for (const auto span : spans)
-                changed[{s->session, s->hop, span, s->timeMs / span * span}].add(one);
+            if (one.sent) {
+                for (const auto span : spans)
+                    changed[{s->session, s->hop, span, s->timeMs / span * span}].add(one);
+            }
             if (s->hop == 0) continue;
             auto [it, added] = bounds.try_emplace({s->session, s->hop}, s->timeMs, s->timeMs);
             if (!added)
@@ -747,7 +1008,7 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
             setDestination.number(3, outcome.current);
             setDestination.string(4, outcome.address);
             setDestination.next();
-            if (sqlite3_changes(db_))
+            if (sqlite3_changes(db_) && outcome.sent)
                 for (const auto span : spans)
                     changed[{id, 0, span, time / span * span}].add(outcome);
         }
@@ -763,11 +1024,14 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
             }
             it = end;
         }
-        Reader reader(db_);
-        Statement put(db_, saveBinSql);
+        Reader reader(c);
+        auto &put = c.stmt(c.saveBin, saveBinSql);
         for (auto &[key, delta] : changed) {
+            if (!delta.sent)
+                continue;
             const auto [id, hop, span, t] = key;
-            auto &get = reader.bins;
+            const int level = int(std::find(spans.begin(), spans.end(), span) - spans.begin());
+            auto &get = reader.binsStmt(level);
             get.reset();
             get.integer(1, id);
             get.integer(2, hop);
@@ -782,7 +1046,6 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
                 // A late probe can change two jitter transitions. Smaller time
                 // buckets are already current because smaller spans sort first.
                 all = {};
-                const int level = int(std::find(spans.begin(), spans.end(), span) - spans.begin());
                 reader.range(all, id, hop, t, t + span - 1, level - 1);
             } else {
                 all.add(delta);
@@ -790,39 +1053,45 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
             if (all.sent) saveBin(put, id, hop, span, t, all);
         }
 
-        Statement hop(db_, "INSERT INTO hops VALUES(?,?,?,?) ON CONFLICT(session,hop) DO UPDATE SET "
+        auto &hop = c.stmt(c.upsertHop, "INSERT INTO hops VALUES(?,?,?,?) ON CONFLICT(session,hop) DO UPDATE SET "
                            "first_ms=min(first_ms,excluded.first_ms),last_ms=max(last_ms,excluded.last_ms)");
-        Statement session(db_, "UPDATE sessions SET first_ms=min(coalesce(first_ms,?1),?1),"
+        auto &session = c.stmt(c.updateSession, "UPDATE sessions SET first_ms=min(coalesce(first_ms,?1),?1),"
                                "last_ms=max(coalesce(last_ms,?2),?2) WHERE id=?3");
-        for (auto &[key, edge] : bounds) {
+        std::map<qint64, std::pair<qint64, qint64>> sessionBounds;
+        for (const auto &[key, edge] : bounds) {
             hop.reset();
             hop.integer(1, key.first);
             hop.integer(2, key.second);
             hop.integer(3, edge.first);
             hop.integer(4, edge.second);
             hop.next();
+            auto [it, added] = sessionBounds.try_emplace(key.first, edge);
+            if (!added) {
+                it->second.first = std::min(it->second.first, edge.first);
+                it->second.second = std::max(it->second.second, edge.second);
+            }
+        }
+        for (const auto &[sid, edge] : sessionBounds) {
             session.reset();
             session.integer(1, edge.first);
             session.integer(2, edge.second);
-            session.integer(3, key.first);
+            session.integer(3, sid);
             session.next();
+            updateRouteIndex(sid, edge.first);
         }
-        QMap<qint64,qint64> earliestNew;
-        for (const auto &[key, edge] : bounds)
-            earliestNew[key.first] = std::min(earliestNew.value(key.first, edge.first), edge.first);
-        for (auto it = earliestNew.cbegin(); it != earliestNew.cend(); ++it)
-            updateRouteIndex(it.key(), it.value());
         tx.commit();
         if (newEvents) *newEvents = std::move(eventIds);
         return true;
     } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
         error_ = QString::fromUtf8(e.what());
         return false;
     }
 }
 
 QVariantMap History::retainedDestination(qint64 id, qint64 from, qint64 through) {
-    Reader reader(db_);
+    Reader reader(cache());
     Stats stats;
     reader.range(stats, id, 0, from, through);
     return {{"sent",stats.sent}, {"received",stats.received}, {"loss",stats.sent ? stats.loss() : -1.},
@@ -903,7 +1172,7 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
         Transaction tx(db_, false);
         result["resolution"] = retainedResolution(id,start,end);
         result["measurement"] = focusedMeasurement(id, focusStart, focusEnd);
-        Reader reader(db_);
+        Reader reader(cache());
         Statement labels(db_, "SELECT EXISTS(SELECT 1 FROM inventory_lengths) OR "
                               "EXISTS(SELECT 1 FROM captured_identity WHERE session=?)");
         labels.integer(1,id);
@@ -970,47 +1239,30 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
         QSet<int> seen;
         const qint64 duration = end - start + 1;
         const int count = static_cast<int>(std::min<qint64>(pixels, duration));
+        static const QString kX = QStringLiteral("x");
+        static const QString kMin = QStringLiteral("min");
+        static const QString kMax = QStringLiteral("max");
+        static const QString kAvg = QStringLiteral("avg");
+        static const QString kLoss = QStringLiteral("loss");
+        static const QString kSent = QStringLiteral("sent");
         for (const auto hop : selected) {
             if (hop < 0 || seen.contains(hop))
                 continue;
             seen.insert(hop);
-            QVector<Stats> points(count);
-            if (duration <= qint64(count) * 1000) {
-                // Live views often have only a few hundred probes. One index
-                // scan is cheaper than a separate database query for each empty pixel.
-                reader.summaries(id,hop,start,end,[&](qint64 t,const Stats &s) {
-                    points[(t-start)*count/duration].add(s);
-                });
-                auto &raw = reader.raw;
-                raw.reset();
-                raw.integer(1, id);
-                raw.integer(2, hop);
-                raw.integer(3, start);
-                raw.integer(4, end);
-                while (raw.next()) {
-                    const auto t = raw.integer(0);
-                    const auto x = (t - start) * count / duration;
-                    points[x].add(Stats::sample(t, raw.number(1), raw.string(2), raw.integer(3)));
-                }
-            } else {
-                // ceil(i*duration/count), without overflowing long recording times.
-                auto edge = [&](qint64 p) {
-                    return start + p * (duration / count) + (p * (duration % count) + count - 1) / count;
-                };
-                for (int i = 0; i < count; ++i)
-                    reader.range(points[i], id, hop, edge(i), edge(i + 1) - 1);
-            }
+            QVector<ChartStats> points(count);
+            reader.sweepChart(points, id, hop, start, end, count);
             QVariantList buckets;
+            buckets.reserve(count);
             for (int i = 0; i < count; ++i) {
-                const Stats &s = points[i];
+                const ChartStats &s = points[i];
                 timeMax = std::max(timeMax, s.high);
                 if (s.sent)
-                    buckets << QVariantMap{{"x", int(qint64(i) * pixels / count)},
-                                           {"min", s.low},
-                                           {"max", s.high},
-                                           {"avg", s.average()},
-                                           {"loss", s.loss()},
-                                           {"sent", s.sent}};
+                    buckets << QVariantMap{{kX, int(qint64(i) * pixels / count)},
+                                           {kMin, s.low},
+                                           {kMax, s.high},
+                                           {kAvg, s.average()},
+                                           {kLoss, s.loss()},
+                                           {kSent, s.sent}};
             }
             charts << QVariantMap{
                 {"hop", hop == 0 ? destinationHop : hop}, {"destination", hop == 0}, {"buckets", buckets}};
@@ -1109,6 +1361,8 @@ bool History::routePage(qint64 session, RouteEvents &detector, qint64 &cursor, q
         if (tx) tx->commit();
         return true;
     } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
         error_ = QString::fromUtf8(e.what());
         return false;
     }

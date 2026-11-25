@@ -1,4 +1,5 @@
 #include "history.h"
+#include "historycache.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
 #include <QDir>
@@ -7,54 +8,176 @@
 #include <QStorageInfo>
 #include <QTemporaryFile>
 #include <algorithm>
+#include <array>
 
 using namespace hopview_sql;
 namespace {
 constexpr qint64 day = 86400000, hour = 3600000;
+constexpr std::array<qint64, 3> binSpans{10000, 60000, 3600000};
+constexpr std::array<qint64, 3> diagSpans{30000, 300000, 3600000};
 qint64 scalar(sqlite3 *db, const char *sql) {
     Statement q(db, sql);
     return q.next() ? q.integer(0) : 0;
 }
-constexpr char protectedRow[] =
-    " AND session NOT IN (SELECT session FROM imported_sessions)"
-    " AND NOT EXISTS(SELECT 1 FROM retention_pins p WHERE p.session=src.session AND ";
-void pruneHistory(sqlite3 *db, qint64 raw, qint64 summary, qint64 session = 0, qint64 from = 0,
-                  qint64 through = 0) {
-    auto prune = [&](const char *table, const char *time, qint64 end, const char *extra = "") {
-        const auto sql = QByteArray("DELETE FROM ") + table + " AS src WHERE " + time + "<?1" + protectedRow +
-                         "src." + time + " BETWEEN p.start_ms AND p.end_ms)" + extra;
-        const auto scoped =
-            session ? sql + " AND src.session=?2 AND src." + time + " BETWEEN ?3 AND ?4" : sql;
-        Statement del(db, scoped.constData());
-        del.integer(1, end);
-        if (session) {
-            del.integer(2, session);
-            del.integer(3, from);
-            del.integer(4, through);
-        }
-        del.next();
-    };
-    if (raw) {
-        prune("samples", "t", raw);
-        prune("probe_failures", "t", raw);
-        prune("diagnostic_records", "t", raw,
-              " AND flag=0 AND NOT EXISTS(SELECT 1 FROM diagnostic_bins b WHERE b.session=src.session "
-              "AND b.kind=src.kind "
-              "AND b.span=30000 AND b.b=src.t/30000*30000 AND b.peak_t=src.t)");
+
+// Delete expired rows for one non-imported session using each table's leading
+// primary-key prefix so SQLite performs bounded range seeks instead of full-table scans.
+void pruneSession(sqlite3 *db, qint64 sid, qint64 raw, qint64 summary, bool scoped = false,
+                  qint64 from = 0, qint64 through = 0) {
+    Statement imp(db, "SELECT 1 FROM imported_sessions WHERE session=?");
+    imp.integer(1, sid);
+    if (imp.next())
+        return;
+
+    QList<int> hops{0};
+    {
+        Statement hopQ(db, "SELECT hop FROM hops WHERE session=? ORDER BY hop");
+        hopQ.integer(1, sid);
+        while (hopQ.next())
+            hops.append(int(hopQ.integer(0)));
     }
+
+    auto buildPinClause = [&](const char *time) -> QByteArray {
+        QByteArray clause = QByteArray(" AND NOT EXISTS(SELECT 1 FROM retention_pins p WHERE p.session=?1 AND src.") +
+                            time + " BETWEEN p.start_ms AND p.end_ms)";
+        if (scoped)
+            clause += QByteArray(" AND src.") + time + " BETWEEN ?3 AND ?4";
+        return clause;
+    };
+
+    if (raw) {
+        const auto pinT = buildPinClause("t");
+        {
+            const auto sql = "DELETE FROM samples AS src WHERE src.session=?1 AND src.hop=?5 AND src.t<?2" + pinT;
+            Statement del(db, sql.constData());
+            for (int hop : hops) {
+                del.reset();
+                del.integer(1, sid);
+                del.integer(2, raw);
+                if (scoped) {
+                    del.integer(3, from);
+                    del.integer(4, through);
+                }
+                del.integer(5, hop);
+                del.next();
+            }
+        }
+        {
+            const auto sql = "DELETE FROM probe_failures AS src WHERE src.session=?1 AND src.hop=?5 AND src.t<?2" + pinT;
+            Statement del(db, sql.constData());
+            for (int hop : hops) {
+                del.reset();
+                del.integer(1, sid);
+                del.integer(2, raw);
+                if (scoped) {
+                    del.integer(3, from);
+                    del.integer(4, through);
+                }
+                del.integer(5, hop);
+                del.next();
+            }
+        }
+        {
+            const auto sql =
+                "DELETE FROM diagnostic_records AS src WHERE src.session=?1 AND src.kind=?5 AND src.t<?2" + pinT +
+                " AND flag=0 AND NOT EXISTS(SELECT 1 FROM diagnostic_bins b WHERE b.session=src.session "
+                "AND b.kind=src.kind AND b.span=30000 AND b.b=src.t/30000*30000 AND b.peak_t=src.t)";
+            Statement del(db, sql.constData());
+            for (const char *kind : {"service", "interface"}) {
+                del.reset();
+                del.integer(1, sid);
+                del.integer(2, raw);
+                if (scoped) {
+                    del.integer(3, from);
+                    del.integer(4, through);
+                }
+                del.string(5, QString::fromLatin1(kind));
+                del.next();
+            }
+        }
+    }
+
     if (summary) {
-        for (auto table : {"bins", "diagnostic_records", "route_transitions", "route_gaps"})
-            prune(table, "t", summary);
-        prune("diagnostic_bins", "b", summary);
-        prune("route_checkpoints","t",summary,
-              " AND t<>(SELECT max(t) FROM route_checkpoints c WHERE c.session=src.session AND t<?1)"
-              " AND NOT EXISTS(SELECT 1 FROM retention_pins p WHERE p.session=src.session AND src.t="
-              "(SELECT max(t) FROM route_checkpoints c WHERE c.session=p.session AND c.t<p.start_ms))");
+        const auto pinT = buildPinClause("t");
+        const auto pinB = buildPinClause("b");
+        {
+            const auto sql =
+                "DELETE FROM bins AS src WHERE src.session=?1 AND src.hop=?5 AND src.span=?6 AND src.t<?2" + pinT;
+            Statement del(db, sql.constData());
+            for (int hop : hops) {
+                for (qint64 span : binSpans) {
+                    del.reset();
+                    del.integer(1, sid);
+                    del.integer(2, summary);
+                    if (scoped) {
+                        del.integer(3, from);
+                        del.integer(4, through);
+                    }
+                    del.integer(5, hop);
+                    del.integer(6, span);
+                    del.next();
+                }
+            }
+        }
+        {
+            const auto sql =
+                "DELETE FROM diagnostic_records AS src WHERE src.session=?1 AND src.kind=?5 AND src.t<?2" + pinT;
+            Statement del(db, sql.constData());
+            for (const char *kind : {"service", "interface"}) {
+                del.reset();
+                del.integer(1, sid);
+                del.integer(2, summary);
+                if (scoped) {
+                    del.integer(3, from);
+                    del.integer(4, through);
+                }
+                del.string(5, QString::fromLatin1(kind));
+                del.next();
+            }
+        }
+        {
+            const auto sql =
+                "DELETE FROM diagnostic_bins AS src WHERE src.session=?1 AND src.kind=?5 AND src.span=?6 AND src.b<?2" +
+                pinB;
+            Statement del(db, sql.constData());
+            for (const char *kind : {"service", "interface"}) {
+                for (qint64 span : diagSpans) {
+                    del.reset();
+                    del.integer(1, sid);
+                    del.integer(2, summary);
+                    if (scoped) {
+                        del.integer(3, from);
+                        del.integer(4, through);
+                    }
+                    del.string(5, QString::fromLatin1(kind));
+                    del.integer(6, span);
+                    del.next();
+                }
+            }
+        }
+        auto pruneSimple = [&](const char *table, const char *extra = "") {
+            const auto sql = QByteArray("DELETE FROM ") + table +
+                             " AS src WHERE src.session=?1 AND src.t<?2" + pinT + extra;
+            Statement del(db, sql.constData());
+            del.integer(1, sid);
+            del.integer(2, summary);
+            if (scoped) {
+                del.integer(3, from);
+                del.integer(4, through);
+            }
+            del.next();
+        };
+        pruneSimple("route_transitions");
+        pruneSimple("route_gaps");
+        pruneSimple("route_checkpoints",
+                    " AND src.t<>(SELECT max(c.t) FROM route_checkpoints c WHERE c.session=src.session AND c.t<?2)"
+                    " AND NOT EXISTS(SELECT 1 FROM retention_pins p WHERE p.session=src.session AND src.t="
+                    "(SELECT max(c.t) FROM route_checkpoints c WHERE c.session=p.session AND c.t<p.start_ms))");
         // Preserve the most recent settings before every retained time range.
-        prune("measurement_epochs", "t", summary,
-              " AND t<>(SELECT max(t) FROM measurement_epochs e WHERE e.session=src.session AND t<?1)"
-              " AND NOT EXISTS(SELECT 1 FROM retention_pins p WHERE p.session=src.session AND src.t="
-              "(SELECT max(t) FROM measurement_epochs e WHERE e.session=p.session AND e.t<=p.start_ms))");
+        pruneSimple("measurement_epochs",
+                    " AND src.t<>(SELECT max(e.t) FROM measurement_epochs e WHERE e.session=src.session AND e.t<?2)"
+                    " AND NOT EXISTS(SELECT 1 FROM retention_pins p WHERE p.session=src.session AND src.t="
+                    "(SELECT max(e.t) FROM measurement_epochs e WHERE e.session=p.session AND e.t<=p.start_ms))");
     }
 }
 
@@ -119,7 +242,7 @@ bool History::releasePin(qint64 id, qint64 from, qint64 through) {
         if (sqlite3_changes(db_)) {
             Statement cut(db_, "SELECT raw_before,summary_before FROM retention WHERE id=1");
             cut.next();
-            pruneHistory(db_, cut.integer(0), cut.integer(1), id, from, through);
+            pruneSession(db_, id, cut.integer(0), cut.integer(1), true, from, through);
         }
         tx.commit();
         return true;
@@ -161,33 +284,61 @@ bool History::maintainStorage(qint64 now) {
         return false;
     error_.clear();
     try {
-        Transaction tx(db_, true);
-        Statement config(db_,
-                         "SELECT raw_days,summary_days,raw_before,summary_before FROM retention WHERE id=1");
-        config.next();
-        const auto cutoff = [&](int field) {
-            const auto days = config.integer(field);
-            return days ? std::max(0LL, (now - days * day) / hour * hour) : 0LL;
-        };
-        const auto raw = std::max(config.integer(2), cutoff(0)),
-                   summary = std::max(config.integer(3), cutoff(1));
-        if (raw > config.integer(2)) {
+        qint64 oldRaw = 0, oldSummary = 0, raw = 0, summary = 0;
+        {
+            Statement config(db_,
+                             "SELECT raw_days,summary_days,raw_before,summary_before FROM retention WHERE id=1");
+            config.next();
+            auto cutoff = [&](int field) {
+                const auto days = config.integer(field);
+                return days ? std::max(0LL, (now - days * day) / hour * hour) : 0LL;
+            };
+            oldRaw = config.integer(2);
+            oldSummary = config.integer(3);
+            raw = std::max(oldRaw, cutoff(0));
+            summary = std::max(oldSummary, cutoff(1));
+        }
+        if (raw > oldRaw) {
             // Upgraded databases may still have unindexed raw history. Save its
-            // transitions before retiring the only observations that can produce them.
+            // transitions in bounded transactions before retiring raw observations.
             Statement behind(db_, "SELECT id FROM sessions WHERE EXISTS(SELECT 1 FROM samples WHERE "
                                   "session=sessions.id AND hop=0 AND t<? AND t>coalesce((SELECT cursor "
                                   "FROM route_index WHERE session=sessions.id),-1)) LIMIT 1");
             while (true) {
                 behind.reset();
-                behind.integer(1,raw);
-                if (!behind.next()) break;
-                const auto id=behind.integer(0);
+                behind.integer(1, raw);
+                if (!behind.next())
+                    break;
+                const auto id = behind.integer(0);
                 behind.reset();
-                updateRouteIndex(id,-1);
+                Transaction tx(db_, true);
+                updateRouteIndex(id, -1);
+                tx.commit();
             }
+            // Ensure each session's latest route_index state is checkpointed before pruning.
+            Transaction ckptTx(db_, true);
+            execute(db_, "INSERT OR REPLACE INTO route_checkpoints(session,hour,t,state) "
+                         "SELECT session,cursor/3600000,cursor,state FROM route_index WHERE cursor>=0");
+            ckptTx.commit();
         }
-        pruneHistory(db_, raw > config.integer(2) ? raw : 0, summary > config.integer(3) ? summary : 0);
-        Statement set(db_, "UPDATE retention SET raw_before=?,summary_before=? WHERE id=1");
+        const qint64 pruneRaw = raw > oldRaw ? raw : 0;
+        const qint64 pruneSummary = summary > oldSummary ? summary : 0;
+        if (pruneRaw || pruneSummary) {
+            QList<qint64> targets;
+            Statement sids(db_, "SELECT id FROM sessions WHERE id NOT IN (SELECT session FROM imported_sessions)");
+            while (sids.next())
+                targets.append(sids.integer(0));
+            // Commit per session so live writers and telemetry receivers never hit busy timeouts.
+            for (const qint64 sid : targets) {
+                Transaction tx(db_, true);
+                pruneSession(db_, sid, pruneRaw, pruneSummary);
+                tx.commit();
+            }
+            if (cache_)
+                cache_->routeStates.clear();
+        }
+        Transaction tx(db_, true);
+        Statement set(db_, "UPDATE retention SET raw_before=max(raw_before,?),summary_before=max(summary_before,?) WHERE id=1");
         set.integer(1, raw);
         set.integer(2, summary);
         set.next();
@@ -200,6 +351,7 @@ bool History::maintainStorage(qint64 now) {
         old.integer(1, now - 7 * day);
         old.next();
         tx.commit();
+        execute(db_, "PRAGMA optimize");
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());

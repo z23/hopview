@@ -11,6 +11,9 @@
 #include <QSaveFile>
 #include <QTemporaryDir>
 #include <cmath>
+#include <memory>
+#include <queue>
+#include <vector>
 
 using namespace hopview_sql;
 namespace {
@@ -151,19 +154,70 @@ void writeTrace(sqlite3 *db, History &history, QSaveFile &out, const QVariantMap
             nextEpoch = epochs.next();
         }
     };
-    Statement samples(db, "SELECT s.t,s.hop,s.address,s.rtt,s.dest,f.data FROM samples s "
-                          "LEFT JOIN probe_failures f USING(session,hop,t) "
-                          "WHERE s.session=? AND s.t BETWEEN ? AND ? AND (s.hop>0 OR s.dest=2) ORDER BY s.t,s.hop");
-    samples.integer(1, id);
-    samples.integer(2, from);
-    samples.integer(3, through);
-    while (samples.next()) {
-        const auto t = samples.integer(0), hop = samples.integer(1);
+    // K-way merge per-hop cursors over the clustered (session, hop, t) PK to avoid
+    // scanning the entire recording when exporting a narrow incident window.
+    QList<int> activeHops{0};
+    {
+        Statement hopQ(db, "SELECT hop FROM hops WHERE session=? AND first_ms<=? AND last_ms>=? ORDER BY hop");
+        hopQ.integer(1, id);
+        hopQ.integer(2, through);
+        hopQ.integer(3, from);
+        while (hopQ.next())
+            activeHops.append(int(hopQ.integer(0)));
+    }
+    struct HopStream {
+        int hop;
+        std::unique_ptr<Statement> stmt;
+        qint64 t = 0;
+    };
+    struct HeapEntry {
+        qint64 t;
+        int hop;
+        size_t idx;
+        bool operator>(const HeapEntry &other) const {
+            return t != other.t ? t > other.t : hop > other.hop;
+        }
+    };
+    std::vector<HopStream> streams;
+    streams.reserve(activeHops.size());
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+    for (int hop : activeHops) {
+        const char *sql =
+            hop == 0 ? "SELECT s.t,s.address,s.rtt,s.dest,f.data FROM samples s "
+                       "LEFT JOIN probe_failures f ON f.session=s.session AND f.hop=s.hop AND f.t=s.t "
+                       "WHERE s.session=? AND s.hop=0 AND s.t BETWEEN ? AND ? AND s.dest=2 ORDER BY s.t"
+                     : "SELECT s.t,s.address,s.rtt,s.dest,f.data FROM samples s "
+                       "LEFT JOIN probe_failures f ON f.session=s.session AND f.hop=s.hop AND f.t=s.t "
+                       "WHERE s.session=? AND s.hop=? AND s.t BETWEEN ? AND ? ORDER BY s.t";
+        auto q = std::make_unique<Statement>(db, sql);
+        q->integer(1, id);
+        if (hop == 0) {
+            q->integer(2, from);
+            q->integer(3, through);
+        } else {
+            q->integer(2, hop);
+            q->integer(3, from);
+            q->integer(4, through);
+        }
+        if (q->next()) {
+            const qint64 t = q->integer(0);
+            const size_t idx = streams.size();
+            streams.push_back({hop, std::move(q), t});
+            heap.push({t, hop, idx});
+        }
+    }
+    while (!heap.empty()) {
+        const auto top = heap.top();
+        heap.pop();
+        auto &stream = streams[top.idx];
+        auto &q = *stream.stmt;
+        const auto t = top.t;
+        const int hop = stream.hop;
         writeEpochs(t);
-        const auto address = samples.string(2);
-        const auto rtt = samples.number(3);
-        const bool destination = hop ? samples.integer(4) == 1 : rtt >= 0;
-        const auto failure = QJsonDocument::fromJson(samples.string(5).toUtf8()).object();
+        const auto address = q.string(1);
+        const auto rtt = q.number(2);
+        const bool destination = hop ? q.integer(3) == 1 : rtt >= 0;
+        const auto failure = QJsonDocument::fromJson(q.string(4).toUtf8()).object();
         const auto role = hop ? QStringLiteral("probe") : QStringLiteral("endpoint");
         if (csv)
             emitRecord(failure, {role, utc(t), QString::number(t), QString::number(hop), address,
@@ -178,6 +232,10 @@ void writeTrace(sqlite3 *db, History &history, QSaveFile &out, const QVariantMap
                         {"destination", destination}},
                        {});
         ++counts.probes;
+        if (q.next()) {
+            stream.t = q.integer(0);
+            heap.push({stream.t, hop, top.idx});
+        }
     }
     writeEpochs(through);
     Statement notes(db, "SELECT t,body FROM notes WHERE session=? AND t BETWEEN ? AND ? ORDER BY t");
@@ -381,11 +439,27 @@ bool History::exportIncident(qint64 id, qint64 from, qint64 through, const QStri
                 meta["clockErrorMs"] = -1;
             }
             QJsonObject identities;
-            Statement ips(db_,"SELECT DISTINCT address FROM samples WHERE session=? AND t BETWEEN ? AND ? AND hop>0 AND address<>''");
-            ips.integer(1,member); ips.integer(2,from); ips.integer(3,through);
-            while (ips.next()) {
-                const auto info = networkIdentity(member,ips.string(0));
-                if (!info.isEmpty()) identities.insert(ips.string(0),QJsonObject::fromVariantMap(info));
+            QSet<QString> seenAddresses;
+            Statement hopQ(db_, "SELECT hop FROM hops WHERE session=? AND first_ms<=? AND last_ms>=?");
+            hopQ.integer(1, member);
+            hopQ.integer(2, through);
+            hopQ.integer(3, from);
+            Statement ips(db_, "SELECT DISTINCT address FROM samples WHERE session=? AND hop=? AND t BETWEEN ? AND ? AND address<>''");
+            while (hopQ.next()) {
+                ips.reset();
+                ips.integer(1, member);
+                ips.integer(2, hopQ.integer(0));
+                ips.integer(3, from);
+                ips.integer(4, through);
+                while (ips.next()) {
+                    const auto addr = ips.string(0);
+                    if (seenAddresses.contains(addr))
+                        continue;
+                    seenAddresses.insert(addr);
+                    const auto info = networkIdentity(member, addr);
+                    if (!info.isEmpty())
+                        identities.insert(addr, QJsonObject::fromVariantMap(info));
+                }
             }
             meta["identities"] = identities;
             traces.append(meta);
