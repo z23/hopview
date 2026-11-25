@@ -1,5 +1,6 @@
 #include "nodeconfig.h"
 #include "history.h"
+#include "receiverweb.h"
 #include "collectormanagement.h"
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -8,6 +9,7 @@
 #include <QSslSocket>
 #include <QTcpServer>
 #include <QTimer>
+#include <QThreadPool>
 #include <cmath>
 
 namespace telemetry {
@@ -93,6 +95,13 @@ class Receiver final : public QTcpServer {
                             throw Error("Authentication failed");
                         site = claim;
                     }
+                    ack["multiBatch"] = true;
+                } else if (type == "batches" && seq > 0) {
+                    const auto bodies = message["bodies"].toArray();
+                    if (bodies.isEmpty() || bodies.size() > 32)
+                        throw Error("Invalid telemetry batch group");
+                    // Each record is idempotent if the connection is lost during the group.
+                    for (const auto &body : bodies) store(site, body.toObject(), received);
                 } else if (type == "batch" && seq > 0) {
                     store(site, message.value("body").toObject(), received);
                 } else if (type == "ping" && seq == 0) {
@@ -102,6 +111,8 @@ class Receiver final : public QTcpServer {
                 } else {
                     throw Error("Unexpected message");
                 }
+                if ((type == "hello" || type == "ping") && message.contains("health"))
+                    management_.saveHealth(site, message["health"].toObject(), received);
                 ack["v"] = 1;
                 ack["ack"] = seq;
                 ack["receivedMs"] = received;
@@ -131,31 +142,41 @@ class Receiver final : public QTcpServer {
         const int family = ip.protocol() == QAbstractSocket::IPv4Protocol ? 4 : 6;
         const auto offset = integer(body, "clockOffsetMs", -maxStamp, maxStamp);
         const auto uncertainty = integer(body, "clockErrorMs", -1, 60000);
-        const auto array = body.value("samples").toArray();
-        if (array.isEmpty() || array.size() > 2048)
+        auto array = body.value("samples").toArray();
+        const auto legacyCount = array.size();
+        for (const auto &value : body["observations"].toArray()) array.append(value);
+        auto measurement = body["measurement"].toObject();
+        if (!measurement.isEmpty() && (!validMeasurement(measurement) || measurement["resolvedAddress"].toString() != address))
+            throw Error("Invalid measurement settings");
+        const auto diagnostic = body["diagnostic"].toObject();
+        if ((array.isEmpty() && diagnostic.isEmpty()) || array.size() > 2048)
             throw Error("Invalid sample count");
-        qint64 latestSample = 0;
+        qint64 latestSample = diagnostic["t"].toInteger(0);
         QVector<Sample> samples;
         samples.reserve(array.size());
-        for (const auto &value : array) {
-            const auto row = value.toArray();
-            if (row.size() != 5)
+        for (int index = 0; index < array.size(); ++index) {
+            const bool detailed = index >= legacyCount;
+            const auto row = array[index].toArray();
+            ProbeFailure failure;
+            if (row.size() != (detailed ? 6 : 5) ||
+                (detailed && (!row.at(5).isObject() || (!row.at(5).toObject().isEmpty() && !ProbeFailure::read(row.at(5).toObject(),failure)))))
                 throw Error("Invalid sample");
             const qint64 t = row[0].toInteger(-1);
             int hop = row[1].toInt(-1);
             const auto responder = row[2].toString();
             const auto rtt = row[3].toDouble(-2);
-            if (t < 0 || t > maxStamp || hop < 1 || hop > 255 || !row[2].isString() ||
+            if (t < 0 || t > maxStamp || hop < (detailed ? 0 : 1) || hop > 255 || !row[2].isString() ||
                 !validText(responder, 128, true) ||
                 (!responder.isEmpty() && QHostAddress(responder).isNull()) || !std::isfinite(rtt) ||
-                !(rtt == -1 || (rtt >= 0 && rtt <= 60000)) || responder.isEmpty() != (rtt < 0) ||
+                !(rtt == -1 || (rtt == -2 && failure.kind == "local-unsent") || (rtt >= 0 && rtt <= 60000)) || responder.isEmpty() != (rtt < 0) ||
                 !row[4].isBool() || (row[4].toBool() && responder.isEmpty()))
                 throw Error("Invalid probe result");
-            samples.append({0, t, hop, responder, rtt, row[4].toBool()});
+            samples.append({0, t, hop, responder, rtt, row[4].toBool(),failure});
             latestSample = std::max(latestSample, t);
         }
         // A DNS change creates a distinct stream, so comparisons can always identify the actual endpoint.
         auto identity = traceObject(trace);
+        identity.remove("diagnostics");
         identity["address"] = ip.toString();
         const auto key = QString::fromLatin1(
             QCryptographicHash::hash(QJsonDocument(identity).toJson(QJsonDocument::Compact),
@@ -163,12 +184,20 @@ class Receiver final : public QTcpServer {
                 .toHex());
         const auto session =
             history_.receiverSession(site, key, trace.target, family, trace.intervalMs, trace.probes.protocol,
-                                     trace.probes.port, trace.probes.interfaceName);
+                                     trace.probes.port, trace.probes.interfaceName, trace.probes.payloadBytes, trace.probes.dscp, trace.probes.dontFragment);
         if (!session)
             throw Error(history_.error());
+        if (!measurement.isEmpty()) {
+            measurement["clockOffsetMs"] = offset;
+            measurement["clockErrorMs"] = uncertainty;
+            auto earliest = latestSample;
+            for (const auto &s : samples) earliest = std::min(earliest,s.timeMs);
+            if (!history_.setMeasurement(session, earliest, measurement.toVariantMap())) throw Error(history_.error());
+        }
         for (auto &sample : samples)
             sample.session = session;
-        if (!history_.append(samples) ||
+        if ((!diagnostic.isEmpty() && !history_.appendDiagnostic(session, diagnostic.toVariantMap())) ||
+            !history_.append(samples) ||
             !history_.setSessionOrigin(session, site, address, offset, uncertainty, received, latestSample))
             throw Error(history_.error());
     }
@@ -204,6 +233,24 @@ int receive(const QJsonObject &config, const QString &base) {
     History history(database);
     if (!history.open())
         throw Error(history.error());
+    if (config.contains("retention")) {
+        const auto retention=config["retention"].toObject();
+        if (!history.setRetention(integer(retention,"rawDays",0,36500),integer(retention,"summaryDays",0,36500)))
+            throw Error(history.error());
+    }
+    QThreadPool maintenancePool;
+    maintenancePool.setMaxThreadCount(1);
+    QTimer maintenance;
+    const auto maintain = [&] {
+        if (maintenancePool.activeThreadCount()) return;
+        maintenancePool.start([database] {
+            History store(database);
+            if (!store.maintainStorage(now())) log("Storage maintenance: " + store.error());
+        });
+    };
+    QObject::connect(&maintenance,&QTimer::timeout,&maintenance,maintain);
+    maintenance.start(3600000);
+    maintain();
     CollectorManagement management(database);
     Receiver server(history, management, tokens, plain, ssl);
     QHostAddress bind;
@@ -213,6 +260,17 @@ int receive(const QJsonObject &config, const QString &base) {
         throw Error("Receiver listen must be a numeric IP address or *");
     if (!server.listen(bind, port))
         throw Error(server.errorString());
+    std::unique_ptr<QTcpServer> viewer;
+    if (config.contains("viewer")) {
+        if (plain) throw Error("The remote viewer requires a TLS receiver");
+        const auto settings = config.value("viewer").toObject();
+        const auto viewerPort = integer(settings, "port", 1, 65535);
+        const auto password = readToken(filePath(base, settings, "tokenFile"));
+        const auto digest = QCryptographicHash::hash(password, QCryptographicHash::Sha256);
+        if (password.startsWith("hv1.") || tokens.values().contains(digest) || management.hasKeyDigest(digest))
+            throw Error("Choose a viewer password separate from collector credentials");
+        viewer = startReceiverViewer(viewerPort, password, database, bind, ssl);
+    }
     const auto fingerprint = ssl.localCertificate().digest(QCryptographicHash::Sha256).toHex();
     management.setCertificateFingerprint(plain ? QString{} : QString::fromLatin1(fingerprint));
     log(QString("Receiving telemetry on %1 port %2 (%3)")

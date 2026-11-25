@@ -174,6 +174,13 @@ def verify(binary, work, office_node=None, branch_node=None, viewer=None):
             deliver(body)
             return True
         until(resend, "receiver restart dropped retry")
+        # Retry an acknowledged group and compare the sample, bin and event counts below.
+        for _ in range(2):
+            with tls() as sock:
+                hello = talk(sock, {"v": 1, "type": "hello", "seq": 0, "site": "replay-test", "token": token})
+                assert hello["multiBatch"]
+                acknowledgement = talk(sock, {"v": 1, "type": "batches", "seq": 10, "bodies": [body, newer]})
+                assert acknowledgement["ack"] == 10
         assert scalar(database, "SELECT count(*) FROM samples WHERE session=? AND hop=1", (session,)) == 10
         assert scalar(database, "SELECT sum(sent) FROM bins WHERE session=? AND hop=0 AND span=10000", (session,)) == 10
         assert scalar(database, "SELECT clock_offset_ms FROM session_origin WHERE session=?", (session,)) == 91

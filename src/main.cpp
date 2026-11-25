@@ -37,7 +37,7 @@ int report(QCoreApplication &app, const QString &host, int family, int interval,
     History history(dir.filePath("report.sqlite"));
     if (!dir.isValid() || !history.open())
         return fail(history.error());
-    const auto session = history.createSession(host, family, interval, options.protocol, options.port, options.interfaceName);
+    const auto session = history.createSession(host, family, interval, options.protocol, options.port, options.interfaceName,options.payloadBytes,options.dscp,options.dontFragment);
     if (session <= 0)
         return fail(history.error());
     Probe probe;
@@ -55,11 +55,15 @@ int report(QCoreApplication &app, const QString &host, int family, int interval,
         }
         QVariantMap result{
             {"target", host}, {"family", family}, {"protocol", options.protocol}, {"port", options.destinationPort()},
-            {"interfaceName", options.interfaceName}, {"status", status}, {"rows", summary.value("rows")}};
+            {"interfaceName", options.interfaceName}, {"status", status}, {"rows", summary.value("rows")}, {"endpoint",summary.value("endpoint")}, {"measurement",summary.value("measurement")}, {"endpointFailure",summary.value("endpointFailure")},
+            {"payloadBytes",options.payloadBytes},{"dscp",options.dscp},{"dontFragment",options.dontFragment}};
         result.insert(resolved);
         QTextStream(stdout) << QJsonDocument::fromVariant(result).toJson(QJsonDocument::Indented);
         app.exit(fatalError ? 1 : 0);
     };
+    QObject::connect(&probe, &Probe::measurement, &app, [&](qint64 id,qint64 stamp,const QVariantMap &m) {
+        history.setMeasurement(id,stamp,m);
+    });
     QObject::connect(&probe, &Probe::resolved, &app, [&](qint64, QString address, QString method, int port) {
         resolved = {{"resolvedAddress", address}, {"effectiveProtocol", method}, {"effectivePort", port}};
     });
@@ -77,7 +81,7 @@ int report(QCoreApplication &app, const QString &host, int family, int interval,
             QTimer::singleShot(0, &app, finish);
         }
     });
-    QTimer::singleShot(0, &app, [&] { probe.start(session, host, family, interval, options.protocol, options.port, options.interfaceName); });
+    QTimer::singleShot(0, &app, [&] { probe.start(session, host, family, interval, options.protocol, options.port, options.interfaceName,options.payloadBytes,options.dscp,options.dontFragment); });
     QObject::connect(&probe, &Probe::finished, &app, [&](qint64) { QTimer::singleShot(0, &app, finish); });
     QTimer::singleShot(seconds * 1000, &app, [&] { probe.finish(session); });
     return app.exec();
@@ -193,6 +197,9 @@ int main(int argc, char **argv) {
          {"family", "Select auto, 4, or 6.", "family", "auto"},
          {"protocol", "Select auto, icmp, udp, or tcp.", "method", "auto"},
          {"port", "Fixed destination port for TCP (default 443) or UDP (default 33434).", "port"},
+         {"payload-bytes", "ICMP/UDP payload in bytes, excluding network and transport headers.", "bytes", "16"},
+         {"dscp", "Set the IP differentiated services code point (0–63).", "value", "0"},
+         {"dont-fragment", "Require unfragmented datagrams and record path MTU errors."},
          {"interface", "Bind probes to this outgoing network interface.", "name"},
          {"interval", "Time between probe rounds in milliseconds (250–60000).", "milliseconds", "1000"},
          {"background", "Keep recording after window close and start with the window closed."},
@@ -211,9 +218,11 @@ int main(int argc, char **argv) {
         return fail("Interval must be 250–60000 ms and duration must be 1–3600 seconds.");
     bool okPort = true;
     const int port = parser.isSet("port") ? parser.value("port").toInt(&okPort) : 0;
-    const ProbeOptions options{parser.value("protocol").toLower(), port, parser.value("interface")};
-    if (!okPort || (parser.isSet("port") && port < 1) || !options.valid())
-        return fail("Use auto, icmp, udp, or tcp. A TCP/UDP port must be between 1 and 65535.");
+    bool okSize = false, okDscp = false;
+    const ProbeOptions options{parser.value("protocol").toLower(), port, parser.value("interface"),
+        parser.value("payload-bytes").toInt(&okSize),parser.value("dscp").toInt(&okDscp),parser.isSet("dont-fragment")};
+    if (!okSize || !okDscp || !okPort || (parser.isSet("port") && port < 1) || !options.valid())
+        return fail("Check the protocol, port, payload (8–65507 bytes) and DSCP (0–63). TCP uses the system SYN size.");
     const int family = familyText.toInt();
     const auto args = parser.positionalArguments();
     if (args.size() > 1)
@@ -261,7 +270,7 @@ int main(int argc, char **argv) {
     const QString action = parser.isSet("quit") ? "quit" : parser.isSet("background") ? "background" : "show";
     const QJsonObject request{{"action", action}, {"target", args.value(0)}, {"family", family},
                               {"interval", interval}, {"protocol", options.protocol},
-                              {"port", options.port}, {"interface", options.interfaceName}};
+                              {"port", options.port}, {"interface", options.interfaceName},{"payloadBytes",options.payloadBytes},{"dscp",options.dscp},{"dontFragment",options.dontFragment}};
     if (!isolated) {
         QString error;
         const auto result = instance.acquire(file, request, error);
@@ -348,7 +357,7 @@ int main(int argc, char **argv) {
                 return;
             ProbeOptions probeOptions{r["protocol"].toString(), r["port"].toInt(), r["interface"].toString()};
             backend.startTrace(target, r["family"].toInt(), r["interval"].toInt(),
-                               probeOptions.protocol, probeOptions.port, probeOptions.interfaceName, true);
+                               probeOptions.protocol, probeOptions.port, probeOptions.interfaceName, true,r["payloadBytes"].toInt(16),r["dscp"].toInt(),r["dontFragment"].toBool());
         };
         handle(request);
         instance.handleRequests(handle);

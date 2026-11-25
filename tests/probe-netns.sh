@@ -12,11 +12,13 @@ unshare --net sleep 180 &
 router=$!
 unshare --net sleep 180 &
 dest=$!
+unshare --net sleep 180 &
+relay=$!
 labdir=$(mktemp -d)
 server=""
-trap 'kill "$router" "$dest" ${server:+"$server"} 2>/dev/null || true; wait || true; rm -rf -- "$labdir"' EXIT
+trap 'kill "$router" "$dest" "$relay" ${server:+"$server"} 2>/dev/null || true; wait || true; rm -rf -- "$labdir"' EXIT
 # The child must have entered its new namespace before the peers are installed.
-for pid in "$router" "$dest"; do
+for pid in "$router" "$dest" "$relay"; do
     for _ in {1..100}; do
         [[ $(readlink "/proc/$pid/ns/net") != $(readlink /proc/self/ns/net) ]] && break
         sleep 0.02
@@ -25,6 +27,7 @@ for pid in "$router" "$dest"; do
 done
 r() { nsenter -t "$router" -n "$@"; }
 d() { nsenter -t "$dest" -n "$@"; }
+x() { nsenter -t "$relay" -n "$@"; }
 ip link set lo up
 r ip link set lo up
 d ip link set lo up
@@ -138,11 +141,81 @@ method=icmp
 check 4 192.0.2.20 192.0.2.2 192.0.2.20
 check 6 2001:db8:1::20 2001:db8::2 2001:db8:1::20
 check 6 fe80::20 fe80::20%hl-left
+
+# One reachable destination beyond a 1280-byte bottleneck. Prove the large
+# endpoint check receives an explicit router error, then compare a smaller probe.
+d ip addr add 192.0.2.21/28 dev d-left
+r ip link set r-right mtu 1280
+trace --report 192.0.2.21 --family 4 --protocol udp --payload-bytes 1400 --dscp 46 --dont-fragment --interval 5000 --seconds 1 |
+    python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+failure = report["endpointFailure"]
+assert failure["router"] == "192.0.2.2" and failure["kind"] == "packet-too-big", report
+assert (failure["type"], failure["code"], failure["mtu"]) == (3, 4, 1280), report
+assert report["endpoint"]["sent"] == 1 and report["endpoint"]["received"] == 0, report
+print("Independent endpoint check recorded the 1280-byte bottleneck.")
+'
+trace --report 192.0.2.21 --family 4 --protocol udp --payload-bytes 64 --dscp 46 --dont-fragment --interval 5000 --seconds 1 |
+    python3 -c 'import json,sys; print("Small endpoint check passed.") if json.load(sys.stdin)["endpoint"]["received"] == 1 else sys.exit(1)'
+r ip link set r-right mtu 1500
 if trace --report 192.0.2.20 --interface hl-missing --seconds 1 >"$labdir/invalid"; then
     echo "Unknown source interface was accepted" >&2
     exit 1
 fi
 python3 -c 'import json,sys; assert "Unknown network interface" in json.load(open(sys.argv[1]))["status"]' "$labdir/invalid"
+
+# Keep the original two-hop path up and prepare a parallel three-hop path.
+# Only a single route on the first router changes during the measurement.
+r ip link add r-alt type veth peer name x-west netns "$relay"
+x ip link add x-east type veth peer name d-alt netns "$dest"
+x ip link set lo up
+r ip link set r-alt up
+x ip link set x-west up
+x ip link set x-east up
+d ip link set d-alt up
+r ip addr add 198.18.0.1/30 dev r-alt
+x ip addr add 198.18.0.2/30 dev x-west
+x ip addr add 198.18.0.5/30 dev x-east
+d ip addr add 198.18.0.6/30 dev d-alt
+x sysctl -qw net.ipv4.ip_forward=1
+x ip route add 192.0.2.20/32 via 198.18.0.6
+x ip route add 192.0.2.0/30 via 198.18.0.1
+ip route add 198.18.0.0/30 via 192.0.2.2
+# The destination continues to reply over the short return path.
+d sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.d-alt.rp_filter=0
+r sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.r-right.rp_filter=0
+r ping -n -c1 -W2 198.18.0.2 >/dev/null
+x ping -n -c1 -W2 198.18.0.6 >/dev/null
+
+echoes() { d nstat -azs IcmpInEchos | awk '$1=="IcmpInEchos" {print $2}'; }
+before=$(echoes)
+trace --report 192.0.2.20 --family 4 --protocol icmp --interval 250 --seconds 5 >"$labdir/growth.json" &
+capture=$!
+# Wait for several completed short rounds so the probe engine has learned TTL 2.
+for _ in {1..100}; do
+    (( $(echoes) >= before + 12 )) && break
+    sleep 0.04
+done
+(( $(echoes) >= before + 12 ))
+r ip route replace 192.0.2.20/32 via 198.18.0.2
+wait "$capture"
+python3 - "$labdir/growth.json" <<'GROWTH'
+import json, sys
+with open(sys.argv[1]) as source:
+    report = json.load(source)
+endpoint = report["endpoint"]
+assert len(report["rows"]) == 3, report
+first, changed, extended = report["rows"]
+assert first["address"] == "192.0.2.2", report
+assert changed["hop"] == 2 and changed["firstAddress"] == "192.0.2.20", report
+assert changed["routeChanged"] and changed["address"] == "198.18.0.2", report
+assert extended["hop"] == 3 and extended["destination"] and extended["address"] == "192.0.2.20", report
+assert 0 < extended["sent"] < first["sent"], report
+assert endpoint["loss"] == 0 and endpoint["received"] == endpoint["sent"] == first["sent"], report
+print(f"Live path grew from two to three hops with {endpoint['received']}/{endpoint['sent']} endpoint replies.")
+GROWTH
+r ip route del 192.0.2.20/32
 
 # A one-second capture still records a timeout when its reply deadline is later.
 d sysctl -qw net.ipv4.icmp_echo_ignore_all=1

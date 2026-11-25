@@ -4,15 +4,19 @@
 #include "sqlhelpers.h"
 
 #include <QDateTime>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QMap>
 #include <QSet>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <map>
+#include <set>
 #include <sqlite3.h>
 #include <stdexcept>
 #include <tuple>
@@ -71,6 +75,7 @@ struct Stats {
 
     static Stats sample(qint64 t, double r, const QString &addr, bool dest) {
         Stats s;
+        if (r == -2) return s; // Failed locally, never sent.
         s.sent = 1;
         s.firstMs = s.lastMs = t;
         s.firstAddress = s.address = addr;
@@ -95,11 +100,48 @@ CREATE TABLE IF NOT EXISTS session_probe(
 CREATE TABLE IF NOT EXISTS session_origin(
  session INTEGER PRIMARY KEY REFERENCES sessions(id),location TEXT NOT NULL,resolved_address TEXT NOT NULL,
  clock_offset_ms INTEGER NOT NULL,clock_error_ms INTEGER NOT NULL,received_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS probe_profiles(
+ session INTEGER PRIMARY KEY REFERENCES sessions(id),payload_bytes INTEGER NOT NULL,dscp INTEGER NOT NULL,df INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS measurement_epochs(
+ session INTEGER NOT NULL REFERENCES sessions(id), t INTEGER NOT NULL, data TEXT NOT NULL,
+ PRIMARY KEY(session,t)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS probe_failures(
+ session INTEGER NOT NULL REFERENCES sessions(id),hop INTEGER NOT NULL,t INTEGER NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(session,hop,t)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receiver_streams(
  location TEXT NOT NULL,stream TEXT NOT NULL,session INTEGER NOT NULL UNIQUE REFERENCES sessions(id),
  PRIMARY KEY(location,stream)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS imported_sessions(
  session INTEGER PRIMARY KEY REFERENCES sessions(id), correction_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS route_index(
+ session INTEGER PRIMARY KEY REFERENCES sessions(id),cursor INTEGER NOT NULL,state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS route_checkpoints(
+ session INTEGER NOT NULL REFERENCES sessions(id),hour INTEGER NOT NULL,t INTEGER NOT NULL,state TEXT NOT NULL,
+ PRIMARY KEY(session,hour)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS route_transitions(
+ session INTEGER NOT NULL REFERENCES sessions(id),t INTEGER NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(session,t)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS route_gaps(
+ session INTEGER NOT NULL REFERENCES sessions(id),t INTEGER NOT NULL,previous_ms INTEGER NOT NULL,
+ PRIMARY KEY(session,t)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS inventory_lengths(family INTEGER NOT NULL,bits INTEGER NOT NULL,
+ PRIMARY KEY(family,bits)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS network_origins(
+ family INTEGER NOT NULL,bits INTEGER NOT NULL,prefix TEXT NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(family,bits,prefix)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS network_inventory(
+ family INTEGER NOT NULL,bits INTEGER NOT NULL,prefix TEXT NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(family,bits,prefix)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS captured_identity(
+ session INTEGER NOT NULL REFERENCES sessions(id),address TEXT NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(session,address)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS retention(id INTEGER PRIMARY KEY,raw_days INTEGER,summary_days INTEGER,raw_before INTEGER,summary_before INTEGER);
+INSERT OR IGNORE INTO retention VALUES(1,0,0,0,0);
+CREATE TABLE IF NOT EXISTS retention_pins(session INTEGER REFERENCES sessions(id),start_ms INTEGER,end_ms INTEGER,PRIMARY KEY(session,start_ms,end_ms)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS storage_growth(t INTEGER PRIMARY KEY,bytes INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS named_baselines(
+ session INTEGER NOT NULL REFERENCES sessions(id),name TEXT NOT NULL,from_ms INTEGER NOT NULL,
+ through_ms INTEGER NOT NULL,p95 REAL NOT NULL,active INTEGER NOT NULL,PRIMARY KEY(session,name)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS comparison_groups(name TEXT PRIMARY KEY, view_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS comparison_members(
  name TEXT NOT NULL REFERENCES comparison_groups(name) ON DELETE CASCADE,
@@ -155,7 +197,26 @@ constexpr char rawSql[] = "SELECT t,rtt,address,dest FROM samples WHERE session=
                           "AND hop=?2 AND t>=?3 AND t<=?4 ORDER BY t";
 
 struct Reader {
-    explicit Reader(sqlite3 *db) : bins(db, binsSql), raw(db, rawSql) {}
+    explicit Reader(sqlite3 *db) : bins(db, binsSql), raw(db, rawSql) {
+        Statement cut(db,"SELECT raw_before FROM retention WHERE id=1");
+        if (cut.next()) rawBefore = cut.integer(0);
+        if (rawBefore) {
+            archived.emplace(db,"SELECT sent,received,first_ms,last_ms,lo,hi,total,first_rtt,last_rtt,current,delta,address,"
+                             "dest,first_address,route_changed,t FROM bins WHERE session=?1 AND hop=?2 AND span=10000 "
+                             "AND t BETWEEN ?3 AND ?4 AND session NOT IN (SELECT session FROM imported_sessions) "
+                             "AND NOT EXISTS(SELECT 1 FROM retention_pins p WHERE p.session=?1 AND bins.t BETWEEN p.start_ms AND p.end_ms) ORDER BY t");
+        }
+    }
+    std::optional<Statement> archived;
+    qint64 rawBefore = 0;
+
+    // Sub-bin windows plot a retained 10-second aggregate at its midpoint.
+    template<class Visit> void summaries(qint64 id,int hop,qint64 from,qint64 to,Visit visit) {
+        if (!archived || from >= rawBefore) return;
+        archived->reset(); archived->integer(1,id); archived->integer(2,hop);
+        archived->integer(3,from-5000); archived->integer(4,std::min(to-5000,rawBefore-10000));
+        while (archived->next()) visit(archived->integer(15)+5000,readBin(*archived));
+    }
     Statement bins, raw;
 
     // Each requested range is exactly covered by whole rollups and the raw
@@ -164,6 +225,7 @@ struct Reader {
         if (from > to)
             return;
         if (level < 0) {
+            summaries(session,hop,from,to,[&](qint64,const Stats &s){ out.add(s); });
             raw.reset();
             raw.integer(1, session);
             raw.integer(2, hop);
@@ -193,6 +255,78 @@ struct Reader {
         range(out, session, hop, last, to, level - 1);
     }
 };
+
+// Compare both halves of the focus to the immediately preceding equal-length
+// period. These are patterns across observed TTLs, never a link attribution.
+QVariantMap destinationImpact(Reader &reader, qint64 session, qint64 from, qint64 through,
+                              const QVariantList &rows) {
+    const qint64 mid = from + (through - from) / 2;
+    const qint64 before = std::max(0LL, from - (through - from + 1));
+    auto halves = [&](int hop) {
+        std::array<Stats, 3> s;
+        reader.range(s[0], session, hop, before, from - 1);
+        reader.range(s[1], session, hop, from, mid);
+        reader.range(s[2], session, hop, mid + 1, through);
+        return s;
+    };
+    const auto dst = halves(0);
+    const auto rcv = dst[1].received + dst[2].received, sent = dst[1].sent + dst[2].sent;
+    const auto hasLoss = [](const auto &s) {
+        return s[1].sent >= 3 && s[2].sent >= 3 && s[1].sent > s[1].received && s[2].sent > s[2].received;
+    };
+    const auto slower = [](const auto &s) {
+        if (s[0].received < 3 || s[1].received < 3 || s[2].received < 3 ||
+            s[0].routeChanged || s[1].routeChanged || s[2].routeChanged ||
+            s[0].address != s[1].address || s[1].address != s[2].address) return false;
+        const double limit = s[0].average() + std::max(10., 0.2 * s[0].average());
+        return s[1].average() >= limit && s[2].average() >= limit;
+    };
+    const bool loss = hasLoss(dst), delay = slower(dst);
+    QVariantMap result{{"sent", sent}, {"received", rcv}, {"state", "inconclusive"}};
+    QString reason;
+    if (!sent) reason = "No destination samples in focus.";
+    else if (!rcv) reason = "No destination replies. Reachability and the point of failure are uncertain.";
+    else if (loss || delay) {
+        result["state"] = "affected";
+        reason = loss && delay ? "Sustained destination loss and latency increase."
+                   : loss ? "Repeated destination reply loss." : "Sustained destination latency increase.";
+        int lastDestination = 0, destinations = 0;
+        for (const auto &entry : rows) {
+            const auto row = entry.toMap();
+            if (row["destination"].toBool()) { lastDestination = row["hop"].toInt(); ++destinations; }
+        }
+        int earliest = 0;
+        if (destinations == 1) {
+            int expected = lastDestination;
+            bool sameLoss = loss, sameDelay = delay;
+            for (auto it = rows.crbegin(); it != rows.crend(); ++it) {
+                const auto row = it->toMap();
+                const int hop = row["hop"].toInt();
+                if (hop > lastDestination) continue;
+                if (hop != expected-- || row["routeChanged"].toBool()) break;
+                const auto s = halves(hop);
+                sameLoss = sameLoss && hasLoss(s);
+                sameDelay = sameDelay && slower(s);
+                if (!sameLoss && !sameDelay) break;
+                if (!s[1].received || !s[2].received) break;
+                earliest = hop;
+            }
+        }
+        if (earliest && earliest < lastDestination)
+            reason += QString(" Downstream pattern from hop %1.").arg(earliest);
+        else reason += " Starting hop inconclusive.";
+        result["earliestHop"] = earliest && earliest < lastDestination ? earliest : 0;
+    } else if (sent == rcv) {
+        result["state"] = "answered";
+        const auto isolated = std::any_of(rows.begin(), rows.end(), [](const QVariant &v) {
+            return v.toMap()["loss"].toDouble() > 0;
+        });
+        reason = isolated ? "Intermediate reply loss. Every destination round had a reply."
+                          : "Every destination round had a reply.";
+    } else reason = "Some destination probes timed out. Persistence is inconclusive.";
+    result["description"] = reason;
+    return result;
+}
 
 void saveBin(Statement &q, qint64 session, int hop, qint64 span, qint64 start, const Stats &s) {
     q.reset();
@@ -260,8 +394,8 @@ void upgradeRollups(sqlite3 *db) {
         flush(i);
 }
 qint64 insertSession(sqlite3 *db, const QString &target, int family, int intervalMs,
-                     const QString &protocol, int port, const QString &interfaceName) {
-    const ProbeOptions options{protocol, port, interfaceName};
+                     const QString &protocol, int port, const QString &interfaceName, int payloadBytes, int dscp, bool dontFragment) {
+    const ProbeOptions options{protocol, port, interfaceName, payloadBytes, dscp, dontFragment};
     if (!options.valid()) throw std::runtime_error("Invalid probe protocol or destination port");
     Statement q(db, "INSERT INTO sessions(target,family,interval_ms,created_ms) VALUES(?,?,?,?)");
     q.string(1, target);
@@ -276,6 +410,9 @@ qint64 insertSession(sqlite3 *db, const QString &target, int family, int interva
     probe.integer(3, options.destinationPort());
     probe.string(4, interfaceName);
     probe.next();
+    Statement profile(db,"INSERT INTO probe_profiles VALUES(?,?,?,?)");
+    profile.integer(1,id); profile.integer(2,payloadBytes); profile.integer(3,dscp); profile.integer(4,dontFragment);
+    profile.next();
     return id;
 }
 } // namespace
@@ -288,6 +425,18 @@ History::~History() {
 }
 QString History::error() const {
     return error_;
+}
+
+bool History::openReadOnly() {
+    if (db_) return sqlite3_db_readonly(db_, "main") == 1;
+    if (sqlite3_open_v2(QFile::encodeName(path_).constData(), &db_, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
+        sqlite3_busy_timeout(db_, 3000);
+        return true;
+    }
+    error_ = QString::fromUtf8(sqlite3_errmsg(db_));
+    sqlite3_close(db_);
+    db_ = nullptr;
+    return false;
 }
 
 bool History::open() {
@@ -322,13 +471,13 @@ bool History::open() {
 }
 
 qint64 History::createSession(QString target, int family, int intervalMs, QString protocol, int port,
-                              QString interfaceName) {
+                              QString interfaceName, int payloadBytes, int dscp, bool dontFragment) {
     if (!open())
         return 0;
     error_.clear();
     try {
         Transaction tx(db_, true);
-        const auto id = insertSession(db_, target, family, intervalMs, protocol, port, interfaceName);
+        const auto id = insertSession(db_, target, family, intervalMs, protocol, port, interfaceName, payloadBytes, dscp, dontFragment);
         tx.commit();
         return id;
     } catch (const std::exception &e) {
@@ -339,7 +488,7 @@ qint64 History::createSession(QString target, int family, int intervalMs, QStrin
 
 qint64 History::receiverSession(const QString &location, const QString &stream, const QString &target,
                                 int family, int intervalMs, const QString &protocol, int port,
-                                const QString &interfaceName) {
+                                const QString &interfaceName, int payloadBytes, int dscp, bool dontFragment) {
     if (!open()) return 0;
     error_.clear();
     try {
@@ -352,7 +501,7 @@ qint64 History::receiverSession(const QString &location, const QString &stream, 
             tx.commit();
             return id;
         }
-        const auto id = insertSession(db_, target, family, intervalMs, protocol, port, interfaceName);
+        const auto id = insertSession(db_, target, family, intervalMs, protocol, port, interfaceName, payloadBytes, dscp, dontFragment);
         Statement bind(db_, "INSERT INTO receiver_streams(location,stream,session) VALUES(?,?,?)");
         bind.string(1, location);
         bind.string(2, stream);
@@ -394,6 +543,20 @@ bool History::setSessionOrigin(qint64 id, const QString &location, const QString
         bind.integer(6, lastReceivedMs);
         bind.next();
         tx.commit();
+        return true;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return false;
+    }
+}
+
+bool History::setMeasurement(qint64 id, qint64 stamp, const QVariantMap &settings) {
+    if (!open()) return false;
+    try {
+        const auto json = QString::fromUtf8(QJsonDocument(QJsonObject::fromVariantMap(settings)).toJson(QJsonDocument::Compact));
+        Statement q(db_, "INSERT OR REPLACE INTO measurement_epochs(session,t,data) SELECT ?1,?2,?3 WHERE "
+                         "coalesce((SELECT data FROM measurement_epochs WHERE session=?1 AND t<=?2 ORDER BY t DESC LIMIT 1),'')<>?3");
+        q.integer(1, id); q.integer(2, stamp); q.string(3, json); q.next();
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
@@ -459,7 +622,7 @@ bool History::addNote(qint64 id, qint64 timeMs, QString text) {
     }
 }
 
-QVariantList History::sessions(bool remoteOnly) {
+QVariantList History::sessions(bool remoteOnly, qint64 onlyId) {
     QVariantList list;
     if (!open())
         return list;
@@ -469,24 +632,31 @@ QVariantList History::sessions(bool remoteOnly) {
                          "coalesce(last_ms,created_ms),closed_tabs.session IS NOT NULL,"
                          "coalesce(p.protocol,'auto'),coalesce(p.port,33434),coalesce(p.interface_name,''),"
                          "coalesce(o.location,r.location,''),coalesce(o.resolved_address,''),coalesce(o.clock_offset_ms,0),"
-                         "coalesce(o.clock_error_ms,-1),coalesce(o.received_ms,0),r.session IS NOT NULL, i.session IS NOT NULL, coalesce(i.correction_ms,0) "
+                         "coalesce(o.clock_error_ms,-1),coalesce(o.received_ms,0),r.session IS NOT NULL, i.session IS NOT NULL, coalesce(i.correction_ms,0), "
+                         "(SELECT data FROM measurement_epochs WHERE session=sessions.id ORDER BY t DESC LIMIT 1),coalesce(profile.payload_bytes,16),coalesce(profile.dscp,0),coalesce(profile.df,0) "
                          "FROM sessions LEFT JOIN session_probe p ON p.session=sessions.id "
                          "LEFT JOIN imported_sessions i ON i.session=sessions.id "
-                         "LEFT JOIN receiver_streams r ON r.session=sessions.id "
+                         "LEFT JOIN receiver_streams r ON r.session=sessions.id LEFT JOIN probe_profiles profile ON profile.session=sessions.id "
                          "LEFT JOIN session_origin o ON o.session=sessions.id "
                          "LEFT JOIN closed_tabs ON closed_tabs.session=sessions.id ";
         if (remoteOnly) query += "WHERE r.session IS NOT NULL ";
+        if (onlyId) query += remoteOnly ? "AND sessions.id=? " : "WHERE sessions.id=? ";
         query += "ORDER BY id DESC";
         Statement q(db_, query.constData());
-        while (q.next())
-            list << QVariantMap{{"id", q.integer(0)},      {"target", q.string(1)},
+        if (onlyId) q.integer(1, onlyId);
+        while (q.next()) {
+            auto info = QVariantMap{{"id", q.integer(0)},      {"target", q.string(1)},
                                 {"family", q.integer(2)},  {"intervalMs", q.integer(3)},
                                 {"startMs", q.integer(4)}, {"endMs", q.integer(5)}, {"closed", bool(q.integer(6))},
                                 {"protocol", q.string(7)}, {"port", q.integer(8)}, {"interfaceName", q.string(9)},
                                 {"location", q.string(10)}, {"resolvedAddress", q.string(11)}, {"clockOffsetMs", q.integer(12)},
                                 {"clockErrorMs", q.integer(13)}, {"lastReceivedMs", q.integer(14)},
                                 {"remote", !q.string(10).isEmpty()}, {"remoteLive", bool(q.integer(15))},
-                                {"imported", bool(q.integer(16))}, {"manualCorrectionMs", q.integer(17)}};
+                                {"imported", bool(q.integer(16))}, {"manualCorrectionMs", q.integer(17)}, {"payloadBytes", q.integer(19)}, {"dscp", q.integer(20)}, {"dontFragment", bool(q.integer(21))}};
+            const auto latest = QJsonDocument::fromJson(q.string(18).toUtf8()).object().toVariantMap();
+            for (auto it = latest.cbegin(); it != latest.cend(); ++it) info[it.key()] = it.value();
+            list << info;
+        }
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
         list.clear();
@@ -504,11 +674,13 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
     try {
         Transaction tx(db_, true);
         Statement insert(db_, "INSERT INTO samples VALUES(?,?,?,?,?,?) ON CONFLICT(session,hop,t) DO NOTHING");
+        Statement failure(db_, "INSERT INTO probe_failures VALUES(?,?,?,?)");
         Statement setDestination(
             db_,
             "INSERT INTO samples VALUES(?,0,?,?,?,0) ON CONFLICT(session,hop,t) "
-            "DO UPDATE SET rtt=excluded.rtt,address=excluded.address WHERE samples.rtt<0 AND excluded.rtt>=0");
+            "DO UPDATE SET rtt=excluded.rtt,address=excluded.address WHERE samples.dest=0 AND samples.rtt<0 AND excluded.rtt>=0");
         std::map<std::pair<qint64, qint64>, Stats> rounds;
+        std::set<std::pair<qint64, qint64>> measuredRounds;
         using Key = std::tuple<qint64, int, qint64, qint64>; // session, hop, span, bucket start
         std::map<Key, Stats> changed;
         std::map<std::pair<qint64, int>, std::pair<qint64, qint64>> bounds;
@@ -517,8 +689,16 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
         for (const auto &s : samples)
             ordered.push_back(&s);
         std::stable_sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->timeMs < b->timeMs; });
+        Statement watermark(db_,"SELECT raw_before FROM retention WHERE id=1");
+        watermark.next();
+        const auto expiredBefore = watermark.integer(0);
+        Statement preserved(db_,"SELECT 1 FROM retention_pins WHERE session=? AND ? BETWEEN start_ms AND end_ms");
         for (const auto *s : ordered) {
-            if (s->timeMs < 0 || s->timeMs > timeLimit || s->hop < 1 || s->hop > 255 ||
+            if (s->timeMs < expiredBefore) {
+                preserved.reset(); preserved.integer(1,s->session); preserved.integer(2,s->timeMs);
+                if (!preserved.next()) continue;
+            }
+            if (s->timeMs < 0 || s->timeMs > timeLimit || s->hop < 0 || s->hop > 255 ||
                 !std::isfinite(s->rttMs))
                 throw std::runtime_error("Invalid probe sample");
             insert.reset();
@@ -527,19 +707,31 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
             insert.integer(3, s->timeMs);
             insert.number(4, s->rttMs);
             insert.string(5, s->address);
-            insert.integer(6, s->destination);
+            insert.integer(6, s->hop == 0 ? 2 : int(s->destination));
             insert.next();
             if (!sqlite3_changes(db_))
                 continue;
+            if (!s->failure.kind.isEmpty()) {
+                failure.reset();
+                failure.integer(1, s->session); failure.integer(2, s->hop); failure.integer(3, s->timeMs);
+                failure.string(4, QString::fromUtf8(QJsonDocument(s->failure.json()).toJson(QJsonDocument::Compact)));
+                failure.next();
+            }
             const Stats one = Stats::sample(s->timeMs, s->rttMs, s->address, s->destination);
-            // The prober timestamps all TTLs in a round together. Hop zero
-            // records exactly one outcome for the target, across all route lengths.
-            auto &round = rounds[{s->session, s->timeMs}];
-            if (!round.sent || s->destination)
+            const auto roundKey = std::pair{s->session, s->timeMs};
+            auto &round = rounds[roundKey];
+            if (s->hop == 0) {
+                // The normal-TTL endpoint probe alone determines this round's loss.
+                measuredRounds.insert(roundKey);
+                round = one;
+            } else if (!measuredRounds.contains(roundKey) && (!round.sent || s->destination)) {
+                // Older recordings contain only TTL sweeps. Keep their original semantics.
                 round = Stats::sample(s->timeMs, s->destination ? s->rttMs : -1,
                                       s->destination ? s->address : QString(), false);
+            }
             for (const auto span : spans)
                 changed[{s->session, s->hop, span, s->timeMs / span * span}].add(one);
+            if (s->hop == 0) continue;
             auto [it, added] = bounds.try_emplace({s->session, s->hop}, s->timeMs, s->timeMs);
             if (!added)
                 it->second.second = s->timeMs;
@@ -548,6 +740,7 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
         QList<qint64> eventIds;
         for (const auto &[key, outcome] : rounds) {
             const auto [id, time] = key;
+            if (measuredRounds.contains(key)) continue;
             setDestination.reset();
             setDestination.integer(1, id);
             setDestination.integer(2, time);
@@ -565,7 +758,7 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
                 ++end;
             if (auto rule = loadAlertState(id)) {
                 for (; it != end; ++it)
-                    evaluateDestination(*rule, it->first.second, it->second.current, eventIds);
+                    if (it->second.sent) evaluateDestination(*rule, it->first.second, it->second.current, eventIds);
                 saveAlertState(*rule);
             }
             it = end;
@@ -594,7 +787,7 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
             } else {
                 all.add(delta);
             }
-            saveBin(put, id, hop, span, t, all);
+            if (all.sent) saveBin(put, id, hop, span, t, all);
         }
 
         Statement hop(db_, "INSERT INTO hops VALUES(?,?,?,?) ON CONFLICT(session,hop) DO UPDATE SET "
@@ -614,12 +807,79 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
             session.integer(3, key.first);
             session.next();
         }
+        QMap<qint64,qint64> earliestNew;
+        for (const auto &[key, edge] : bounds)
+            earliestNew[key.first] = std::min(earliestNew.value(key.first, edge.first), edge.first);
+        for (auto it = earliestNew.cbegin(); it != earliestNew.cend(); ++it)
+            updateRouteIndex(it.key(), it.value());
         tx.commit();
         if (newEvents) *newEvents = std::move(eventIds);
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
         return false;
+    }
+}
+
+QVariantMap History::retainedDestination(qint64 id, qint64 from, qint64 through) {
+    Reader reader(db_);
+    Stats stats;
+    reader.range(stats, id, 0, from, through);
+    return {{"sent",stats.sent}, {"received",stats.received}, {"loss",stats.sent ? stats.loss() : -1.},
+            {"p95",-1.}, {"resolution", retainedResolution(id,from,through)}};
+}
+
+QVariantMap History::focusedMeasurement(qint64 id, qint64 from, qint64 through) {
+    if (!open()) return {};
+    try {
+        Statement q(db_, "SELECT t,data FROM measurement_epochs WHERE session=?1 AND t BETWEEN "
+                         "coalesce((SELECT max(t) FROM measurement_epochs WHERE session=?1 AND t<=?2),?2) AND ?3 ORDER BY t");
+        q.integer(1, id);
+        q.integer(2, from);
+        q.integer(3, through);
+        QVariantMap focused;
+        bool mixed = false, unknownClock = false;
+        QStringList flowModes;
+        qint64 firstEpoch = -1, low = std::numeric_limits<qint64>::max(), high = std::numeric_limits<qint64>::min();
+        while (q.next()) {
+            auto next = QJsonDocument::fromJson(q.string(1).toUtf8()).object().toVariantMap();
+            const auto flow = next["flowMode"].toString();
+            if (!flow.isEmpty() && !flowModes.contains(flow)) flowModes.append(flow);
+            const auto stamp = q.integer(0);
+            if (firstEpoch < 0) firstEpoch = stamp;
+            else if (!mixed) {
+                for (const auto &key : {"resolvedAddress", "effectiveProtocol", "effectivePort",
+                                        "effectiveInterface", "flowMode", "sourceAddress"})
+                    mixed |= next.value(key) != focused.value(key);
+            }
+            const auto uncertainty = next.value("clockErrorMs", -1).toLongLong();
+            const auto offset = next.value("clockOffsetMs").toLongLong();
+            unknownClock |= uncertainty < 0;
+            if (uncertainty >= 0) {
+                low = std::min(low, offset - uncertainty);
+                high = std::max(high, offset + uncertainty);
+            }
+            focused = std::move(next);
+            focused["t"] = stamp;
+        }
+        if (focused.isEmpty()) return {};
+        bool partial = false;
+        if (firstEpoch > from) {
+            Statement unknown(db_, "SELECT 1 FROM samples WHERE session=? AND hop=0 AND t>=? AND t<? LIMIT 1");
+            unknown.integer(1,id);
+            unknown.integer(2,from);
+            unknown.integer(3,firstEpoch);
+            partial = unknown.next();
+        }
+        const auto offset = focused.value("clockOffsetMs").toLongLong();
+        focused["flowModes"] = flowModes;
+        focused["partial"] = partial;
+        focused["mixed"] = mixed;
+        focused["clockErrorMs"] = partial || unknownClock ? -1 : std::max(high-offset,offset-low);
+        return focused;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return {};
     }
 }
 
@@ -641,7 +901,14 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
     focusEnd = std::clamp(focusEnd, focusStart, timeLimit);
     try {
         Transaction tx(db_, false);
+        result["resolution"] = retainedResolution(id,start,end);
+        result["measurement"] = focusedMeasurement(id, focusStart, focusEnd);
         Reader reader(db_);
+        Statement labels(db_, "SELECT EXISTS(SELECT 1 FROM inventory_lengths) OR "
+                              "EXISTS(SELECT 1 FROM captured_identity WHERE session=?)");
+        labels.integer(1,id);
+        const bool hasLabels = !timelinesOnly && labels.next() && labels.integer(0);
+        Statement lastFailure(db_, "SELECT data FROM probe_failures WHERE session=? AND hop=? AND t BETWEEN ? AND ? ORDER BY t DESC LIMIT 1");
         Statement hops(db_, "SELECT hop FROM hops WHERE session=? AND first_ms<=? AND last_ms>=? ORDER BY hop");
         hops.integer(1, id);
         hops.integer(2, focusEnd);
@@ -652,14 +919,17 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
             const int hop = hops.integer(0);
             Stats s;
             reader.range(s, id, hop, focusStart, focusEnd);
-            if (!s.sent)
-                continue;
+            lastFailure.reset();
+            lastFailure.integer(1,id); lastFailure.integer(2,hop);
+            lastFailure.integer(3,focusStart); lastFailure.integer(4,focusEnd);
+            const auto failure = lastFailure.next() ? QJsonDocument::fromJson(lastFailure.string(0).toUtf8()).object().toVariantMap() : QVariantMap{};
+            if (!s.sent && failure.isEmpty()) continue;
             rows << QVariantMap{{"hop", hop},
                                 {"address", s.address},
-                                {"firstAddress", s.firstAddress},
+                                {"firstAddress", s.firstAddress}, {"identity", hasLabels ? networkIdentity(id,s.address) : QVariantMap{}},
                                 {"routeChanged", s.routeChanged},
                                 {"sent", s.sent},
-                                {"loss", s.loss()},
+                                {"loss", s.sent ? s.loss() : -1.}, {"lastFailure", failure},
                                 {"min", s.low},
                                 {"avg", s.average()},
                                 {"max", s.high},
@@ -668,6 +938,16 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
                                 {"destination", s.destination}};
         }
 
+        if (!timelinesOnly) result["impact"] = destinationImpact(reader, id, focusStart, focusEnd, rows);
+
+        lastFailure.reset();
+        lastFailure.integer(1,id); lastFailure.integer(2,0);
+        lastFailure.integer(3,focusStart); lastFailure.integer(4,focusEnd);
+        if (lastFailure.next()) result["endpointFailure"] = QJsonDocument::fromJson(lastFailure.string(0).toUtf8()).object().toVariantMap();
+        Stats endpoint;
+        reader.range(endpoint,id,0,focusStart,focusEnd);
+        result["endpoint"] = QVariantMap{{"sent",endpoint.sent},{"received",endpoint.received},
+            {"loss",endpoint.sent ? endpoint.loss() : -1.},{"avg",endpoint.average()}};
         int destinationHop = 0;
         if (selected.contains(0)) {
             Statement dest(
@@ -691,13 +971,16 @@ QVariantMap History::view(qint64 id, qint64 start, qint64 end, qint64 focusStart
         const qint64 duration = end - start + 1;
         const int count = static_cast<int>(std::min<qint64>(pixels, duration));
         for (const auto hop : selected) {
-            if (hop < 0 || (hop == 0 && destinationHop <= 0) || seen.contains(hop))
+            if (hop < 0 || seen.contains(hop))
                 continue;
             seen.insert(hop);
             QVector<Stats> points(count);
             if (duration <= qint64(count) * 1000) {
                 // Live views often have only a few hundred probes. One index
                 // scan is cheaper than a separate database query for each empty pixel.
+                reader.summaries(id,hop,start,end,[&](qint64 t,const Stats &s) {
+                    points[(t-start)*count/duration].add(s);
+                });
                 auto &raw = reader.raw;
                 raw.reset();
                 raw.integer(1, id);
@@ -767,8 +1050,9 @@ bool History::routePage(qint64 session, RouteEvents &detector, qint64 &cursor, q
         return false;
     error_.clear();
     try {
-        Transaction tx(db_, false);
-        if (cursor < 0) {
+        std::optional<Transaction> tx;
+        if (sqlite3_get_autocommit(db_)) tx.emplace(db_, false);
+        if (cursor < 0 && until <= 0) {
             Statement end(db_, "SELECT max(t) FROM samples WHERE session=? AND hop=0");
             end.integer(1, session);
             end.next();
@@ -822,7 +1106,7 @@ bool History::routePage(qint64 session, RouteEvents &detector, qint64 &cursor, q
             cursor = end;
             more = end < until && rounds.size() == pageSize;
         }
-        tx.commit();
+        if (tx) tx->commit();
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());

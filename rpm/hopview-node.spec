@@ -5,7 +5,7 @@ Summary:        Headless IPv4 and IPv6 path telemetry collector and receiver
 License:        MIT
 Source0:        %{name}-%{version}.tar.gz
 
-BuildRequires:  gcc-c++, make, qt6-qtbase-devel, sqlite-devel, pkgconf-pkg-config
+BuildRequires:  gcc-c++, make, qt6-qtbase-devel, libcurl-devel, sqlite-devel, pkgconf-pkg-config
 BuildRequires:  systemd-rpm-macros
 Requires(pre):  shadow-utils
 Requires(post): systemd

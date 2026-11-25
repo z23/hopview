@@ -4,6 +4,7 @@
 #include <QDateTime>
 #include <QHostAddress>
 #include <QHostInfo>
+#include <linux/rtnetlink.h>
 #include <QSocketNotifier>
 #include <QTimer>
 
@@ -93,6 +94,79 @@ QHostAddress hostOf(const sockaddr *sa, quint32 scope = 0) {
     return host;
 }
 
+// Ask the routing table which output device and source address match these selectors.
+// A source address alone can belong to a different device than the egress route.
+struct RouteSelection {
+    QString device, source;
+};
+RouteSelection routedSource(const Endpoint &endpoint, const QString &method, const ProbeOptions &options) {
+    RouteSelection result{options.interfaceName, {}};
+    const int fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+    if (fd < 0) return result;
+    struct Request {
+        nlmsghdr header;
+        rtmsg route;
+        std::array<char, 128> attrs;
+    } request{};
+    const bool v6 = endpoint.family() == AF_INET6;
+    request.header.nlmsg_type = RTM_GETROUTE;
+    request.header.nlmsg_flags = NLM_F_REQUEST;
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
+    request.route.rtm_family = endpoint.family();
+    request.route.rtm_dst_len = v6 ? 128 : 32;
+    request.route.rtm_tos = options.dscp << 2;
+    auto add = [&](int type, const void *value, size_t length) {
+        auto *at = reinterpret_cast<char *>(&request) + NLMSG_ALIGN(request.header.nlmsg_len);
+        auto *attr = reinterpret_cast<rtattr *>(at);
+        attr->rta_type = type;
+        attr->rta_len = RTA_LENGTH(length);
+        std::memcpy(RTA_DATA(attr), value, length);
+        request.header.nlmsg_len = NLMSG_ALIGN(request.header.nlmsg_len) + RTA_ALIGN(attr->rta_len);
+    };
+    const auto &ip4 = reinterpret_cast<const sockaddr_in &>(endpoint.storage);
+    const auto &ip6 = reinterpret_cast<const sockaddr_in6 &>(endpoint.storage);
+    if (v6) add(RTA_DST, &ip6.sin6_addr, sizeof(ip6.sin6_addr));
+    else add(RTA_DST, &ip4.sin_addr, sizeof(ip4.sin_addr));
+    unsigned device = options.interfaceName.isEmpty() ? (v6 ? ip6.sin6_scope_id : 0)
+        : if_nametoindex(options.interfaceName.toLocal8Bit().constData());
+    if (device) add(RTA_OIF,&device,sizeof(device));
+    const quint8 protocol = method == "udp" ? int(IPPROTO_UDP) : method == "tcp" ? int(IPPROTO_TCP)
+                              : v6 ? int(IPPROTO_ICMPV6) : int(IPPROTO_ICMP);
+    add(RTA_IP_PROTO,&protocol,sizeof(protocol));
+    if (method != "icmp") {
+        const auto port = htons(endpoint.port());
+        add(RTA_DPORT,&port,sizeof(port));
+    }
+    sockaddr_nl kernel{};
+    kernel.nl_family = AF_NETLINK;
+    alignas(nlmsghdr) std::array<char,4096> answer{};
+    ssize_t length = -1;
+    if (sendto(fd,&request,request.header.nlmsg_len,0,reinterpret_cast<sockaddr *>(&kernel),sizeof(kernel)) >= 0)
+        length = recv(fd,answer.data(),answer.size(),MSG_DONTWAIT);
+    close(fd);
+    if (length < 0) return result;
+    auto *header = reinterpret_cast<nlmsghdr *>(answer.data());
+    if (!NLMSG_OK(header,length) || header->nlmsg_type != RTM_NEWROUTE) return result;
+    auto *route = static_cast<rtmsg *>(NLMSG_DATA(header));
+    int remaining = RTM_PAYLOAD(header);
+    for (auto *attr = RTM_RTA(route); RTA_OK(attr,remaining); attr = RTA_NEXT(attr,remaining)) {
+        if (attr->rta_type == RTA_OIF && RTA_PAYLOAD(attr) == sizeof(device)) {
+            std::memcpy(&device,RTA_DATA(attr),sizeof(device));
+            char name[IF_NAMESIZE]{};
+            if (if_indextoname(device,name)) result.device = QString::fromLocal8Bit(name);
+        } else if (attr->rta_type == RTA_PREFSRC) {
+            const auto *bytes = static_cast<const quint8 *>(RTA_DATA(attr));
+            if (v6 && RTA_PAYLOAD(attr)==16) result.source = QHostAddress(bytes).toString();
+            else if (!v6 && RTA_PAYLOAD(attr)==4) {
+                in_addr_t ip{};
+                std::memcpy(&ip,bytes,sizeof(ip));
+                result.source = QHostAddress(ntohl(ip)).toString();
+            }
+        }
+    }
+    return result;
+}
+
 struct Round {
     qint64 wallMs = 0;
     int nextHop = 1;
@@ -100,7 +174,8 @@ struct Round {
     int destination = 0;
     int outstanding = 0;
     Moment nextSend{};
-    std::array<std::optional<Sample>, maxHops> values{};
+    // Index zero is a separately transmitted endpoint check with an unrestricted hop limit.
+    std::array<std::optional<Sample>, maxHops + 1> values{};
 };
 
 struct Pending {
@@ -208,6 +283,17 @@ private:
             errno = error;
             return -1;
         }
+        const int tos = options_.dscp << 2;
+        const int level = v6 ? IPPROTO_IPV6 : IPPROTO_IP;
+        const int discover = IP_PMTUDISC_DO;
+        if ((tos && setsockopt(fd, level, v6 ? IPV6_TCLASS : IP_TOS, &tos, sizeof(tos)) < 0) ||
+            (options_.dontFragment && setsockopt(fd, level, v6 ? IPV6_MTU_DISCOVER : IP_MTU_DISCOVER,
+                                               &discover, sizeof(discover)) < 0)) {
+            const int error = errno;
+            ::close(fd);
+            errno = error;
+            return -1;
+        }
         setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on));
         if (v6) setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on));
         return fd;
@@ -267,6 +353,12 @@ private:
                         finishRounds();
                     });
                 }
+                packet_.resize(options_.payloadBytes + (method == "icmp" ? 8 : 0));
+                packet_.fill(0);
+                actual_ = {{"resolvedAddress",target_.toString()}, {"effectiveFamily",endpoint.family()==AF_INET ? 4 : 6},
+                           {"effectiveProtocol",method_}, {"effectivePort",endpoint_.port()},
+                           {"flowMode",method_ == "udp" ? "fixed-udp" : method_ == "tcp" ? "separate-ports" : "icmp"}};
+                refreshRoute();
                 emit owner_->resolved(id_, target_.toString(), method_, endpoint_.port());
                 emit owner_->status(id_, description(), false);
                 nextRound_ = Clock::now();
@@ -277,6 +369,16 @@ private:
         fail("Cannot trace target: " + error);
     }
 
+    void refreshRoute() {
+        const auto route = routedSource(endpoint_,method_,options_);
+        if (!actual_.contains("sourceAddress") || actual_["sourceAddress"] != route.source ||
+            actual_["effectiveInterface"] != route.device) {
+            actual_["sourceAddress"] = route.source;
+            actual_["effectiveInterface"] = route.device;
+            emit owner_->measurement(id_,QDateTime::currentMSecsSinceEpoch(),actual_);
+        }
+        nextRouteCheck_ = Clock::now() + 5s;
+    }
     void tick();
     void sendProbe(qint64 roundId, Round &round, int hop);
     void drain();
@@ -285,7 +387,7 @@ private:
     void separateProbe(qint64 number, Round &r, int hop, quint16 key);
     void socketReady(quint16 key);
     void closeSocket(quint16 key);
-    void sendError(int error);
+    void sendError(Round &round, int hop, int error);
     void complete(quint16 key, const QHostAddress &responder, bool destination, qint64 rxNs);
     void finishRounds();
 
@@ -298,6 +400,9 @@ private:
     int lookup_ = -1;
     ProbeOptions options_;
     QString method_;
+    QVariantMap actual_;
+    QByteArray packet_;
+    Moment nextRouteCheck_{};
     bool separateUdp_ = false;
     struct Socket { int fd; QSocketNotifier *notifier; };
     std::map<quint16, Socket> sockets_;
@@ -322,7 +427,7 @@ void ProbeSession::tick() {
         if (it->second.sent + responseTimeout > now) { ++it; continue; }
         const auto &probe = it->second;
         auto &round = rounds_.at(probe.round);
-        round.values[probe.hop - 1] = Sample{id_, round.wallMs, probe.hop, {}, -1, false};
+        round.values[probe.hop] = Sample{id_, round.wallMs, probe.hop, {}, -1, false};
         --round.outstanding;
         closeSocket(it->first);
         it = pending_.erase(it);
@@ -330,10 +435,15 @@ void ProbeSession::tick() {
     finishRounds();
     if (!active_) return;
     if (!finishing_ && now >= nextRound_) {
+        if (now >= nextRouteCheck_) refreshRoute();
         auto &r = rounds_[++roundId_];
         r.wallMs = QDateTime::currentMSecsSinceEpoch();
         r.limit = hopLimit_;
         r.nextSend = now;
+        // A local send failure leaves the endpoint unmeasured. A successful send
+        // replaces this placeholder with a reply or a recorded timeout.
+        r.values[0] = Sample{id_, r.wallMs, 0, {}, -2, false};
+        sendProbe(roundId_, r, 0);
         nextRound_ = now + interval_; // Missed intervals do not produce catch-up traffic.
     }
     auto wake = finishing_ ? now + responseTimeout : nextRound_;
@@ -360,11 +470,12 @@ void ProbeSession::sendProbe(qint64 number, Round &r, int hop) {
     const int level = ipv6 ? IPPROTO_IPV6 : IPPROTO_IP;
     const int option = ipv6 ? IPV6_UNICAST_HOPS : IP_TTL;
     const quint16 key = quint16(++sequence_);
+    const int ttl = hop ? hop : 255;
     if (method_ == "tcp" || separateUdp_) {
         separateProbe(number, r, hop, key);
         return;
     }
-    std::array<unsigned char, 16> packet{};
+    auto &packet = packet_;
     const auto sequence = htons(key);
     if (method_ == "udp") {
         std::copy(udpMarker.begin(), udpMarker.end(), packet.begin());
@@ -379,7 +490,7 @@ void ProbeSession::sendProbe(qint64 number, Round &r, int hop) {
     // The kernel fills in the identifier and checksum on ICMP echo sockets.
     qint64 wall = 0;
     Moment sent{};
-    if (setsockopt(fd_, level, option, &hop, sizeof(hop)) == 0) {
+    if (setsockopt(fd_, level, option, &ttl, sizeof(ttl)) == 0) {
         const auto send = [&] {
             wall = realtimeNs();
             sent = Clock::now();
@@ -401,10 +512,11 @@ void ProbeSession::sendProbe(qint64 number, Round &r, int hop) {
             return;
         }
     }
-    sendError(errno);
+    sendError(r, hop, errno);
 }
 
-void ProbeSession::sendError(int error) {
+void ProbeSession::sendError(Round &r, int hop, int error) {
+    r.values[hop] = Sample{id_, r.wallMs, hop, {}, -2, false, {"local-unsent", {}, -1, -1, 0, error}};
     const auto now = Clock::now();
     if (now - lastError_ > 3s) {
         lastError_ = now;
@@ -416,6 +528,8 @@ void ProbeSession::sendError(int error) {
 void ProbeSession::switchUdpSockets() {
     if (separateUdp_) return;
     separateUdp_ = true;
+    actual_["flowMode"] = "separate-ports";
+    emit owner_->measurement(id_,QDateTime::currentMSecsSinceEpoch(),actual_);
     emit owner_->status(id_, description() + " (using separate source ports for untagged replies)", false);
     // A short quote (or application response) has no sequence number. Retry in-flight
     // measurements on independent sockets, starting a fresh RTT clock for each one.
@@ -431,12 +545,13 @@ void ProbeSession::separateProbe(qint64 number, Round &r, int hop, quint16 key) 
     const bool tcp = method_ == "tcp";
     const bool v6 = endpoint_.family() == AF_INET6;
     const int fd = openSocket(endpoint_.family(), method_);
-    if (fd < 0) { sendError(errno); return; }
-    const auto reject = [this, fd](int error) {
+    if (fd < 0) { sendError(r, hop, errno); return; }
+    const auto reject = [this, fd, &r, hop](int error) {
         ::close(fd);
-        sendError(error);
+        sendError(r, hop, error);
     };
-    if (setsockopt(fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP, v6 ? IPV6_UNICAST_HOPS : IP_TTL, &hop, sizeof(hop)) < 0) {
+    const int ttl = hop ? hop : 255;
+    if (setsockopt(fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP, v6 ? IPV6_UNICAST_HOPS : IP_TTL, &ttl, sizeof(ttl)) < 0) {
         reject(errno);
         return;
     }
@@ -450,8 +565,7 @@ void ProbeSession::separateProbe(qint64 number, Round &r, int hop, quint16 key) 
     }
     if (!tcp) {
         // The socket identifies this probe even for an empty ICMP quote or an application-specific response.
-        std::array<unsigned char, 16> payload{};
-        if (::send(fd, payload.data(), payload.size(), 0) < 0) { reject(errno); return; }
+        if (::send(fd, packet_.constData(), packet_.size(), 0) < 0) { reject(errno); return; }
     }
     pending_.emplace(key, Pending{number, hop, sent, wall});
     ++r.outstanding;
@@ -575,13 +689,22 @@ bool ProbeSession::receive(int fd, bool errors, std::optional<quint16> socketKey
     const bool expired = err->ee_type == (v6 ? ICMP6_TIME_EXCEEDED : ICMP_TIME_EXCEEDED) && err->ee_code == 0;
     const bool portUnreachable = err->ee_type == (v6 ? ICMP6_DST_UNREACH : ICMP_DEST_UNREACH)
                               && err->ee_code == (v6 ? ICMP6_DST_UNREACH_NOPORT : ICMP_PORT_UNREACH);
-    if (expired || (method_ == "udp" && portUnreachable && router == target_)) {
+    if ((expired && pending_.contains(key) && pending_.at(key).hop != 0) || (method_ == "udp" && portUnreachable && router == target_)) {
         complete(key, router, !expired, rxNs);
-    } else if (pending_.contains(key) && Clock::now() - lastError_ > 3s) {
-        // An explicit routing or filtering error is not a successful RTT.
-        lastError_ = Clock::now();
-        emit owner_->status(id_, QString("ICMP error %1/%2 from %3: %4")
-                                .arg(err->ee_type).arg(err->ee_code).arg(router.toString(), systemError(err->ee_errno)), false);
+    } else if (auto pending = pending_.find(key); pending != pending_.end()) {
+        const bool tooBig = v6 ? err->ee_type == ICMP6_PACKET_TOO_BIG
+            : err->ee_type == ICMP_DEST_UNREACH && err->ee_code == ICMP_FRAG_NEEDED;
+        const bool unreachable = err->ee_type == (v6 ? ICMP6_DST_UNREACH : ICMP_DEST_UNREACH);
+        const bool filtered = unreachable && (v6 ? err->ee_code == ICMP6_DST_UNREACH_ADMIN
+            : err->ee_code == ICMP_PKT_FILTERED || err->ee_code == ICMP_NET_ANO || err->ee_code == ICMP_HOST_ANO);
+        const auto kind = tooBig ? "packet-too-big" : filtered ? "filtered" : unreachable ? "unreachable" : "icmp-error";
+        const auto hop = pending->second.hop;
+        auto &r = rounds_.at(pending->second.round);
+        r.values[hop] = Sample{id_, r.wallMs, hop, {}, -1, false,
+            {kind, router.toString(), err->ee_type, err->ee_code, tooBig ? int(err->ee_info) : 0, int(err->ee_errno)}};
+        --r.outstanding;
+        closeSocket(key);
+        pending_.erase(pending);
     }
     return true;
 }
@@ -599,9 +722,10 @@ void ProbeSession::complete(quint16 key, const QHostAddress &responder, bool des
     const double rtt = double(valid ? kernelElapsed : elapsed) / 1e6;
     auto &r = rounds_.at(p.round);
     const bool timely = rtt <= std::chrono::duration<double, std::milli>(responseTimeout).count();
-    r.values[p.hop - 1] = Sample{id_, r.wallMs, p.hop, timely ? responder.toString() : QString{},
+    r.values[p.hop] = Sample{id_, r.wallMs, p.hop, timely ? responder.toString() : QString{},
                                  timely ? rtt : -1.0, timely && destination};
-    if (timely && destination) {
+    if (timely && owner_->previews(id_)) emit owner_->replyReceived(id_, r.wallMs, p.hop, responder.toString(), rtt);
+    if (timely && destination && p.hop > 0) {
         r.destination = r.destination ? std::min(r.destination, p.hop) : p.hop;
         r.limit = r.destination;
     }
@@ -616,7 +740,7 @@ void ProbeSession::finishRounds() {
         const auto &r = rounds_.begin()->second;
         if (r.nextHop <= r.limit || r.outstanding != 0) break;
         hopLimit_ = r.destination ? r.destination : maxHops;
-        for (int h = 0; h < r.limit; ++h)
+        for (int h = 0; h <= r.limit; ++h)
             if (r.values[h]) batch.append(*r.values[h]);
         rounds_.erase(rounds_.begin());
     }
@@ -629,9 +753,9 @@ void ProbeSession::finishRounds() {
 
 Probe::Probe(QObject *parent) : QObject(parent) {}
 
-void Probe::start(qint64 id, QString target, int family, int intervalMs, QString protocol, int port, QString interfaceName) {
+void Probe::start(qint64 id, QString target, int family, int intervalMs, QString protocol, int port, QString interfaceName, int payloadBytes, int dscp, bool dontFragment) {
     stop(id);
-    auto *s = new ProbeSession(this, id, intervalMs, {std::move(protocol), port, std::move(interfaceName)});
+    auto *s = new ProbeSession(this, id, intervalMs, {std::move(protocol), port, std::move(interfaceName), payloadBytes, dscp, dontFragment});
     sessions_.insert(id, s);
     s->resolve(std::move(target), family);
 }

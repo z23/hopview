@@ -42,6 +42,13 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
             if (m_ready) {
                 m_sessions = m_writer->sessions();
                 m_diagnosticsSettings = m_writer->diagnosticsSettings();
+                for (const auto &value : m_writer->namedBaselines()) {
+                    const auto mark = value.toMap();
+                    const auto session = mark["session"].toLongLong();
+                    m_namedBaselines[session][mark["name"].toString()] = mark;
+                    if (mark["active"].toBool())
+                        m_baselines[session] = mark;
+                }
                 m_groupNames = m_writer->groupNames();
                 const auto settings = m_writer->monitoringSettings();
                 m_resumeSessions = settings["active"].toList();
@@ -70,6 +77,31 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
         (info.take("closed").toBool() ? m_closedSessions : m_sessions).append(info);
     }
     for (auto &event : m_alertEvents) event = labelAlert(event.toMap());
+    connect(m_probe,&Probe::measurement,this,[this](qint64 id,qint64 stamp,const QVariantMap &settings) {
+        for (auto &entry : m_sessions) {
+            auto info = entry.toMap();
+            if (info["id"].toLongLong() != id) continue;
+            for (auto it=settings.cbegin();it!=settings.cend();++it) info[it.key()] = it.value();
+            entry = info;
+            emit sessionsChanged();
+            break;
+        }
+        QMetaObject::invokeMethod(m_writerContext,[this,id,stamp,settings] {
+            if (!m_writer->setMeasurement(id,stamp,settings)) {
+                auto error=m_writer->error();
+                QMetaObject::invokeMethod(this,[this,error]{ setStatus(error); });
+            }
+        });
+    });
+    connect(m_probe,&Probe::replyReceived,this,[this](qint64 id,qint64 stamp,int hop,const QString &address,double rtt) {
+        if (id != m_session || !m_active.contains(id) || !m_windowVisible || !m_live || stamp < m_provisionalStamp) return;
+        if (stamp != m_provisionalStamp) m_replyLabels.clear();
+        m_provisionalStamp = stamp;
+        m_replyLabels[hop] = tr("%1 %2 · %3 ms").arg(hop ? tr("Hop %1").arg(hop) : tr("Target"), address, QString::number(rtt,'f',1));
+        const auto time = QDateTime::fromMSecsSinceEpoch(stamp).toUTC().toString("HH:mm:ss.zzz");
+        m_provisionalReplies = time + " UTC    " + m_replyLabels.values().join(QStringLiteral("    "));
+        emit provisionalChanged();
+    });
     connect(m_probe, &Probe::status, this, [this](qint64 id, QString message, bool fatal) {
         if (!m_active.contains(id))
             return;
@@ -96,6 +128,18 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
         }
     });
     m_refresh.start();
+    auto *maintenance = new QTimer(this);
+    connect(maintenance,&QTimer::timeout,this,[this] {
+        if (m_ready && !m_replayMode)
+            m_exports.start([this] {
+                History store(m_historyPath);
+                if (!store.maintainStorage(now())) {
+                    const auto error = store.error();
+                    QMetaObject::invokeMethod(this,[this,error] { setStatus(error); });
+                }
+            });
+    });
+    maintenance->start(3600000);
     m_remotePoll.setInterval(2000);
     connect(&m_remotePoll,&QTimer::timeout,this,&Backend::pollReceiver);
     m_remotePoll.start();
@@ -108,6 +152,7 @@ Backend::~Backend() {
     m_refresh.stop();
     m_coalesce.stop();
     cancelBaseline();
+    cancelFleet();
     m_baselinePool.waitForDone();
     m_exports.waitForDone();
     if (m_diagnostics) {
@@ -340,11 +385,11 @@ QStringList Backend::interfaceNames() const {
     return names;
 }
 
-void Backend::startTrace(QString target, int family, int intervalMs, QString protocol, int port, QString interfaceName, bool reuseRunning) {
+void Backend::startTrace(QString target, int family, int intervalMs, QString protocol, int port, QString interfaceName, bool reuseRunning, int payloadBytes, int dscp, bool dontFragment) {
     if (m_replayMode) return;
-    const ProbeOptions options{protocol, port, interfaceName};
+    const ProbeOptions options{protocol, port, interfaceName,payloadBytes,dscp,dontFragment};
     if (!options.valid()) {
-        setStatus(tr("Choose a valid probe protocol and destination port."));
+        setStatus(tr("Check protocol, port, payload size and DSCP. TCP uses the system SYN size."));
         return;
     }
     port = options.destinationPort();
@@ -356,7 +401,7 @@ void Backend::startTrace(QString target, int family, int intervalMs, QString pro
         setStatus(tr("Enter a hostname or address and an interval between 0.25 and 60 seconds."));
         return;
     }
-    const QVariantList key{target, family, intervalMs, protocol, port, interfaceName};
+    const QVariantList key{target, family, intervalMs, protocol, port, interfaceName,payloadBytes,dscp,dontFragment};
     if (reuseRunning) {
         if (m_pendingStarts.contains(key))
             return;
@@ -364,18 +409,18 @@ void Backend::startTrace(QString target, int family, int intervalMs, QString pro
             const auto trace = entry.toMap();
             if (trace["running"].toBool() && trace["target"] == target && trace["family"].toInt() == family &&
                 trace["intervalMs"].toInt() == intervalMs && trace["protocol"] == protocol &&
-                trace["port"].toInt() == port && trace["interfaceName"] == interfaceName) {
+                trace["port"].toInt() == port && trace["interfaceName"] == interfaceName && trace["payloadBytes"].toInt() == payloadBytes && trace["dscp"].toInt()==dscp && trace["dontFragment"].toBool()==dontFragment) {
                 selectSession(trace["id"].toLongLong());
                 return;
             }
         }
     }
     m_pendingStarts.append(key);
-    QMetaObject::invokeMethod(m_writerContext, [this, target, family, intervalMs, protocol, port, interfaceName, key] {
-        const auto id = m_writer->createSession(target, family, intervalMs, protocol, port, interfaceName);
+    QMetaObject::invokeMethod(m_writerContext, [this, target, family, intervalMs, protocol, port, interfaceName, key,payloadBytes,dscp,dontFragment] {
+        const auto id = m_writer->createSession(target, family, intervalMs, protocol, port, interfaceName,payloadBytes,dscp,dontFragment);
         const auto error = m_writer->error();
         const auto stamp = now();
-        QMetaObject::invokeMethod(this, [this, id, target, family, intervalMs, error, stamp, protocol, port, interfaceName, key] {
+        QMetaObject::invokeMethod(this, [this, id, target, family, intervalMs, error, stamp, protocol, port, interfaceName, key,payloadBytes,dscp,dontFragment] {
             m_pendingStarts.removeOne(key);
             if (id <= 0) {
                 setStatus(error);
@@ -384,13 +429,14 @@ void Backend::startTrace(QString target, int family, int intervalMs, QString pro
             m_sessions.prepend(QVariantMap{{"id", id},
                                            {"target", target},
                                            {"family", family},
-                                           {"protocol", protocol}, {"port", port}, {"interfaceName", interfaceName},
+                                           {"protocol", protocol}, {"port", port}, {"interfaceName", interfaceName}, {"payloadBytes",payloadBytes},{"dscp",dscp},{"dontFragment",dontFragment},
                                            {"intervalMs", intervalMs},
                                            {"startMs", stamp},
                                            {"endMs", stamp},
                                            {"running", false}});
             selectSession(id);
             runSession(id);
+            matchPair(id);
         });
     });
 }
@@ -428,7 +474,7 @@ void Backend::runSession(qint64 id) {
     QMetaObject::invokeMethod(m_probe, [this, id, info] {
         m_probe->start(id, info.value("target").toString(), info.value("family").toInt(),
                        info.value("intervalMs").toInt(), info.value("protocol", "auto").toString(),
-                       info.value("port").toInt(), info.value("interfaceName").toString());
+                       info.value("port").toInt(), info.value("interfaceName").toString(),info.value("payloadBytes",16).toInt(),info.value("dscp").toInt(),info.value("dontFragment").toBool());
     });
 }
 void Backend::setIntervalMs(int intervalMs) {
@@ -454,7 +500,7 @@ void Backend::setIntervalMs(int intervalMs) {
                         m_probe->stop(id);
                         m_probe->start(id, info.value("target").toString(), info.value("family").toInt(),
                                        intervalMs, info.value("protocol", "auto").toString(),
-                                       info.value("port").toInt(), info.value("interfaceName").toString());
+                                       info.value("port").toInt(), info.value("interfaceName").toString(),info.value("payloadBytes",16).toInt(),info.value("dscp").toInt(),info.value("dontFragment").toBool());
                     });
                 }
                 emit sessionsChanged();
@@ -502,6 +548,8 @@ void Backend::selectSession(qint64 id) {
         m_views[m_session] = {m_hops, m_spanMs, m_focusSecs, m_live, m_viewEnd, m_focusCenter, m_comparisons};
     cancelBaseline();
     m_session = id;
+    m_probe->setPreviewSession(m_windowVisible ? id : 0);
+    m_provisionalStamp = -1; m_replyLabels.clear(); m_provisionalReplies.clear(); emit provisionalChanged();
     emit baselineChanged();
     const auto saved = m_views.value(id);
     m_hops = saved.hops;
@@ -732,11 +780,14 @@ void Backend::fetchView() {
                              comparison.value("timeMax").toDouble()};
                 }
                 auto chart = entry.charts.value(0).toMap();
+                chart["measurement"] = m_reader->focusedMeasurement(peerId, fs, fe);
                 chart["comparisonId"] = peerId;
                 chart["target"] = peer.value("target");
                 for (const auto &key : {"location", "resolvedAddress", "clockOffsetMs", "clockErrorMs", "manualCorrectionMs"})
                     chart[key] = peer.value(key);
                 chart["family"] = peer.value("family");
+                for (const auto &key : {"protocol", "port", "interfaceName", "payloadBytes", "dscp", "dontFragment"})
+                    chart[key] = peer.value(key);
                 chart["intervalMs"] = peer.value("intervalMs");
                 if (!chart.contains("buckets"))
                     chart["buckets"] = QVariantList{};
@@ -745,6 +796,7 @@ void Backend::fetchView() {
                 nextCache.insert(peerId, std::move(entry));
             }
             m_comparisonCache.swap(nextCache);
+            view["events"] = m_reader->timelineEvents(id, start, end);
             view["diagnostics"] = m_reader->diagnosticTracks(id, start, end, pixels);
             if (!m_reader->error().isEmpty()) error = m_reader->error();
             view["charts"] = charts;
@@ -806,12 +858,25 @@ void Backend::resolveNames() {
 
 struct Backend::RouteScan {
     quint64 request;
-    qint64 session, cursor = -1, until = 0;
-    RouteEvents detector;
+    qint64 session, cursor = -1;
 };
 
 void Backend::cancelRouteHistory() {
     ++m_routeRequest;
+}
+
+void Backend::warmRouteIndex(qint64 id,quint64 generation) {
+    QMetaObject::invokeMethod(m_readContext,[this,id,generation] {
+        bool more;
+        const bool ok=m_reader->advanceRouteIndex(id,more);
+        const auto error=m_reader->error();
+        QMetaObject::invokeMethod(this,[this,id,generation,more,ok,error] {
+            if (generation!=m_indexGeneration) return;
+            if (!ok) { setStatus(error); return; }
+            if (more) warmRouteIndex(id,generation);
+            else scheduleView(false);
+        });
+    });
 }
 
 void Backend::requestRouteHistory() {
@@ -830,7 +895,7 @@ void Backend::readRoutePage(std::shared_ptr<RouteScan> scan) {
     QMetaObject::invokeMethod(m_readContext, [this, scan] {
         QVariantList events;
         bool more = false;
-        m_reader->routePage(scan->session, scan->detector, scan->cursor, scan->until, events, more);
+        m_reader->indexedRoutes(scan->session, scan->cursor, events, more);
         const QString error = m_reader->error();
         QMetaObject::invokeMethod(this, [this, scan, events = std::move(events), more, error] {
             if (scan->request != m_routeRequest || scan->session != m_session)
@@ -884,6 +949,7 @@ void Backend::setBackgroundEnabled(bool enabled) {
 
 void Backend::setWindowVisible(bool visible) {
     m_windowVisible = visible;
+    m_probe->setPreviewSession(visible ? m_session : 0);
     if (visible) pollReceiver();
     if (visible && m_session) {
         if (m_live) {

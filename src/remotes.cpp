@@ -139,8 +139,10 @@ void Backend::pollReceiver() {
                     changed = true;
                 }
             }
-            if (changed)
+            if (changed) {
                 emit sessionsChanged();
+                attachSiteStreams();
+            }
             if (!m_session && !m_sessions.isEmpty())
                 selectSession(m_sessions.first().toMap()["id"].toLongLong());
             if (visibleTraceChanged && m_windowVisible) {

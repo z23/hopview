@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hopview receiver</title>
+<style>
+:root{font:16px/1.5 system-ui,sans-serif;color-scheme:dark;color:#dce6ec;background:#111923}
+body{max-width:70rem;margin:2rem auto;padding:0 1rem}
+h1{font-size:1.8rem;margin-bottom:1rem}h2{font-size:1.2rem;margin-top:2rem}
+form{display:flex;flex-wrap:wrap;align-items:end;gap:.8rem}
+label{display:grid;gap:.25rem}button,input,select{font:inherit;padding:.4rem;border:1px solid #596b77;border-radius:.25rem;background:#1b2a35;color:inherit}
+button{cursor:pointer}button[type=submit]{background:#215a53}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}th,td{padding:.5rem;text-align:right;border-bottom:1px solid #344653}th:first-child,td:first-child,td:nth-child(2),th:nth-child(2){text-align:left}
+figure{margin:1rem 0}canvas{display:block;width:100%;height:10rem;background:#182630}figcaption,#status{color:#b2c5d0}
+</style><script src="/app.js" defer></script></head>
+<body><h1>Receiver recordings</h1>
+<form id="window"><label>Recording<select id="recording" required></select></label>
+<label>Start (UTC)<input id="from" type="datetime-local" step=".001" required></label>
+<label>End (UTC)<input id="through" type="datetime-local" step=".001" required></label>
+<button type="submit">Inspect</button><button id="latest" type="button">Latest 15 min</button></form>
+<p id="status" role="status">Loading recordings…</p>
+<section id="trace" hidden><h2>Destination latency and loss</h2><p id="impact"></p><p id="measurement"></p>
+<figure><canvas id="plot" width="720" height="160" aria-label="Destination mean RTT and loss over the selected interval"></canvas><figcaption id="legend"></figcaption></figure>
+<h2>Hops in this interval</h2><div style="overflow:auto"><table><thead><tr><th>Hop</th><th>Responder</th><th>Sent</th><th>Loss (%)</th><th>Min (ms)</th><th>Mean (ms)</th><th>Max (ms)</th><th>Last probe error</th></tr></thead><tbody id="hops"></tbody></table></div>
+</section></body></html>

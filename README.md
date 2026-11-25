@@ -15,7 +15,7 @@ bin/build
 ./build/hopview
 ```
 
-Enter a hostname or IP address, select the address family and interval, and press **Start trace**. Auto uses a routable address returned by the system resolver. To compare IPv4 and IPv6 for a dual-stack hostname, start one trace for each family. Each tab collects independently. A link-local IPv6 target needs its interface, for example `fe80::1%eth0`.
+Enter a hostname or IP address, select the address family and interval, and press **Start trace**. Auto uses a routable address returned by the system resolver. To compare a dual-stack hostname, select **IPv4 + IPv6** and start the trace. Hopview opens both families on a shared timeline and reuses matching active traces. Each tab collects independently. A link-local IPv6 target needs its interface, for example `fe80::1%eth0`.
 
 ```sh
 ./build/hopview --demo
@@ -28,14 +28,17 @@ The demo opens two simultaneous recordings. Compare the IPv6 service with the IP
 
 On a system that supports the desktop package manifest, `bin/package` writes binary and source packages to `pkgbuild/`. Installing the binary package adds Hopview to the desktop launcher.
 
-The **Probes** menu selects ICMP, UDP, or TCP and an outgoing interface for the new trace. Auto tries ICMP first and uses UDP if the kernel disallows ping sockets. Pick UDP or TCP explicitly to test the path to a particular port. The default TCP port is 443 and the default UDP port is 33434. Hover over a recording’s tab to see its saved probe settings. A resumed recording uses those settings.
+Use **Probes** to choose ICMP, UDP, or TCP and an outgoing interface. Auto tries ICMP first and falls back to UDP if ping sockets are unavailable. TCP defaults to port 443 and UDP to 33434. The capture records the resolved address, effective family, protocol, port, selected source address, interface and flow mode when a trace starts or resumes. With the system route selected, Hopview reads the kernel’s routing decision at startup and checks for changes every five seconds while probing. A UDP switch to separate source ports also creates a new measurement record. Older recordings can have missing fields.
+
+For a paired test, choose **Payload size** or **DSCP** in **Probes**, set the two values, select one IP family, and start the trace. Both tracks open on the same timeline. Payload size means ICMP or UDP payload bytes, excluding IP and transport headers. TCP uses the kernel's SYN size and supports DSCP. **Require unfragmented datagrams** enables path MTU discovery on the chosen datagram sockets. A large probe that receives Packet Too Big can identify an advertised MTU; silence alone leaves the cause unknown. The CLI accepts the same settings, for example `--protocol udp --payload-bytes 1400 --dscp 46 --dont-fragment`.
 
 ## Investigate a trace
 
 - **Read across a hop row.** The horizontal span is the lowest to highest RTT in the focus period. The connected dots show averages, and the cross marks the last sample when it received a reply. Sent and loss count timeouts. Latency statistics use replies only. Jitter is the mean absolute difference between consecutive successful RTTs.
 - **Click a hop** to toggle its timeline. All visible timelines share a time axis. The destination timeline follows the target when its hop number changes. Per-hop timelines follow the selected hop number. A change of responding address is flagged in the focused hop table.
 - **Click a spike** to inspect that point in history. The upper table recalculates over the focus window, using the responders observed then. Auto focus covers the visible timeline. All focus covers the recording. Drag across any timeline to fill all timelines with that time range and recompute the hop table for the selection. Shift-drag or use the arrow buttons to pan. Ctrl+wheel and the View picker change the displayed duration. The horizontal amber and red timeline bands mark RTTs above 100 and 200 ms, respectively. **Go live** returns to the current end of a running trace.
-- **Read loss downstream.** A router can rate-limit its own replies. Loss at one intermediate hop with a healthy destination has a different meaning from loss that persists to the destination.
+- **Read the destination impact line.** It shows answered and recorded destination rounds in the focus. If every destination round receives a reply, intermediate reply loss is muted. If there is repeated destination loss or a sustained increase in mean RTT, the line identifies the earliest consecutive observed hop showing the same pattern through the responding destination. Missing replies, responder changes and short samples can leave the starting hop inconclusive. This is evidence for investigation. A router can rate-limit its own replies, and RTT includes the return path.
+- Hopview checks both halves of the focus. Repeated loss needs at least three rounds and one timeout in each half. A latency increase needs at least three replies in each half and in the preceding equal-length window, with an increase of at least 10 ms and 20% over that earlier mean.
 - **Right-click a timeline** to add a timestamped note. Right-click an existing marker to edit or remove it. **Trace actions → Save graph as PNG** exports the visible graphs. Ctrl+L focuses the target field and Ctrl+Shift+S opens the image export dialog.
 - **Resize the interface** with Ctrl++ (or Ctrl+=) and Ctrl+−. Ctrl+0 restores 100%. Hopview remembers the scale across launches.
 - **Close a trace tab** with its × button or a middle-click. Closing stops collection and keeps the recording. Use the closed-traces menu to reopen it, including after restarting Hopview.
@@ -43,9 +46,9 @@ The **Probes** menu selects ICMP, UDP, or TCP and an outgoing interface for the 
 
 ## Compare a healthy period with an incident
 
-Zoom to the bad interval, then choose **Trace actions → Compare time ranges**. By default Hopview compares the focused interval with the immediately preceding interval of the same duration. To choose a different baseline, select the healthy interval first, choose **Mark focus as baseline**, then select the incident and open the comparison. The mark belongs to that trace for the current app session.
+Zoom to the bad interval, then choose **Trace actions → Compare time ranges**. By default Hopview compares the focused interval with the immediately preceding interval of the same duration. To choose a different baseline, select the healthy interval first, choose **Mark focus as baseline**, then select the incident and open the comparison. Named baselines belong to their recording and survive a restart. In **Compare time ranges**, enter a name and choose **Save focus**. Select that name later, or choose **Same time yesterday (UTC)** to compare the same UTC hours a day earlier. A selected baseline with replies replaces the destination timeline’s fixed bands with amber shading above its p95.
 
-The destination and hop rows show replies/sent, median RTT, p95 RTT, loss and the longest run of consecutive recorded timeouts in each period. RTT uses raw replies and nearest-rank p95. Empty periods display a dash for loss and latency. Hopview estimates the historical probe interval using nearby recorded rounds. A gap longer than three of those intervals, with a three-second minimum, breaks a timeout streak. When neighboring rounds provide no cadence evidence, Hopview uses the trace’s configured interval. A responder change lists the addresses observed in each period. The comparison runs on a separate reader while collection continues.
+The destination and hop rows show replies/sent, median RTT, p95 RTT and its change, jitter, loss and the longest run of consecutive recorded timeouts in each period. RTT uses raw replies and nearest-rank p95. Empty periods display a dash for loss and latency. Hopview estimates the historical probe interval using nearby recorded rounds. A gap longer than three of those intervals, with a three-second minimum, breaks a timeout streak. When neighboring rounds provide no cadence evidence, Hopview uses the trace’s configured interval. A responder change lists the addresses observed in each period. The comparison runs on a separate reader while collection continues.
 
 ## Compare destinations
 
@@ -55,17 +58,39 @@ To keep a comparison, enter a name in **Compare…** and choose **Save group**. 
 
 To bring a recording from another site onto the same graphs, choose **Trace actions → Add recording to comparison**. The site name fills in missing location labels. By default, all measurements use their recorded UTC timestamps. If you know a collector clock ran 250 ms fast, enter `-250` to move its evidence back by that amount. Hopview shifts probes, notes, and diagnostic observations together and shows the applied adjustment in the tab tooltip. Imported tabs retain their recorded data across restarts. An import into a replay window lasts until that window closes.
 
-For example, monitor your gateway, a public endpoint, and the service you are troubleshooting. A spike that begins at the same time on all three points you toward the shared part of the path. A spike seen only on the service gives you a different set of hops to investigate. To compare address families, trace the same hostname twice and select IPv4 on one trace and IPv6 on the other.
+For example, monitor your gateway, a public endpoint, and the service you are troubleshooting. A spike that begins at the same time on all three points you toward the shared part of the path. A spike seen only on the service gives you a different set of hops to investigate. For a family comparison, enter the service hostname and choose **IPv4 + IPv6**. For a packet-size or DSCP comparison, choose one family and select the comparison in **Probes**. Track headers identify the profiles. Hover over a destination track label for the effective endpoint and protocol in the focus and the recorded collector clock uncertainty. The timeline flags different or changing endpoints. Older recordings can have unknown effective settings.
+
+**Site health** in Trace actions lists target and probe profiles against sites. Filter by site or target and select cells to inspect on one time axis. A cell shows loss, replies/sent, p95 RTT, its change from the preceding equal interval and the age of the most recent sample at the end of the selected window. Choose **Last 5 minutes** for operations or **Current focus** for an incident. Empty cells have no matching recording. **No samples** means that a recording exists but supplied no destination samples in the selected period.
+
+**Compare → All matching sites** opens the target's existing recordings across sites. **Choose comparison sites** in Trace actions also lists managed collectors. Select the sites and review whether Hopview will reuse a recording, await an existing assignment or append a new target to that collector. **Assign and compare** applies the displayed changes. Incoming streams join the comparison when their first measurements arrive. For example, select a Melbourne and a Sydney collector to compare a service at two points of presence.
 
 ## Share an incident
 
-Drag across the incident, then choose **Trace actions → Export focus as CSV** or **Save replayable incident**. Both commands capture the active target and every selected comparison destination over the same focus interval. **Focus → All** uses the active recording’s full time span. CSV rows identify the trace, target, IP family, location, probe settings and UTC timestamp. Each real probe appears once, with its responder and RTT or timeout. Notes retain their source trace and timestamp. Recorded service and interface observations appear in the `diagnostic_json` column.
+Drag across the incident and choose **Trace actions → Copy incident summary** to paste a plain-text handoff into a ticket. The summary includes UTC focus and baseline bounds, the primary and comparison sites, effective probe settings where recorded, destination reply counts and p95 RTT in both windows, downstream evidence and indexed route changes. It uses the selected baseline when available and otherwise compares the preceding equal interval.
 
-Open a portable recording with **Trace actions → Open incident**, the empty window’s **Open incident** button, or the command below. A separate offline window opens at the saved interval with the primary trace, comparison destinations, pinned hops, settings, measurements and annotations. The reader accepts single-trace format 1 and multi-trace format 2. Closing the window discards its temporary database.
+Choose **Trace actions → Export focus as CSV** or **Save replayable incident**. Both commands capture the active target and every selected comparison destination over the same focus interval. **Focus → All** uses the active recording’s full time span. CSV rows identify the trace, target, IP family, location, probe settings and UTC timestamp. Each real probe appears once, with its responder and RTT or timeout. Notes retain their source trace and timestamp. Recorded service and interface observations appear in the `diagnostic_json` column.
+
+Open a portable recording with **Trace actions → Open incident**, the empty window’s **Open incident** button, or the command below. A separate offline window opens at the saved interval with the primary trace, comparison destinations, pinned hops, settings, measurements and annotations. Format 3 preserves independent endpoint checks, failure details and effective measurement changes. The reader also opens formats 1 and 2. Closing the window discards its temporary database.
 
 ```sh
 ./build/hopview --replay outage.hopview
 ```
+
+## Find a ticket interval and identify a handoff
+
+Open **Trace actions → Find incident by UTC time**. Paste an ISO timestamp or specify both ends of an interval. A lone timestamp opens the surrounding minute. Times without a zone use UTC, and explicit offsets are accepted. Event markers align route transitions, destination alerts, notes, service failures, interface events and observed collection gaps to the graph. Hover for details or select a marker to inspect its time.
+
+Right-click a hop or open **Hop responders and inventory** to see reply counts for each responding address in focus and the recorded flow mode. A return to a previously confirmed address is marked in route history. Distinct responders can indicate multiple paths through the network. A responder change alone cannot identify which link caused an outage.
+
+**Import network inventory** accepts UTF-8 tab-separated rows. Supply a prefix, origin ASN, PoP, peer, circuit, and source. Operator fields can be empty. The most specific matching prefix wins. An import updates matching prefix entries. The route table shows the match; responder details and incident replay retain the source and inventory import time. For example:
+
+```tsv
+prefix	asn	pop	peer	circuit	source
+192.0.2.0/24	AS64501	Melbourne	Example Transit	MEL-100	Peering inventory
+2001:db8:abcd::/48	AS64502				Routing table snapshot
+```
+
+For public origin data, import an unpacked IPv4 or IPv6 RouteViews prefix-to-AS file. Each snapshot replaces the previous origin table for its address family and preserves multi-origin and AS-set notation. Hopview combines the most specific routing prefix with the local inventory match and records both sources when they differ. [CAIDA dataset and file format](https://www.caida.org/catalog/datasets/routeviews-prefix2as/)
 
 ## Route history
 
@@ -89,9 +114,11 @@ Configure a mean RTT threshold, a packet-loss percentage, or both for the select
 
 ## Measurement and storage
 
-The collector uses nonblocking sockets on a dedicated worker thread. ICMP uses ping sockets. TCP uses nonblocking connects and reads the socket error queue for replies from intermediate routers. An accepted connection or a TCP reset proves that the destination responded. UDP keeps the same source and destination ports and checksum across hops. When a router quotes only the UDP header or an application sends an untagged reply, subsequent UDP probes use separate source ports for reliable attribution. In-flight probes are retried once when switching source ports. Each round sends increasing IPv4 TTLs or IPv6 hop limits toward the target and correlates replies with individual probes. The path limit is 30 hops and the reply timeout is 1.5 seconds. The collector uses kernel receive timestamps when available and coherent with the send clock.
+The collector uses nonblocking sockets on a dedicated worker thread. Each round sends one independent endpoint check with an IP hop limit of 255, followed by a TTL sweep up to 30 hops. Endpoint loss and alerts use the independent check. A route extending past the previous sweep limit can therefore remain healthy while Hopview rediscovers its length. Historical sweeps from older versions retain their original derived endpoint series. When reviewing a local live trace, the latest replies appear with their round timestamp as they arrive. Counts and loss update when a round has finished, including the 1.5-second deadline for unanswered probes.
 
-New installations store history in `${XDG_DATA_HOME:-~/.local/share}/hopview/history.sqlite`. On upgrade, Hopview reuses the existing history if the new location has no database. Use `--database PATH` for a separate recording collection. Raw data is kept until the database is removed. To archive the full history, quit Hopview and stop any receiver using the same database before copying the file and any accompanying `-wal` and `-shm` files. To share a selected interval while recording continues, save a replayable incident.
+ICMP uses ping sockets. TCP uses nonblocking connects and reads the socket error queue for intermediate replies. An accepted connection or a TCP reset proves the endpoint answered. UDP keeps ports and checksum stable until a short quote or an untagged response requires separate source ports for attribution. The collector uses kernel receive timestamps when available and coherent with the send clock. Explicit rejections and Packet Too Big retain the reporting router, ICMP type and code, and any advertised MTU. A local send error is recorded separately and excluded from transmitted counts. Focused rows show the latest explicit error. CSV exports and portable incidents preserve the individual observations and timestamps.
+
+New installations store history in `${XDG_DATA_HOME:-~/.local/share}/hopview/history.sqlite`. On upgrade, Hopview reuses the existing history if the new location has no database. Use `--database PATH` for a separate recording collection. Raw and summary history are kept indefinitely by default. Open **Trace actions → Recording storage** to set raw and summary lifetimes in days, estimate growth from hourly database usage, or make a consistent online backup to a new file. Applying retention expires unpinned data immediately, then maintenance advances the cutoff hourly. SQLite reuses released space. **Pin focus** keeps the complete UTC hours covering the selected interval for the primary and compared traces. Select a saved interval and choose **Release pin** to reapply retention to that recording. Overlapping pins continue protecting their covered hours. Imported incident evidence is preserved. Older unpinned RTTs remain available as 10-second aggregates until summary retention expires. The timeline labels intervals that contain summarized or expired data. Exact percentiles, responder counts, and raw exports require retained probes.
 
 A writer batches samples into transactions using a write-ahead log. An independent reader combines raw samples with 10-second, minute, and hour summaries. Zoomed-out pixels retain extrema and loss, and focus statistics include the raw edges of the selected interval. The renderer receives only the displayed rows and timeline buckets and supports both hardware and software rendering.
 
@@ -112,6 +139,7 @@ For focused checks, run the relevant script from the project directory using the
 | --- | --- | --- |
 | Open valid and truncated incidents | [replay-cli.py](tests/replay-cli.py) | |
 | Deliver telemetry from two sites and compare it live | [telemetry.py](tests/telemetry.py) | `--viewer build-tests/integration/integration_test` |
+| Drain a 20-target WAN backlog and query a receiver from two readers | [receiver-workflows.py](tests/receiver-workflows.py) | |
 | Measure service timing over loopback | [diagnostics-loopback.py](tests/diagnostics-loopback.py) | |
 | Close, reopen and restart the background recorder | [background-recorder.py](tests/background-recorder.py) | Add `--notifications` to check delivery through a private desktop notification service. |
 

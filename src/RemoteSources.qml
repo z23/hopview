@@ -39,10 +39,33 @@ C.Dialog {
         return qsTr("%1 h ago").arg(Math.floor(seconds / 3600))
     }
     function status(info) {
+        if (info.manual) return qsTr("Targets configured on the collector")
         if (info.applyError) return qsTr("Could not apply · %1").arg(info.applyError)
         return Number(info.revision) === Number(info.appliedRevision)
              ? qsTr("Applied · revision %1").arg(info.revision)
              : qsTr("Pending · revision %1 (running %2)").arg(info.revision).arg(info.appliedRevision)
+    }
+    function healthText(node) {
+        const h = node.health || {}
+        if (!("lastProbeMs" in h)) return ""
+        const targetCount = h.targetCount ?? node.targets.length
+        const observed = h.maxIntervalMs || 1000
+        const receiverTime = t => h.reportMs ? node.lastSeenMs + (t - h.reportMs) : t
+        const offline = clock - node.lastSeenMs > 45000
+        const stale = !h.lastProbeMs || clock - receiverTime(h.lastProbeMs) > Math.max(15000, observed * 3)
+        const state = offline ? qsTr("Missing contact") : !targetCount ? qsTr("Idle")
+                      : h.oldestMs && clock - receiverTime(h.oldestMs) > 10000 ? qsTr("Delayed delivery")
+                      : stale ? qsTr("Missing probes") : qsTr("Collecting")
+        const when = stamp => stamp ? age(receiverTime(stamp)) : qsTr("no report")
+        let lines = [state + " · " + qsTr("last probe %1 · last upload %2").arg(when(h.lastProbeMs)).arg(when(h.lastUploadMs))]
+        lines.push(qsTr("%1 queued · %2 dropped").arg(h.queuedBatches).arg(h.droppedBatches)
+                   + (h.oldestMs ? " · " + qsTr("oldest %1").arg(when(h.oldestMs)) : ""))
+        for (const issue of (h.errors || [])) {
+            const profile = [issue.family ? "IPv" + issue.family : "", issue.protocol?.toUpperCase(),
+                             issue.port ? String(issue.port) : ""].filter(Boolean).join(" ")
+            lines.push([issue.target, profile, issue.message].filter(Boolean).join(" · "))
+        }
+        return lines.join("\n")
     }
     function manage(info) { notice = ""; targets.load(info); page = "targets" }
     Core.Settings {
@@ -122,11 +145,13 @@ C.Dialog {
                         Label {
                             Layout.fillWidth: true; color: dialog.clock - nodeRow.modelData.lastSeenMs < 45000 ? "#86d1bd" : "#b4c1cb"
                             text: (dialog.clock - nodeRow.modelData.lastSeenMs < 45000 ? qsTr("Online") : qsTr("Offline")) +
-                                  " · " + dialog.age(nodeRow.modelData.lastSeenMs) + " · " + (nodeRow.modelData.targets.length === 1 ? qsTr("1 assigned target") : qsTr("%1 assigned targets").arg(nodeRow.modelData.targets.length))
+                                  " · " + dialog.age(nodeRow.modelData.lastSeenMs) + " · " + qsTr("%1 targets").arg(nodeRow.modelData.health?.targetCount ?? nodeRow.modelData.targets.length)
                         }
+                        Label { Layout.fillWidth: true; text: dialog.healthText(nodeRow.modelData); visible: text.length > 0 }
                         Label { Layout.fillWidth: true; color: nodeRow.modelData.applyError ? "#f1a59e" : "#b4c1cb"; text: dialog.status(nodeRow.modelData) }
                     }
                     TraceButton {
+                        visible: !nodeRow.modelData.manual
                         objectName: "editCollector-" + nodeRow.modelData.site
                         text: qsTr("Targets…"); Accessible.name: qsTr("Edit targets for %1").arg(nodeRow.modelData.site)
                         onClicked: dialog.manage(nodeRow.modelData)

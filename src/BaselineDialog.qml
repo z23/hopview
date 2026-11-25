@@ -17,10 +17,10 @@ C.Dialog {
     property string baselineRange: ""
     property string incidentRange: ""
     property string message: ""
-    property bool previous: true
+    property int sourceIndex: 0
     readonly property bool compact: availableWidth < 610
-    readonly property real metricWidth: (availableWidth - 162) / 5
-    readonly property var metrics: [qsTr("Replies / sent"), qsTr("Median"), qsTr("P95"), qsTr("Loss"), qsTr("Timeout streak")]
+    readonly property real metricWidth: (availableWidth - 162) / 6
+    readonly property var metrics: [qsTr("Replies / sent"), qsTr("Median"), qsTr("P95"), qsTr("Loss"), qsTr("Timeout streak"), qsTr("Jitter")]
     function valueText(stats, index) {
         if (index === 0) return stats.received + "/" + stats.sent
         if (index === 1 || index === 2) {
@@ -28,6 +28,7 @@ C.Dialog {
             return ms < 0 ? "—" : Number(ms).toFixed(1) + " ms"
         }
         if (index === 3) return stats.loss < 0 ? "—" : Number(stats.loss).toFixed(1) + "%"
+        if (index === 5) return stats.jitter >= 0 ? Number(stats.jitter).toFixed(1) + " ms" : "—"
         return stats.sent ? String(stats.longest) : "—"
     }
     background: Rectangle { color: "#16212b"; radius: 6; border.color: "#425461" }
@@ -37,9 +38,10 @@ C.Dialog {
     }
     function update() {
         results = []; baselineRange = ""; incidentRange = ""; message = qsTr("Reading recorded probes…")
-        backend.compareFocus(previous)
+        if (sourceIndex === 1) backend.compareYesterday()
+        else backend.compareFocus(sourceIndex === 0)
     }
-    onOpened: { previous = backend.savedBaseline.from === undefined; update() }
+    onOpened: { sourceIndex = backend.savedBaseline.name ? backend.baselineNames.indexOf(backend.savedBaseline.name) + 2 : 0; update() }
     onClosed: backend.cancelBaseline()
     Connections {
         target: backend
@@ -72,15 +74,18 @@ C.Dialog {
             Label { visible: !dialog.compact; text: qsTr("Baseline") }
             TraceCombo {
                 objectName: "baselineSource"
-                model: backend.savedBaseline.from === undefined ? [qsTr("Preceding interval")] : [qsTr("Preceding interval"), qsTr("Marked interval")]
-                currentIndex: dialog.previous ? 0 : 1
+                model: [qsTr("Preceding interval"), qsTr("Same time yesterday (UTC)")].concat(backend.baselineNames)
+                currentIndex: dialog.sourceIndex
                 implicitWidth: 150
                 Layout.fillWidth: dialog.compact
                 Layout.minimumWidth: 100
-                onActivated: index => { dialog.previous = index === 0; dialog.update() }
+                onActivated: index => { dialog.sourceIndex = index; if (index >= 2) backend.selectBaseline(backend.baselineNames[index - 2]); dialog.update() }
             }
             Item { visible: !dialog.compact; Layout.fillWidth: true }
-            TraceButton { text: qsTr("Mark current focus"); onClicked: { backend.markBaseline(); dialog.close() } }
+            C.TextField { id: markName; Layout.preferredWidth: 140; Layout.minimumWidth: 55; Layout.fillWidth: true
+                maximumLength: 100; placeholderText: qsTr("Baseline name"); Accessible.name: placeholderText }
+            TraceButton { text: qsTr("Save focus"); enabled: !!markName.text.trim()
+                onClicked: { backend.markBaseline(markName.text); dialog.close() } }
         }
         Label { text: qsTr("Baseline   ") + dialog.baselineRange; visible: !dialog.compact && !!dialog.baselineRange; Layout.fillWidth: true }
         Label { text: qsTr("Incident    ") + dialog.incidentRange; visible: !dialog.compact && !!dialog.incidentRange; Layout.fillWidth: true; color: "#b3d2ef" }
@@ -117,7 +122,10 @@ C.Dialog {
                     anchors.left: parent.left; anchors.right: parent.right; y: 4; spacing: 2
                     Label {
                         text: (entry.modelData.hop ? qsTr("Hop %1").arg(entry.modelData.hop) : qsTr("Destination")) +
-                              (entry.modelData.changed ? qsTr(" · Responder changed") : "")
+                              (entry.modelData.changed ? qsTr(" · Responder changed") : "") +
+                              (entry.modelData.baseline.p95 >= 0 && entry.modelData.incident.p95 >= 0
+                               ? qsTr("   Δ p95 %1 ms").arg((entry.modelData.incident.p95 - entry.modelData.baseline.p95).toFixed(1)) : "")
+                        rightPadding: 3
                         color: entry.modelData.changed ? "#edc47f" : "#e8eff2"; font.bold: true
                     }
                     Row { visible: !dialog.compact; Label { width: 148; text: qsTr("Baseline"); leftPadding: 8 } Measures { stats: entry.modelData.baseline } }

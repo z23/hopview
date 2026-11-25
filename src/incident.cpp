@@ -77,13 +77,13 @@ QJsonObject readRecord(QFile &in, int limit) {
     return doc.object();
 }
 struct Counts {
-    qint64 probes = 0, notes = 0, diagnostics = 0;
+    qint64 probes = 0, notes = 0, diagnostics = 0, measurements = 0;
 };
 
 void writeTrace(sqlite3 *db, History &history, QSaveFile &out, const QVariantMap &info, int index,
                 qint64 from, qint64 through, bool csv, Counts &counts) {
     const auto id = info.value("id").toLongLong();
-    const QStringList settings{info["target"].toString(),
+    QStringList settings{info["target"].toString(),
                                info["family"].toString(),
                                info["intervalMs"].toString(),
                                info["protocol"].toString(),
@@ -97,13 +97,39 @@ void writeTrace(sqlite3 *db, History &history, QSaveFile &out, const QVariantMap
                                info["clockOffsetMs"].toString(),
                                info["clockErrorMs"].toString(),
                                info["manualCorrectionMs"].toString()};
+    // Probes, notes and diagnostics are each streamed chronologically. Reuse the
+    // effective settings across rows in the same epoch, including after seeking backwards.
+    Statement lookup(db, "SELECT (SELECT data FROM measurement_epochs WHERE session=?1 AND t<=?2 ORDER BY t DESC LIMIT 1),"
+                         "coalesce((SELECT max(t) FROM measurement_epochs WHERE session=?1 AND t<=?2),0),"
+                         "coalesce((SELECT min(t) FROM measurement_epochs WHERE session=?1 AND t>?2),253402300800000)");
+    qint64 epochStart = 1, epochEnd = 0;
+    QVariantMap actual;
     auto emitRecord = [&](QJsonObject record, QStringList fields) {
         if (csv) {
+            const auto t = fields.size() > 2 ? fields[2].toLongLong() : from;
+            if (t < epochStart || t >= epochEnd) {
+                lookup.reset(); lookup.integer(1,id); lookup.integer(2,t); lookup.next();
+                actual = QJsonDocument::fromJson(lookup.string(0).toUtf8()).object().toVariantMap();
+                epochStart = lookup.integer(1);
+                epochEnd = lookup.integer(2);
+            }
+            auto rowSettings = settings;
+            if (!actual.isEmpty()) {
+                rowSettings[10] = actual["resolvedAddress"].toString();
+                rowSettings[11] = actual.value("clockOffsetMs").toString();
+                rowSettings[12] = actual.value("clockErrorMs",-1).toString();
+            } else if (!info["remote"].toBool() && !info["imported"].toBool()) {
+                rowSettings[10].clear(); rowSettings[11].clear(); rowSettings[12] = "-1";
+            }
             fields.resize(9);
-            csvRow(out, fields + settings +
+            csvRow(out, fields + rowSettings +
                             QStringList{record.isEmpty() ? QString()
                                                          : QString::fromUtf8(QJsonDocument(record).toJson(
-                                                               QJsonDocument::Compact))});
+                                                               QJsonDocument::Compact)),
+                                info["payloadBytes"].toString(),info["dscp"].toString(),info["dontFragment"].toString(),
+                                actual.value("effectiveFamily").toString(), actual.value("effectiveProtocol").toString(),
+                                actual.value("effectivePort").toString(),actual.value("effectiveInterface").toString(),
+                                actual.value("sourceAddress").toString(),actual.value("flowMode").toString()});
         } else {
             record["trace"] = index;
             jsonLine(out, record);
@@ -111,23 +137,40 @@ void writeTrace(sqlite3 *db, History &history, QSaveFile &out, const QVariantMap
     };
     if (csv)
         emitRecord({}, {"session"});
-    Statement samples(db, "SELECT s.t,s.hop,s.address,s.rtt,s.dest FROM hops h CROSS JOIN samples s "
-                          "WHERE h.session=? AND s.session=h.session AND s.hop=h.hop "
-                          "AND s.t BETWEEN ? AND ? ORDER BY s.t,s.hop");
+    Statement epochs(db,"SELECT t,data FROM measurement_epochs WHERE session=?1 AND t BETWEEN "
+                        "coalesce((SELECT max(t) FROM measurement_epochs WHERE session=?1 AND t<=?2),?2) AND ?3 ORDER BY t");
+    epochs.integer(1,id); epochs.integer(2,from); epochs.integer(3,through);
+    bool nextEpoch = epochs.next();
+    auto writeEpochs = [&](qint64 until) {
+        while (nextEpoch && epochs.integer(0) <= until) {
+            auto measurement = QJsonDocument::fromJson(epochs.string(1).toUtf8()).object();
+            const auto stamp = std::max(from,epochs.integer(0));
+            if (csv) emitRecord(measurement, {"measurement",utc(stamp),QString::number(stamp)});
+            else emitRecord({{"kind","measurement"},{"t",stamp},{"settings",measurement}},{});
+            ++counts.measurements;
+            nextEpoch = epochs.next();
+        }
+    };
+    Statement samples(db, "SELECT s.t,s.hop,s.address,s.rtt,s.dest,f.data FROM samples s "
+                          "LEFT JOIN probe_failures f USING(session,hop,t) "
+                          "WHERE s.session=? AND s.t BETWEEN ? AND ? AND (s.hop>0 OR s.dest=2) ORDER BY s.t,s.hop");
     samples.integer(1, id);
     samples.integer(2, from);
     samples.integer(3, through);
     while (samples.next()) {
         const auto t = samples.integer(0), hop = samples.integer(1);
+        writeEpochs(t);
         const auto address = samples.string(2);
         const auto rtt = samples.number(3);
-        const bool destination = samples.integer(4);
+        const bool destination = hop ? samples.integer(4) == 1 : rtt >= 0;
+        const auto failure = QJsonDocument::fromJson(samples.string(5).toUtf8()).object();
+        const auto role = hop ? QStringLiteral("probe") : QStringLiteral("endpoint");
         if (csv)
-            emitRecord({}, {"probe", utc(t), QString::number(t), QString::number(hop), address,
+            emitRecord(failure, {role, utc(t), QString::number(t), QString::number(hop), address,
                             rtt < 0 ? QString() : QString::number(rtt, 'g', 17),
-                            rtt < 0 ? "timeout" : "reply", destination ? "true" : "false"});
+                            failure.isEmpty() ? (rtt < 0 ? "timeout" : "reply") : failure["kind"].toString(), destination ? "true" : "false"});
         else
-            emitRecord({{"kind", "probe"},
+            emitRecord({{"kind", role}, {"failure", failure},
                         {"t", t},
                         {"hop", hop},
                         {"address", address},
@@ -136,6 +179,7 @@ void writeTrace(sqlite3 *db, History &history, QSaveFile &out, const QVariantMap
                        {});
         ++counts.probes;
     }
+    writeEpochs(through);
     Statement notes(db, "SELECT t,body FROM notes WHERE session=? AND t BETWEEN ? AND ? ORDER BY t");
     notes.integer(1, id);
     notes.integer(2, from);
@@ -160,7 +204,7 @@ void writeTrace(sqlite3 *db, History &history, QSaveFile &out, const QVariantMap
                  history);
 }
 struct Cursor {
-    qint64 time = -1, note = -1;
+    qint64 time = -1, note = -1, measurement = -1;
     int hop = 0;
     QMap<QString, qint64> diagnostics;
 };
@@ -170,7 +214,8 @@ qint64 addTrace(History &history, QJsonObject meta, const QString &fallback, qin
     const auto family = integer(meta, "family", 0, 6);
     const auto interval = integer(meta, "intervalMs", 250, 60000);
     const ProbeOptions options{stringField(meta, "protocol", 8), int(integer(meta, "port", 0, 65535)),
-                               stringField(meta, "interfaceName", 255)};
+                               stringField(meta, "interfaceName", 255), int(meta.contains("payloadBytes") ? integer(meta,"payloadBytes",8,65507) : 16),
+                               int(meta.contains("dscp") ? integer(meta,"dscp",0,63) : 0), meta.value("dontFragment").toBool()};
     require(!target.trimmed().isEmpty() && (family == 0 || family == 4 || family == 6) && options.valid(),
             "Invalid incident trace settings.");
     auto location = modern ? stringField(meta, "location", 255) : QString{};
@@ -183,9 +228,12 @@ qint64 addTrace(History &history, QJsonObject meta, const QString &fallback, qin
     const auto applied = modern ? integer(meta, "manualCorrectionMs", -maxTime, maxTime) : 0;
     require(std::abs(applied + correction) <= maxTime, "Invalid cumulative clock adjustment.");
     const auto id = history.createSession(target, family, interval, options.protocol, options.port,
-                                          options.interfaceName);
+                                          options.interfaceName, options.payloadBytes, options.dscp, options.dontFragment);
     checkHistory(id > 0, history);
     checkHistory(history.setSessionOrigin(id, location, address, offset, uncertainty, received), history);
+    const auto identities = meta["identities"].toObject();
+    for (auto it = identities.begin(); it != identities.end(); ++it)
+        checkHistory(history.captureIdentity(id,it.key(),it.value().toObject().toVariantMap()),history);
     checkHistory(history.markImported(id, applied + correction), history);
     return id;
 }
@@ -194,7 +242,7 @@ void parseIncident(QFile &in, History &stage, IncidentRange &range, const QStrin
     const auto header = readRecord(in, 16 * 1024 * 1024);
     const auto kind = header["kind"].toString();
     require(kind == "hopview" || kind == "hopline", "Unsupported Hopview incident format.");
-    const int version = integer(header, "version", 1, 2);
+    const int version = integer(header, "version", 1, 3);
     const auto from = integer(header, "from", 0, maxTime);
     const auto through = integer(header, "through", from, maxTime);
     require(correction >= -maxTime && correction <= maxTime && from + correction >= 0 &&
@@ -218,7 +266,7 @@ void parseIncident(QFile &in, History &stage, IncidentRange &range, const QStrin
         }
     }
     for (const auto &entry : traces)
-        range.sessions.append(addTrace(stage, entry.toObject(), site, correction, version == 2));
+        range.sessions.append(addTrace(stage, entry.toObject(), site, correction, version >= 2));
     QVector<Cursor> cursors(traces.size());
     QVector<Sample> batch;
     Counts counts;
@@ -235,6 +283,7 @@ void parseIncident(QFile &in, History &stage, IncidentRange &range, const QStrin
             require(integer(record, "probes", 0, maxTime) == counts.probes &&
                         integer(record, "notes", 0, maxTime) == counts.notes &&
                         (version == 1 || integer(record, "diagnostics", 0, maxTime) == counts.diagnostics) &&
+                        (version < 3 || integer(record,"measurements",0,maxTime) == counts.measurements) &&
                         in.atEnd() && in.error() == QFile::NoError,
                     "Incident record count mismatch or trailing data.");
             flush();
@@ -244,8 +293,12 @@ void parseIncident(QFile &in, History &stage, IncidentRange &range, const QStrin
         const auto i = version == 1 ? 0 : integer(record, "trace", 0, range.sessions.size() - 1);
         const auto id = range.sessions[i];
         auto &cursor = cursors[i];
-        if (kind == "probe") {
-            const int hop = integer(record, "hop", 1, 255);
+        if (kind == "probe" || (version >= 3 && kind == "endpoint")) {
+            const bool endpoint = kind == "endpoint";
+            const int hop = integer(record, "hop", endpoint ? 0 : 1, endpoint ? 0 : 255);
+            ProbeFailure failure;
+            const auto details = record["failure"].toObject();
+            require(details.isEmpty() || (version >= 3 && ProbeFailure::read(details,failure)), "Invalid probe failure.");
             const auto address = stringField(record, "address", 255);
             const auto rtt = record.value("rtt");
             require(
@@ -257,17 +310,25 @@ void parseIncident(QFile &in, History &stage, IncidentRange &range, const QStrin
                     "Unordered or duplicate probe.");
             cursor.time = t;
             cursor.hop = hop;
-            batch.append({id, t, hop, address, rtt.toDouble(-1), record["destination"].toBool()});
+            require(details.isEmpty() || rtt.isNull(), "Failure with successful RTT");
+            batch.append({id, t, hop, address, failure.kind == "local-unsent" ? -2 : rtt.toDouble(-1),
+                          record["destination"].toBool(), failure});
             ++counts.probes;
             if (batch.size() >= 4096)
                 flush();
+        } else if (version >= 3 && kind == "measurement") {
+            const auto settings = record["settings"].toObject();
+            require(t > cursor.measurement && validMeasurement(settings),"Invalid measurement epoch.");
+            checkHistory(stage.setMeasurement(id,t,settings.toVariantMap()),stage);
+            cursor.measurement = t;
+            ++counts.measurements;
         } else if (kind == "note") {
             const auto note = stringField(record, "text", 2048);
             require(!note.trimmed().isEmpty() && t > cursor.note, "Invalid annotation.");
             checkHistory(stage.addNote(id, t, note), stage);
             cursor.note = t;
             ++counts.notes;
-        } else if (version == 2 && (kind == "interface" || kind == "service")) {
+        } else if (version >= 2 && (kind == "interface" || kind == "service")) {
             require(t > cursor.diagnostics.value(kind, -1), "Unordered or duplicate diagnostics record.");
             auto data = record.toVariantMap();
             data.remove("trace");
@@ -302,12 +363,31 @@ bool History::exportIncident(qint64 id, qint64 from, qint64 through, const QStri
         QJsonArray traces;
         for (const auto member : comparisons) {
             require(available.contains(member), "Recording could not be found.");
+            require(retainedResolution(member,from,through) == "Raw probes",
+                    "Part of the selected recording has expired raw probes. Choose a retained interval for raw export.");
             QJsonObject meta;
             const auto &session = available[member];
             for (const auto &key :
                  {"target", "family", "intervalMs", "protocol", "port", "interfaceName", "location",
-                  "resolvedAddress", "clockOffsetMs", "clockErrorMs", "lastReceivedMs", "manualCorrectionMs"})
+                  "resolvedAddress", "clockOffsetMs", "clockErrorMs", "lastReceivedMs", "manualCorrectionMs","payloadBytes","dscp","dontFragment"})
                 meta.insert(key, QJsonValue::fromVariant(session.value(key)));
+            const auto first = focusedMeasurement(member,from,from);
+            if (!first.isEmpty()) {
+                for (const auto &key : {"resolvedAddress","clockOffsetMs","clockErrorMs"})
+                    if (first.contains(key)) meta[key] = QJsonValue::fromVariant(first.value(key));
+            } else if (!session["remote"].toBool() && !session["imported"].toBool()) {
+                meta["resolvedAddress"] = "";
+                meta["clockOffsetMs"] = 0;
+                meta["clockErrorMs"] = -1;
+            }
+            QJsonObject identities;
+            Statement ips(db_,"SELECT DISTINCT address FROM samples WHERE session=? AND t BETWEEN ? AND ? AND hop>0 AND address<>''");
+            ips.integer(1,member); ips.integer(2,from); ips.integer(3,through);
+            while (ips.next()) {
+                const auto info = networkIdentity(member,ips.string(0));
+                if (!info.isEmpty()) identities.insert(ips.string(0),QJsonObject::fromVariantMap(info));
+            }
+            meta["identities"] = identities;
             traces.append(meta);
         }
         QSaveFile out(file);
@@ -337,10 +417,11 @@ bool History::exportIncident(qint64 id, qint64 from, qint64 through, const QStri
                          "clock_offset_ms",
                          "clock_error_ms",
                          "manual_correction_ms",
-                         "diagnostic_json"});
+                          "diagnostic_json","payload_bytes","dscp","dont_fragment","effective_family","effective_protocol",
+                         "effective_port","effective_interface","source_address","flow_mode"});
         else
             jsonLine(out, {{"kind", "hopview"},
-                           {"version", 2},
+                           {"version", 3},
                            {"from", from},
                            {"through", through},
                            {"traces", traces},
@@ -352,7 +433,7 @@ bool History::exportIncident(qint64 id, qint64 from, qint64 through, const QStri
             jsonLine(out, {{"kind", "end"},
                            {"probes", counts.probes},
                            {"notes", counts.notes},
-                           {"diagnostics", counts.diagnostics}});
+                           {"diagnostics", counts.diagnostics},{"measurements",counts.measurements}});
         tx.commit();
         if (!out.commit())
             throw std::runtime_error(out.errorString().toStdString());
@@ -408,8 +489,8 @@ bool History::adoptIncident(const QString &database, QList<qint64> &ids, qint64 
             const auto imported = sqlite3_last_insert_rowid(db_);
             // Reuse the validated rows and rollups. Never transfer local recorder intent or receiver
             // bindings.
-            for (const char *table : {"session_probe", "session_origin", "imported_sessions", "notes", "hops",
-                                      "samples", "bins", "diagnostic_records", "diagnostic_bins"}) {
+            for (const char *table : {"session_probe", "route_transitions", "route_gaps", "route_index", "route_checkpoints", "captured_identity", "session_origin", "imported_sessions", "notes", "hops",
+                                      "samples", "bins", "diagnostic_records", "diagnostic_bins", "measurement_epochs", "probe_failures", "probe_profiles"}) {
                 const QByteArray name(table);
                 const QByteArray schema = "PRAGMA main.table_info(" + name + ")";
                 Statement columns(db_, schema.constData());

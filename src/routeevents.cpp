@@ -8,8 +8,10 @@ QVariantMap RouteEvents::observe(const RouteRound &round) {
     if (!recent_.empty()) {
         const auto gap = round.timeMs - recent_.back().stamp;
         if (gap > std::max(5000LL, 4 * previousIntervalMs_)) {
-            for (auto &hop : hops_)
+            for (auto &hop : hops_) {
                 hop.streak = 0;
+                hop.recentRuns.clear();
+            }
             destinationStreak_ = 0;
             recent_.clear();
         }
@@ -24,7 +26,7 @@ QVariantMap RouteEvents::observe(const RouteRound &round) {
 
     // Save only changed/replaced addresses. Stable rounds allocate no path snapshots.
     QMap<int, QString> previous;
-    QSet<int> changed;
+    QSet<int> changed, returning;
     const int oldDestination = destination_;
     const QString oldTargetAddress = targetAddress_;
     if (round.destinationHop == destinationCandidate_ && round.destinationHop > 0)
@@ -41,6 +43,10 @@ QVariantMap RouteEvents::observe(const RouteRound &round) {
     for (int ttl = 1; ttl < hops_.size(); ++ttl) {
         auto &hop = hops_[ttl];
         const auto reply = round.replies.value(ttl);
+        if (!reply.isEmpty() && (hop.recentRuns.isEmpty() || hop.recentRuns.last() != reply)) {
+            hop.recentRuns.append(reply);
+            if (hop.recentRuns.size() > 32) hop.recentRuns.removeFirst();
+        }
         if (reply.isEmpty()) {
             hop.streak = 0;
         } else if (hop.candidate != reply || !hop.streak) {
@@ -49,6 +55,12 @@ QVariantMap RouteEvents::observe(const RouteRound &round) {
         } else if (hop.streak < confirmation) {
             if (++hop.streak == confirmation && hop.address != reply) {
                 previous.insert(ttl, hop.address);
+                if (hop.previous.contains(reply) || hop.recentRuns.count(reply) >= 3) returning.insert(ttl);
+                if (!hop.address.isEmpty()) {
+                    hop.previous.removeAll(hop.address);
+                    hop.previous.prepend(hop.address);
+                    if (hop.previous.size() > 16) hop.previous.removeLast();
+                }
                 if (!hop.address.isEmpty() && (!destination_ || ttl <= destination_))
                     changed.insert(ttl);
                 hop.address = reply;
@@ -88,7 +100,7 @@ QVariantMap RouteEvents::observe(const RouteRound &round) {
                             {"inBefore", ttl <= oldExtent}, {"inAfter", ttl <= newExtent},
                             {"wasTarget", ttl == oldDestination && before == oldTargetAddress},
                             {"isTarget", ttl == destination_ && current == targetAddress_},
-                            {"changed", changed.contains(ttl)}};
+                            {"knownAlternate", returning.contains(ttl)}, {"changed", changed.contains(ttl)}};
         if (changed.contains(ttl))
             numbers << QString::number(ttl);
     }
@@ -108,7 +120,36 @@ QVariantMap RouteEvents::observe(const RouteRound &round) {
         }
     }
     return {{"firstMs", recent_[start].stamp}, {"confirmedMs", round.timeMs},
-            {"startMs", recent_.front().stamp}, {"changedHops", numbers.join(", ")}, {"path", path},
+            {"startMs", recent_.front().stamp}, {"knownAlternate", !returning.isEmpty() && returning == changed && oldDestination == destination_}, {"changedHops", numbers.join(", ")}, {"path", path},
             {"beforeRtt", beforeN ? beforeSum / beforeN : -1}, {"afterRtt", afterN ? afterSum / afterN : -1},
             {"beforeN", beforeN}, {"afterN", afterN}};
+}
+
+QVariantMap RouteEvents::state() const {
+    QVariantList hops, outcomes;
+    for (const auto &hop : hops_)
+        hops.append(QVariant(QVariantList{hop.address, hop.candidate, hop.streak, hop.previous, hop.recentRuns}));
+    for (const auto &outcome : recent_)
+        outcomes.append(QVariant(QVariantList{outcome.stamp, outcome.rtt}));
+    return {{"hops", hops}, {"recent", outcomes}, {"destination", destination_},
+            {"candidate", destinationCandidate_}, {"streak", destinationStreak_},
+            {"target", targetAddress_}, {"interval", previousIntervalMs_}};
+}
+
+void RouteEvents::restore(const QVariantMap &state) {
+    *this = {};
+    if (state.isEmpty()) return;
+    for (const auto &item : state["hops"].toList()) {
+        const auto h = item.toList();
+        hops_.append({h.value(0).toString(), h.value(1).toString(), h.value(3).toStringList(), h.value(2).toInt(), h.value(4).toStringList()});
+    }
+    for (const auto &item : state["recent"].toList()) {
+        const auto o = item.toList();
+        recent_.push_back({o.value(0).toLongLong(), o.value(1).toDouble()});
+    }
+    destination_ = state["destination"].toInt();
+    destinationCandidate_ = state["candidate"].toInt();
+    destinationStreak_ = state["streak"].toInt();
+    targetAddress_ = state["target"].toString();
+    previousIntervalMs_ = state["interval"].toLongLong();
 }

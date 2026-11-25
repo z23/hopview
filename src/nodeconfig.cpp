@@ -7,6 +7,7 @@
 #include <QSslKey>
 #include <QSslSocket>
 #include <QTextStream>
+#include <QUrl>
 #include <cmath>
 
 namespace telemetry {
@@ -40,21 +41,45 @@ Trace parseTrace(const QJsonObject &o) {
     auto protocol = o.value("protocol").toString("auto");
     int port = o.contains("port") ? int(integer(o, "port", 0, 65535)) : 0;
     auto iface = o.value("interface").toString();
-    ProbeOptions options{protocol, port, iface};
+    if (o.contains("dontFragment") && !o["dontFragment"].isBool()) throw Error("Invalid fragmentation setting");
+    ProbeOptions options{protocol, port, iface,
+        int(o.contains("payloadBytes") ? integer(o,"payloadBytes",8,65507) : 16),
+        int(o.contains("dscp") ? integer(o,"dscp",0,63) : 0), o["dontFragment"].toBool()};
     if (!validText(target, 255) || !validText(iface, 63, true) ||
         (family != 0 && family != 4 && family != 6) || !options.valid())
         throw Error("Invalid target, family, protocol, interface or port");
+    QVariantMap diagnostics;
+    if (o.contains("diagnostics")) {
+        if (!o["diagnostics"].isObject()) throw Error("Expected diagnostic settings");
+        const auto settings = o["diagnostics"].toObject();
+        const auto address = settings["url"].toString();
+        const QUrl url(address, QUrl::StrictMode);
+        const auto device = settings["interface"].toString();
+        if ((!address.isEmpty() && (address.size() > 2048 || !url.isValid() || url.host().isEmpty() ||
+             (url.scheme() != "http" && url.scheme() != "https") || !url.userInfo().isEmpty() || url.hasFragment())) ||
+            !validText(device, 15, true) || device.contains('/') || device == "." || device == "..")
+            throw Error("Invalid service URL or diagnostic interface");
+        const auto seconds = settings.contains("seconds") ? integer(settings, "seconds", 5, 3600) : 30;
+        if (!address.isEmpty() || !device.isEmpty())
+            diagnostics = {{"url", address}, {"interface", device}, {"seconds", seconds}};
+    }
     return {target, family, int(o.contains("intervalMs") ? integer(o, "intervalMs", 250, 60000) : 1000),
-            options};
+            options, diagnostics};
 }
 
 QJsonObject traceObject(const Trace &t) {
-    return {{"target", t.target},
+    QJsonObject result{{"target", t.target},
             {"family", t.family},
             {"intervalMs", t.intervalMs},
             {"protocol", t.probes.protocol},
             {"port", t.probes.destinationPort()},
             {"interface", t.probes.interfaceName}};
+    // Omit defaults so existing collector stream identities remain stable.
+    if (t.probes.payloadBytes != 16) result["payloadBytes"] = t.probes.payloadBytes;
+    if (t.probes.dscp) result["dscp"] = t.probes.dscp;
+    if (t.probes.dontFragment) result["dontFragment"] = true;
+    if (!t.diagnostics.isEmpty()) result["diagnostics"] = QJsonObject::fromVariantMap(t.diagnostics);
+    return result;
 }
 
 QString filePath(const QString &base, const QJsonObject &o, const QString &key) {

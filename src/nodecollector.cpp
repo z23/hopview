@@ -1,6 +1,7 @@
 #include "nodeconfig.h"
 #include "nodejoin.h"
 #include "probe.h"
+#include "diagnostics.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
 #include <QDir>
@@ -42,7 +43,9 @@ QList<Trace> readTargets(const QJsonValue &value, bool allowEmpty) {
     QSet<QByteArray> seen;
     for (const auto &target : value.toArray()) {
         const auto trace = parseTrace(target.toObject());
-        const auto key = identity(trace);
+        auto probe = traceObject(trace);
+        probe.remove("diagnostics");
+        const auto key = QJsonDocument(probe).toJson(QJsonDocument::Compact);
         if (seen.contains(key))
             throw Error("Duplicate trace configuration");
         seen.insert(key);
@@ -67,10 +70,14 @@ class Spool {
         if (rc != SQLITE_OK)
             throw Error("Cannot open collector spool " + path);
         auto db = db_.get();
+        check(db, sqlite3_busy_timeout(db, 5000));
+        // A read-only outbox inspection can overlap both durable inserts and acknowledgements.
         execute(db,
-                "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;"
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"
                 "CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,body TEXT NOT NULL);"
                 "CREATE TABLE IF NOT EXISTS destination(name TEXT NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS spool_stats(id INTEGER PRIMARY KEY,dropped INTEGER NOT NULL);"
+                "INSERT OR IGNORE INTO spool_stats VALUES(1,0);"
                 "CREATE TABLE IF NOT EXISTS assignment(id INTEGER PRIMARY KEY CHECK(id=1),site TEXT NOT NULL,"
                 "revision INTEGER NOT NULL,targets TEXT NOT NULL);");
         Transaction tx(db, true);
@@ -125,6 +132,11 @@ class Spool {
             remove.next();
             ++dropped;
         }
+        if (dropped) {
+            Statement save(db, "UPDATE spool_stats SET dropped=dropped+? WHERE id=1");
+            save.integer(1, dropped);
+            save.next();
+        }
         tx.commit();
         bytes_ = total;
         if (dropped) {
@@ -137,20 +149,46 @@ class Spool {
         }
     }
 
-    QPair<qint64, QJsonObject> oldest() const {
-        Statement next(db_.get(), "SELECT id,body FROM outbox ORDER BY id LIMIT 1");
-        if (!next.next())
-            return {};
-        return {next.integer(0), QJsonDocument::fromJson(next.string(1).toUtf8()).object()};
+    QPair<qint64, QJsonArray> pending(int limit) const {
+        Statement rows(db_.get(), "SELECT id,body FROM outbox ORDER BY id LIMIT ?");
+        rows.integer(1, limit);
+        int size = 256;
+        qint64 last = 0;
+        QJsonArray entries;
+        while (rows.next()) {
+            const auto bytes = rows.string(1).toUtf8();
+            if (size + bytes.size() + 1 > maxFrame)
+                break;
+            size += bytes.size() + 1;
+            entries.append(QJsonDocument::fromJson(bytes).object());
+            last = rows.integer(0);
+        }
+        return {last, entries};
     }
-    void confirm(qint64 id) {
+    QJsonObject health() const {
+        Statement stats(db_.get(), "SELECT dropped,(SELECT count(*) FROM outbox),"
+                                   "(SELECT body FROM outbox ORDER BY id LIMIT 1) FROM spool_stats WHERE id=1");
+        stats.next();
+        const auto first = QJsonDocument::fromJson(stats.string(2).toUtf8()).object();
+        qint64 oldest = first["diagnostic"].toObject()["t"].toInteger();
+        for (const auto key : {"samples", "observations"}) {
+            const auto rows = first[key].toArray();
+            if (rows.isEmpty()) continue;
+            const auto stamp = rows.first().toArray().at(0).toInteger();
+            if (!oldest || stamp < oldest) oldest = stamp;
+        }
+        return {{"droppedBatches", stats.integer(0)}, {"queuedBatches", stats.integer(1)},
+                {"queuedBytes", bytes_}, {"oldestMs", oldest}};
+    }
+    void confirm(qint64 through) {
         auto db = db_.get();
         Transaction tx(db, true);
-        Statement item(db, "SELECT length(cast(body AS blob)) FROM outbox WHERE id=?");
-        item.integer(1, id);
-        const auto size = item.next() ? item.integer(0) : 0;
-        Statement del(db, "DELETE FROM outbox WHERE id=?");
-        del.integer(1, id);
+        Statement item(db, "SELECT coalesce(sum(length(cast(body AS blob))),0) FROM outbox WHERE id<=?");
+        item.integer(1, through);
+        item.next();
+        const auto size = item.integer(0);
+        Statement del(db, "DELETE FROM outbox WHERE id<=?");
+        del.integer(1, through);
         del.next();
         tx.commit();
         bytes_ -= size;
@@ -188,9 +226,25 @@ class Collector final : public QObject {
         }
         if (!plain_)
             ssl_ = tlsConfig(config, base, false);
+        diagnostics_ = new Diagnostics;
+        diagnostics_->moveToThread(&diagnosticThread_);
+        connect(&diagnosticThread_, &QThread::finished, diagnostics_, &QObject::deleteLater);
+        connect(diagnostics_, &Diagnostics::observation, this, [this](qint64 id, const QVariantMap &record) {
+            if (!traces_.contains(id) || addresses_.value(id).isEmpty()) return;
+            try {
+                auto body = recordHeader(id, record["t"].toLongLong());
+                body["diagnostic"] = QJsonObject::fromVariantMap(record);
+                spool_.push(body);
+                pump();
+            } catch (const std::exception &e) { fatal(e); }
+        });
+        diagnosticThread_.start();
         probe_ = new Probe;
         probe_->moveToThread(&probeThread_);
         connect(&probeThread_, &QThread::finished, probe_, &QObject::deleteLater);
+        connect(probe_, &Probe::measurement, this, [this](qint64 id,qint64,QVariantMap info) {
+            if (traces_.contains(id)) measurements_[id] = QJsonObject::fromVariantMap(info);
+        });
         connect(probe_, &Probe::resolved, this,
                 [this](qint64 id, const QString &address, const QString &, int) {
                     if (traces_.contains(id))
@@ -224,6 +278,8 @@ class Collector final : public QObject {
             if (!traces_.contains(id))
                 return;
             log(QString("%1: %2").arg(traces_.value(id).target, message));
+            if (failed) errors_[id] = message.simplified().left(200).trimmed();
+            else errors_.remove(id);
             if (failed)
                 QTimer::singleShot(30000, this, [this, id] { startProbe(id); });
         });
@@ -276,8 +332,10 @@ class Collector final : public QObject {
         active_ = std::move(next);
         if (!probe_)
             return;
-        for (const auto id : retired)
+        for (const auto id : retired) {
             QMetaObject::invokeMethod(probe_, [probe = probe_, id] { probe->stop(id); });
+            QMetaObject::invokeMethod(diagnostics_, [diag = diagnostics_, id] { diag->configure(id, {}, 0, {}); });
+        }
         for (const auto id : added)
             startProbe(id);
         if (!added.isEmpty() || !retired.isEmpty()) {
@@ -286,8 +344,10 @@ class Collector final : public QObject {
             // Keep retired trace metadata available to samples already queued for storage.
             QMetaObject::invokeMethod(this, [this, retired] {
                 for (const auto id : retired) {
+                    errors_.remove(id);
                     traces_.remove(id);
                     addresses_.remove(id);
+                    measurements_.remove(id);
                 }
             }, Qt::QueuedConnection);
         }
@@ -296,37 +356,61 @@ class Collector final : public QObject {
         if (!probe_ || active_.key(id).isEmpty())
             return;
         const auto t = traces_.value(id);
+        if (!t.diagnostics.isEmpty())
+            QMetaObject::invokeMethod(diagnostics_, [diag = diagnostics_, id, t] {
+                diag->configure(id, t.diagnostics, t.family, t.probes.interfaceName);
+            });
         QMetaObject::invokeMethod(probe_, [probe = probe_, id, t] {
             probe->start(id, t.target, t.family, t.intervalMs, t.probes.protocol, t.probes.port,
-                         t.probes.interfaceName);
+                         t.probes.interfaceName, t.probes.payloadBytes, t.probes.dscp, t.probes.dontFragment);
         });
     }
     void stopProbes() {
         if (!probe_)
             return;
+        QMetaObject::invokeMethod(diagnostics_, &Diagnostics::shutdown, Qt::BlockingQueuedConnection);
+        diagnosticThread_.quit();
+        diagnosticThread_.wait();
         QMetaObject::invokeMethod(probe_, &Probe::shutdown, Qt::BlockingQueuedConnection);
         probeThread_.quit();
         probeThread_.wait();
         probe_ = nullptr;
     }
 
+    QJsonObject recordHeader(qint64 id, qint64 stamp) const {
+        const auto t = traces_.value(id);
+        // Expiry and wall-vs-monotonic checks prevent attaching a pre-step estimate to new observations.
+        const auto age = estimateAge_.isValid() ? estimateAge_.elapsed() : -1;
+        const bool validClock = age >= 0 && age <= 60000 && std::abs(now() - estimateAt_ - age) < 20 &&
+                                std::abs(stamp - estimateAt_) <= 60000;
+        return QJsonObject{{"trace", traceObject(t)},
+                                {"resolvedAddress", addresses_.value(id)}, {"measurement",measurements_.value(id)},
+                                {"clockOffsetMs", validClock ? offsetMs_ : 0},
+                                {"clockErrorMs", validClock ? clockErrorMs_ : -1}};
+    }
+
     void enqueue(const QVector<Sample> &samples) {
+        lastProbeMs_ = std::max(lastProbeMs_, samples.back().timeMs);
         auto id = samples.front().session;
         const auto it = traces_.constFind(id);
         if (it == traces_.cend())
             return;
-        const auto &t = it.value();
-        // Expiry and wall-vs-monotonic checks prevent attaching a pre-step estimate to new observations.
-        const auto age = estimateAge_.isValid() ? estimateAge_.elapsed() : -1;
-        const bool validClock = age >= 0 && age <= 60000 && std::abs(now() - estimateAt_ - age) < 20 &&
-                                std::abs(samples.front().timeMs - estimateAt_) <= 60000;
-        auto body = QJsonObject{{"trace", traceObject(t)},
-                                {"resolvedAddress", addresses_.value(id)},
-                                {"clockOffsetMs", validClock ? offsetMs_ : 0},
-                                {"clockErrorMs", validClock ? clockErrorMs_ : -1}};
-        QJsonArray rows;
-        for (const auto &s : samples)
-            rows.append(QJsonArray{s.timeMs, s.hop, s.address, s.rttMs, s.destination});
+        const auto localFailure = std::find_if(samples.crbegin(), samples.crend(), [](const Sample &sample) {
+            return sample.failure.kind == "local-unsent";
+        });
+        if (localFailure != samples.crend())
+            errors_[id] = QString("Probe could not be sent (system error %1)").arg(localFailure->failure.systemError);
+        else errors_.remove(id);
+        auto body = recordHeader(id, samples.front().timeMs);
+        QJsonArray rows, detailed;
+        for (const auto &s : samples) {
+            QJsonArray row{s.timeMs,s.hop,s.address,s.rttMs,s.destination};
+            if (s.hop == 0 || !s.failure.kind.isEmpty()) {
+                row.append(s.failure.kind.isEmpty() ? QJsonObject{} : s.failure.json());
+                detailed.append(row);
+            } else rows.append(row);
+        }
+        if (!detailed.isEmpty()) body["observations"] = detailed;
         body["samples"] = rows;
         spool_.push(body);
     }
@@ -366,6 +450,8 @@ class Collector final : public QObject {
                 return;
             }
             QJsonObject message{{"type", "hello"}, {"token", token_}};
+            try { message["health"] = health(); }
+            catch (const std::exception &e) { fatal(e); return; }
             if (managed_) {
                 message["managed"] = true;
                 message["nodeId"] = nodeId_;
@@ -427,11 +513,33 @@ class Collector final : public QObject {
         deadline_.start(15000);
     }
 
+    QJsonObject health() const {
+        auto report = spool_.health();
+        report["reportMs"] = now();
+        report["targetCount"] = active_.size();
+        int maxIntervalMs = 0;
+        for (const auto id : active_) maxIntervalMs = std::max(maxIntervalMs, traces_.value(id).intervalMs);
+        report["maxIntervalMs"] = maxIntervalMs;
+        report["lastProbeMs"] = lastProbeMs_;
+        report["lastUploadMs"] = lastUploadMs_;
+        QJsonArray failures;
+        for (auto it = errors_.cbegin(); it != errors_.cend(); ++it) {
+            const auto t = traces_.value(it.key());
+            failures.append(QJsonObject{{"target", t.target}, {"family", t.family},
+                                        {"protocol", t.probes.protocol}, {"port", t.probes.destinationPort()},
+                                        {"message", it.value()}});
+        }
+        report["errors"] = failures;
+        return report;
+    }
+
     void pump() {
         if (!ready_ || seq_ >= 0)
             return;
         if (std::exchange(pingPending_, false)) {
             QJsonObject message{{"type", "ping"}};
+            try { message["health"] = health(); }
+            catch (const std::exception &e) { fatal(e); return; }
             if (managed_) {
                 message["appliedRevision"] = applied_;
                 message["applyError"] = applyError_;
@@ -439,9 +547,27 @@ class Collector final : public QObject {
             send(message, 0);
             return;
         }
-        const auto record = spool_.oldest();
-        if (record.first)
-            send({{"type", "batch"}, {"body", record.second}}, record.first);
+        const auto [through, records] = spool_.pending(grouped_ ? 32 : 1);
+        if (records.size() == 1) {
+            auto body = records.first().toObject();
+            if (!grouped_) {
+                auto rows = body["samples"].toArray();
+                for (const auto &entry : body.take("observations").toArray()) {
+                    auto row = entry.toArray();
+                    if (row.at(1).toInt() > 0 && row.at(3).toDouble() >= -1) {
+                        row.removeLast();
+                        rows.append(row);
+                    }
+                }
+                if (rows.isEmpty()) {
+                    lost("Upgrade receiver to store the queued diagnostic or detailed probe result");
+                    return;
+                }
+                body["samples"] = rows;
+            }
+            send({{"type", "batch"}, {"body", body}}, through);
+        } else if (!records.isEmpty())
+            send({{"type", "batches"}, {"bodies", records}}, through);
     }
 
     void readAck() {
@@ -503,13 +629,16 @@ class Collector final : public QObject {
                 applyError_ = reason;
             }
         }
+        if (!ready_) grouped_ = ack["multiBatch"].toBool();
         if (!ready_)
             log("Telemetry connection established for " + site_);
         ready_ = true;
         backoff_ = 1000;
         try {
-            if (confirmed > 0)
+            if (confirmed > 0) {
                 spool_.confirm(confirmed);
+                lastUploadMs_ = receivedWall;
+            }
             pump();
         } catch (const std::exception &e) {
             fatal(e);
@@ -519,18 +648,22 @@ class Collector final : public QObject {
     QString site_, host_, token_, nodeId_, applyError_;
     QByteArray pin_;
     qint64 applied_ = 0, nextId_ = 0;
-    bool managed_ = false, pingPending_ = false;
+    bool managed_ = false, pingPending_ = false, grouped_ = false;
+    qint64 lastProbeMs_ = 0, lastUploadMs_ = 0;
+    QHash<qint64, QString> errors_;
     int port_;
     bool plain_;
     Spool &spool_;
     QSslConfiguration ssl_;
-    QThread probeThread_;
+    QThread probeThread_, diagnosticThread_;
+    Diagnostics *diagnostics_ = nullptr;
     Probe *probe_ = nullptr;
     std::atomic<qint64> queuedSamples_{0};
     std::atomic_bool overloaded_{false};
     QHash<QByteArray, qint64> active_;
     QHash<qint64, Trace> traces_;
     QHash<qint64, QString> addresses_;
+    QHash<qint64, QJsonObject> measurements_;
     QSslSocket *socket_ = nullptr;
     QTimer reconnect_, deadline_, ping_;
     QElapsedTimer sentTimer_, estimateAge_;

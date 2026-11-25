@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS managed_collectors(
     applied_revision INTEGER NOT NULL DEFAULT 0, apply_error TEXT NOT NULL DEFAULT '',
     last_seen_ms INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS collector_health(site TEXT PRIMARY KEY,report TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receiver_certificate(
     id INTEGER PRIMARY KEY CHECK (id=1), fingerprint TEXT NOT NULL
 );
@@ -80,6 +81,7 @@ QString listJson(const QVariantList &entries) {
         }
         auto target = telemetry::traceObject(trace);
         auto identity = target;
+        identity.remove("diagnostics");
         identity["target"] = literal.isNull() ? trace.target.toCaseFolded() : literal.toString();
         const auto key = QJsonDocument(identity).toJson(QJsonDocument::Compact);
         if (unique.contains(key))
@@ -149,12 +151,20 @@ QVariantList CollectorManagement::nodes() {
     try {
         open();
         QVariantList result;
-        Statement rows(db_, "SELECT site,hostname,revision,applied_revision,apply_error,last_seen_ms,targets "
-                            "FROM managed_collectors WHERE node_id IS NOT NULL ORDER BY site COLLATE NOCASE,site");
+        Statement rows(db_, "SELECT site,hostname,revision,applied_revision,apply_error,last_seen_ms,targets,report "
+                            "FROM managed_collectors LEFT JOIN collector_health USING(site) WHERE node_id IS NOT NULL ORDER BY site COLLATE NOCASE,site");
         while (rows.next())
             result.append(QVariantMap{{"site", rows.string(0)}, {"hostname", rows.string(1)},
                 {"revision", rows.integer(2)}, {"appliedRevision", rows.integer(3)}, {"applyError", rows.string(4)},
-                {"lastSeenMs", rows.integer(5)}, {"targets", QJsonDocument::fromJson(rows.string(6).toUtf8()).array().toVariantList()}});
+                {"lastSeenMs", rows.integer(5)}, {"health", QJsonDocument::fromJson(rows.string(7).toUtf8()).object().toVariantMap()}, {"targets", QJsonDocument::fromJson(rows.string(6).toUtf8()).array().toVariantList()}});
+        Statement manual(db_, "SELECT h.site,h.report FROM collector_health h WHERE NOT EXISTS "
+                              "(SELECT 1 FROM managed_collectors m WHERE m.site=h.site) ORDER BY h.site COLLATE NOCASE");
+        while (manual.next()) {
+            const auto site = manual.string(0);
+            const auto health = QJsonDocument::fromJson(manual.string(1).toUtf8()).object().toVariantMap();
+            result.append(QVariantMap{{"site", site}, {"hostname", site}, {"manual", true},
+                {"lastSeenMs", health["lastSeenMs"]}, {"health", health}, {"targets", QVariantList{}}});
+        }
         return result;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
@@ -186,6 +196,46 @@ bool CollectorManagement::setTargets(const QString &site, qint64 expectedRevisio
         error_ = QString::fromUtf8(e.what());
         return false;
     }
+}
+
+void CollectorManagement::saveHealth(const QString &site, const QJsonObject &report, qint64 received) {
+    open();
+    QJsonObject clean{{"lastSeenMs", received}};
+    if (report.contains("reportMs")) clean["reportMs"] = telemetry::integer(report, "reportMs", 0, maxRevision);
+    if (report.contains("targetCount")) clean["targetCount"] = telemetry::integer(report, "targetCount", 0, 128);
+    if (report.contains("maxIntervalMs")) clean["maxIntervalMs"] = telemetry::integer(report, "maxIntervalMs", 0, 60000);
+    for (const auto *key : {"lastProbeMs", "lastUploadMs", "oldestMs", "droppedBatches", "queuedBatches", "queuedBytes"})
+        clean[key] = telemetry::integer(report, key, 0, maxRevision);
+    const auto errors = report["errors"].toArray();
+    if (!report["errors"].isArray() || errors.size() > 128)
+        throw telemetry::Error("Invalid collector health errors");
+    QJsonArray issues;
+    for (const auto &entry : errors) {
+        const auto issue = entry.toObject();
+        if (!telemetry::validText(issue["target"].toString(), 255) ||
+            !telemetry::validText(issue["message"].toString(), 200))
+            throw telemetry::Error("Invalid collector target error");
+        QJsonObject issueRow{{"target", issue["target"]}, {"message", issue["message"]}};
+        if (issue.contains("protocol")) {
+            const auto trace = telemetry::parseTrace(issue);
+            issueRow["family"] = trace.family;
+            issueRow["protocol"] = trace.probes.protocol;
+            issueRow["port"] = trace.probes.destinationPort();
+        }
+        issues.append(issueRow);
+    }
+    clean["errors"] = issues;
+    Statement save(db_, "INSERT OR REPLACE INTO collector_health VALUES(?,?)");
+    save.string(1, site);
+    save.string(2, QString::fromUtf8(QJsonDocument(clean).toJson(QJsonDocument::Compact)));
+    save.next();
+}
+
+bool CollectorManagement::hasKeyDigest(const QByteArray &digest) {
+    open();
+    Statement existing(db_, "SELECT 1 FROM managed_collectors WHERE key_digest=?");
+    existing.string(1, QString::fromLatin1(digest.toHex()));
+    return existing.next();
 }
 
 bool CollectorManagement::hasSite(const QString &site) {

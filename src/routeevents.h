@@ -15,12 +15,16 @@ struct RouteRound {
 // State survives read pages, including a candidate crossing a page boundary.
 class RouteEvents {
   public:
+    QVariantMap state() const;
+    void restore(const QVariantMap &state);
     QVariantMap observe(const RouteRound &round);
 
   private:
     struct Hop {
         QString address, candidate;
+        QStringList previous;
         int streak = 0;
+        QStringList recentRuns;
     };
     struct Outcome { qint64 stamp; double rtt; };
     QVector<Hop> hops_;

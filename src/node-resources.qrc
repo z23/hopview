@@ -2,4 +2,8 @@
     <qresource prefix="/defaults">
         <file alias="collector.json">../deploy/collector.example.json</file>
     </qresource>
+    <qresource prefix="/viewer">
+        <file alias="index.html">receiver-view.html</file>
+        <file alias="app.js">receiver-view.js</file>
+    </qresource>
 </RCC>

@@ -33,7 +33,7 @@ C.Dialog {
         backend.requestRouteHistory()
     }
     function timestamp(ms) {
-        return Qt.formatDateTime(new Date(ms), "yyyy-MM-dd HH:mm:ss.zzz")
+        return new Date(ms).toISOString().replace("T", " ").replace("Z", " UTC")
     }
     function rtt(mean, count) {
         return count > 0 ? qsTr("%1 ms (%2/3)").arg(Number(mean).toFixed(1)).arg(count) : qsTr("No replies")
@@ -55,7 +55,7 @@ C.Dialog {
                 events.append({firstMs: Number(e.firstMs), confirmedMs: Number(e.confirmedMs),
                                startMs: Number(e.startMs), beforeRtt: e.beforeRtt, afterRtt: e.afterRtt,
                                beforeN: e.beforeN, afterN: e.afterN, path: e.path,
-                               label: dialog.timestamp(e.firstMs) + qsTr("   ·   Changed hops %1").arg(e.changedHops)})
+                               label: dialog.timestamp(e.firstMs) + (e.knownAlternate ? qsTr("   ·   Known responder returned at %1") : qsTr("   ·   Changed hops %1")).arg(e.changedHops)})
             }
             if (dialog.followNewest && batch.length > 0) picker.currentIndex = events.count - 1
             dialog.scanning = !finished

@@ -99,6 +99,10 @@ def verify(binary, work):
                 until_message(stream, 3, targets[:1], lambda m: m.get("appliedRevision") == 3)
             await_backlog(3)
         assert log.read_text().count("127.0.0.1: 127.0.0.1 via") == 1, "unchanged target restarted"
+        # Simulate an older installation with unacknowledged rows in a rollback-journal spool.
+        with contextlib.closing(sqlite3.connect(spool)) as previous:
+            assert previous.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+            assert previous.execute("SELECT count(*) FROM outbox").fetchone()[0] >= 3
         # Drop queued connection attempts so the next accepted connection belongs to the new process.
         listener.setblocking(False)
         try:
@@ -109,6 +113,8 @@ def verify(binary, work):
         listener.settimeout(10)
         with run(config):
             with accept(listener) as stream:
+                with contextlib.closing(sqlite3.connect(spool)) as current:
+                    assert current.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
                 backlog = pending()
                 await_backlog(backlog + 3)
                 assert exchange(stream, 3, targets[:1])["appliedRevision"] == 3

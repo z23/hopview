@@ -147,12 +147,15 @@ void profileLayers(Layers &layers, const QVariantList &samples, qreal width,
 }
 
 void timelineLayers(Layers &layers, const QVariantList &samples, qreal width,
-                    qreal height, qreal ceiling, int pixels, qreal maxGap)
+                    qreal height, qreal ceiling, int pixels, qreal maxGap, qreal baselineP95)
 {
     auto y = [=](qreal rtt) { return height - 2 - std::clamp(rtt / ceiling, 0.0, 1.0) * (height - 5); };
-    if (ceiling > warningMs)
+    if (baselineP95 >= 0) {
+        if (ceiling > baselineP95)
+            rectangle(layers[Warning], 0, 0, width, y(baselineP95));
+    } else if (ceiling > warningMs)
         rectangle(layers[Warning], 0, ceiling > criticalMs ? y(criticalMs) : 0, width, y(warningMs));
-    if (ceiling > criticalMs)
+    if (baselineP95 < 0 && ceiling > criticalMs)
         rectangle(layers[Critical], 0, 0, width, y(criticalMs));
     for (int i = 0; i <= 4; ++i) {
         const qreal gx = (width - 1) * i / 4;
@@ -202,6 +205,9 @@ GraphView::GraphView(QQuickItem *parent) : QQuickItem(parent)
 void GraphView::setSamples(const QVariantList &v) { m_samples = v; emit samplesChanged(); update(); }
 void GraphView::setProfile(bool v) { if (m_profile != v) { m_profile = v; emit profileChanged(); update(); } }
 void GraphView::setPixels(int v) { if (m_pixels != v) { m_pixels = v; emit pixelsChanged(); update(); } }
+void GraphView::setBaselineP95(qreal value) {
+    if (m_baselineP95 != value) { m_baselineP95 = value; emit baselineP95Changed(); update(); }
+}
 void GraphView::setCeiling(qreal v) { if (m_ceiling != v && v > 0) { m_ceiling = v; emit ceilingChanged(); update(); } }
 void GraphView::setRowHeight(qreal v) { if (m_rowHeight != v) { m_rowHeight = v; emit rowHeightChanged(); update(); } }
 void GraphView::setMaxGap(qreal v) { if (m_maxGap != v) { m_maxGap = v; emit maxGapChanged(); update(); } }
@@ -225,7 +231,7 @@ QSGNode *GraphView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
     if (m_profile)
         profileLayers(layers, m_samples, width(), height(), m_rowHeight, m_ceiling);
     else
-        timelineLayers(layers, m_samples, width(), height(), m_ceiling, m_pixels, m_maxGap);
+        timelineLayers(layers, m_samples, width(), height(), m_ceiling, m_pixels, m_maxGap, m_baselineP95);
     QColor fill = m_accent;
     fill.setAlpha(23);
     const std::array<QColor, Count> colors = {

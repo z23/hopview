@@ -156,6 +156,15 @@ bool History::appendDiagnostic(qint64 id, const QVariantMap &record) {
         const bool event = !record["event"].toString().isEmpty();
         execute(db_, "SAVEPOINT diagnostic_sample");
         saving = true;
+        Statement expired(db_, "SELECT 1 FROM retention WHERE raw_before>?2 AND NOT EXISTS("
+                               "SELECT 1 FROM retention_pins WHERE session=?1 AND ?2 BETWEEN start_ms AND end_ms) "
+                               "AND NOT EXISTS(SELECT 1 FROM imported_sessions WHERE session=?1)");
+        expired.integer(1,id); expired.integer(2,t);
+        if (expired.next()) {
+            expired.reset();
+            execute(db_, "RELEASE diagnostic_sample");
+            return true;
+        }
         Statement q(
             db_, "INSERT INTO diagnostic_records VALUES(?,?,?,?,?,?) ON CONFLICT(session,kind,t) DO NOTHING");
         q.integer(1, id);

@@ -191,7 +191,11 @@ QVariantMap measureService(const QString &address, int family, const QString &bi
     const auto encoded = url.toEncoded(), device = QByteArray("if!") + bindInterface.toLocal8Bit();
     char message[CURL_ERROR_SIZE]{};
     curl_easy_setopt(curl, CURLOPT_URL, encoded.constData());
+#if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(curl, CURLOPT_PROXY, "");
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);

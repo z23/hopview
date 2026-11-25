@@ -21,6 +21,7 @@ struct Trace {
     QString target;
     int family, intervalMs;
     ProbeOptions probes;
+    QVariantMap diagnostics{};
 };
 
 bool validSite(const QString &site);

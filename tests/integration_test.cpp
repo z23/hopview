@@ -5,6 +5,8 @@
 #include "localreceiver.h"
 #include "collectormanagement.h"
 #include <QTcpServer>
+#include <QUdpSocket>
+#include <QNetworkDatagram>
 #include <QStandardPaths>
 #include <QUuid>
 #include <QJsonDocument>
@@ -108,6 +110,9 @@ bool fresh(Backend &b) {
 class Integration : public QObject {
     Q_OBJECT
   private slots:
+    void operatorWorkflows();
+    void pairedTraces();
+    void provisionComparison();
     void desktop();
     void alertControls();
     void diagnosticTracks();
@@ -120,13 +125,119 @@ class Integration : public QObject {
     void rangeSelection();
     void compareTargets();
     void baselineComparison();
+    void historicalInvestigation();
     void collectorControls();
     void incomingSites();
     void twoSiteWindow();
     void savedComparison();
     void saveFocus();
     void replayWhileProbing();
+    void firstVisibleReply();
 };
+
+void Integration::pairedTraces() {
+    QTemporaryDir dir;
+    Backend b(dir.filePath("pair.sqlite"));
+    b.startTracePair("localhost", 4, 6, 500, "udp", 33434, {}, false, 16,16,0,0);
+    QVERIFY(waitFor([&] { return b.sessions().size() == 2 && b.comparisonIds().size() == 1; }));
+    const auto peers = b.comparisonIds();
+    const auto primary = b.sessionId();
+    b.startTracePair("localhost", 4, 6, 500, "udp", 33434, {}, false, 16,16,0,0);
+    QCOMPARE(b.sessions().size(), 2);
+    QCOMPARE(b.comparisonIds(), peers);
+    QCOMPARE(b.sessionId(), primary);
+    b.startTracePair("localhost", 4, 4, 500, "udp", 33434, {}, false, 16,48,0,0);
+    QVERIFY(waitFor([&] { return b.sessions().size() == 3 && b.sessionId() == primary && b.comparisonIds() != peers; }));
+}
+
+void Integration::provisionComparison() {
+    QTemporaryDir dir;
+    const auto path = dir.filePath("sites.sqlite");
+    History h(path);
+    const auto primary = h.createSession("service.test", 4, 500, "tcp", 443);
+    QVERIFY(h.append({{primary, base, 1, "192.0.2.1", 4., true}}));
+    CollectorManagement manager(path);
+    const auto enrollment = manager.enroll(manager.createKey().section('.',1,1), QUuid::createUuid().toString(QUuid::WithoutBraces),
+                                           "west", {}, 0, {}, base);
+    const auto site = enrollment["site"].toString();
+    QVERIFY(!site.isEmpty());
+    Backend b(path);
+    b.refreshCollectors();
+    QVERIFY(waitFor([&]{return b.comparisonSites().size() == 1;}));
+    const auto choice = b.comparisonSites().first().toMap();
+    QCOMPARE(choice["managed"].toBool(), true);
+    const auto revision = choice["revision"].toLongLong();
+    QSignalSpy applied(&b, &Backend::siteComparisonApplied);
+    b.applySiteComparison({QVariantMap{{"site",site},{"revision",revision},{"assign",true}}});
+    QVERIFY(applied.wait());
+    const auto targets = manager.nodes().first().toMap()["targets"].toList();
+    QCOMPARE(targets.size(), 1);
+    QCOMPARE(targets.first().toMap()["port"].toInt(), 443);
+    const auto peer = h.receiverSession(site,"stream","service.test",4,500,"tcp",443,{});
+    QVERIFY(h.setSessionOrigin(peer,site,"192.0.2.1",0,1,base));
+    QVERIFY(h.append({{peer,base,1,"192.0.2.1",3.,true}}));
+    QVERIFY(waitFor([&] { return b.comparisonIds() == QVariantList{peer}; }));
+}
+
+void Integration::operatorWorkflows() {
+    QTemporaryDir dir;
+    const auto file = dir.filePath("history.sqlite");
+    History writer(file);
+    const auto first = writer.createSession("service.test", 4, 1000, "udp");
+    const auto second = writer.createSession("service.test", 4, 1000, "udp");
+    QVector<Sample> samples;
+    for (auto id : {first, second}) {
+        const QString address = id == first ? "192.0.2.10" : "192.0.2.11";
+        QVERIFY(writer.setSessionOrigin(id, id == first ? "North" : "South", address));
+        QVERIFY(writer.setMeasurement(id, base, {{"effectiveFamily",4},{"effectiveProtocol","udp"},
+            {"effectivePort",33434},{"resolvedAddress",address},{"clockOffsetMs",3},{"clockErrorMs",7}}));
+        for (int i = 0; i < 120; ++i) {
+            for (int ttl = 1; ttl <= 4; ++ttl) {
+                const bool downstream = id == first && i >= 60 && ttl >= 3;
+                const bool missed = (downstream && i % 6 == 0) || (ttl == 1 && i % 4 == 0);
+                samples.append({id, base + 1000LL * i, ttl, missed ? QString{} :
+                                ttl == 4 ? address : QString("192.0.2.%1").arg(ttl),
+                                missed ? -1. : ttl + (downstream ? 70. : 0.), ttl == 4 && !missed});
+            }
+        }
+    }
+    QVERIFY2(writer.append(samples), qPrintable(writer.error()));
+    Backend b(file);
+    b.selectSession(first);
+    const qint64 from = base + 60000, through = base + 119999;
+    b.zoomToRange(from, through);
+    b.compareSites();
+    QCOMPARE(b.comparisonIds(), QVariantList{second});
+    Window ui(b);
+    QVERIFY2(ui.win, qPrintable(ui.warnings.join('\n')));
+    QVERIFY(waitFor([&] { return fresh(b) && !b.snapshot()["impact"].toMap().isEmpty(); }));
+    const auto impact = b.snapshot()["impact"].toMap();
+    QCOMPARE(impact["state"].toString(), "affected");
+    QCOMPARE(impact["earliestHop"].toInt(), 3);
+    QCOMPARE(impact["received"].toInt(), 50);
+    QCOMPARE(impact["sent"].toInt(), 60);
+    QVERIFY(ui.win->property("endpointMismatch").toBool());
+
+    auto *fleet = ui.win->findChild<QObject *>("fleetDialog");
+    QVERIFY(fleet && QMetaObject::invokeMethod(fleet, "open"));
+    QSignalSpy ready(&b, &Backend::fleetReady);
+    b.requestFleet(from, through);
+    QVERIFY(ready.wait());
+    const auto cells = ready.last()[0].toList();
+    QCOMPARE(cells.size(), 2);
+    QCOMPARE(cells.first().toMap()["incident"].toMap()["p95"].toInt(), 74);
+    QVERIFY(QMetaObject::invokeMethod(fleet, "close"));
+    b.compareSessions({second, first}, from, through);
+    QVERIFY(waitFor([&] { return fresh(b) && b.snapshot()["impact"].toMap()["state"] == "answered"; }));
+    QSignalSpy copied(&b, &Backend::incidentSummaryReady);
+    b.copyIncidentSummary();
+    QVERIFY(copied.wait());
+    QVERIFY2(copied.first()[1].toString().isEmpty(), qPrintable(copied.first()[1].toString()));
+    const auto text = copied.first()[0].toString();
+    for (const auto &part : {"North", "South", "50/60", "p95 74.0 ms", "UDP/33434", "± 7 ms", "Downstream pattern from hop 3"})
+        QVERIFY2(text.contains(part), qPrintable(text));
+    QVERIFY2(ui.warnings.isEmpty(),qPrintable(ui.warnings.join('\n')));
+}
 
 void Integration::diagnosticTracks() {
     QTemporaryDir dir;
@@ -546,6 +657,49 @@ void Integration::routeHistory() {
     QCOMPARE(b.viewEnd(), base + 32000);
     QVERIFY(!history->property("visible").toBool());
     QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
+}
+
+void Integration::historicalInvestigation() {
+    QTemporaryDir dir;
+    const auto db=dir.filePath("navigate.sqlite");
+    const auto id=fill(db,300);
+    {
+        Backend backend(db);
+        Window ui(backend);
+        QVERIFY(ui.win && waitFor([&]{return fresh(backend);}));
+        auto *dialog=ui.win->findChild<QObject *>("incidentNavigator");
+        QVERIFY(dialog && QMetaObject::invokeMethod(dialog,"open"));
+        auto *start=dialog->findChild<QObject *>("utcStart");
+        auto *end=dialog->findChild<QObject *>("utcEnd");
+        QVERIFY(start && end);
+        // Two representations of the same time as a NOC ticket and its offset timestamp.
+        start->setProperty("text","2023-11-14 22:13:20 UTC");
+        end->setProperty("text","2023-11-15T09:13:30+11:00");
+        QVERIFY(QMetaObject::invokeMethod(dialog,"jump"));
+        QCOMPARE(backend.viewStart(),base);
+        QCOMPARE(backend.viewEnd(),base+10000);
+        backend.markBaseline("Weekday");
+        QVERIFY(waitFor([&]{return backend.savedBaseline().value("p95").toDouble()>0;}));
+        QSignalSpy rows(&backend,&Backend::respondersReady);
+        backend.requestResponders(3);
+        QVERIFY(waitFor([&]{return !rows.isEmpty();}));
+        QCOMPARE(rows.first()[2].toList().first().toMap()["replies"].toInt(),9);
+        QSignalSpy storage(&backend,&Backend::storageUpdated);
+        backend.storageAction("pin");
+        QVERIFY(waitFor([&]{return !storage.isEmpty();}));
+        QCOMPARE(storage.first()[0].toMap()["pins"].toInt(),1);
+        QVERIFY2(ui.warnings.isEmpty(),qPrintable(ui.warnings.join('\n')));
+    }
+    Backend restored(db);
+    QCOMPARE(restored.sessionId(),id);
+    QCOMPARE(restored.savedBaseline()["name"].toString(),"Weekday");
+    QCOMPARE(restored.savedBaseline()["through"].toLongLong(),base+10000);
+    QSignalSpy result(&restored,&Backend::comparisonReady);
+    restored.zoomToRange(base+86400000,base+86410000);
+    restored.compareYesterday();
+    QVERIFY(waitFor([&]{return !result.isEmpty();}));
+    QCOMPARE(result.first()[1].toLongLong(),base);
+    QCOMPARE(result.first()[0].toList().first().toMap()["baseline"].toMap()["sent"].toLongLong(),11);
 }
 
 void Integration::baselineComparison() {
@@ -1120,6 +1274,47 @@ void Integration::latencyColors() {
     const auto fast = window.grabWindow();
     QVERIFY(!fast.isNull());
     QCOMPARE(pixelAt(fast, 0.9), normal);
+}
+
+void Integration::firstVisibleReply() {
+    if (!qEnvironmentVariableIsSet("HOPVIEW_LIVE_TEST"))
+        QSKIP("Set HOPVIEW_LIVE_TEST=1 for the live first-reply benchmark.");
+    QTemporaryDir dir;
+    QUdpSocket server;
+    QVERIFY(server.bind(QHostAddress::LocalHost,0));
+    bool replied = false;
+    connect(&server,&QUdpSocket::readyRead,this,[&] {
+        while (server.hasPendingDatagrams()) {
+            const auto packet = server.receiveDatagram();
+            // Only the first, normal-TTL check gets an answer. The sweep remains in flight.
+            if (!replied) {
+                QCOMPARE(packet.data().size(), 1400);
+                QCOMPARE(server.writeDatagram(packet.makeReply(packet.data())), qint64(1400));
+                replied = true;
+            }
+        }
+    });
+    Backend b(dir.filePath("preview.db"));
+    Window ui(b);
+    QVERIFY2(ui.win,qPrintable(ui.warnings.join('\n')));
+    QVERIFY(waitFor([&]{return ui.win->isExposed();}));
+    QElapsedTimer start;
+    start.start();
+    b.startTrace("127.0.0.1",4,5000,"udp",server.localPort(),{},false,1400,46,true);
+    auto *preview = findItem(ui.win->contentItem(), "roundReplies");
+    QVERIFY(preview);
+    QVERIFY(waitFor([&]{return preview->isVisible() && preview->property("text").toString().contains("127.0.0.1");}));
+    QVERIFY(!ui.win->grabWindow().isNull());
+    const auto firstFrame = start.elapsed();
+    QCOMPARE(b.snapshot()["endpoint"].toMap()["sent"].toInt(), 0);
+    QVERIFY(waitFor([&]{return b.snapshot()["endpoint"].toMap()["sent"].toInt() == 1;}));
+    qInfo("Start to first visible reply: %lld ms; complete round displayed: %lld ms.", firstFrame,start.elapsed());
+    QVERIFY(firstFrame < start.elapsed());
+    QCOMPARE(b.snapshot()["endpoint"].toMap()["loss"].toDouble(),0.);
+    const auto actual = b.snapshot()["measurement"].toMap();
+    QCOMPARE(actual["effectiveProtocol"].toString(), "udp");
+    QCOMPARE(actual["effectiveInterface"].toString(), "lo");
+    QCOMPARE(actual["sourceAddress"].toString(), "127.0.0.1");
 }
 
 void Integration::replayWhileProbing() {

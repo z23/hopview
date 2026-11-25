@@ -10,6 +10,7 @@ class GraphView : public QQuickItem {
     Q_PROPERTY(QVariantList samples READ samples WRITE setSamples NOTIFY samplesChanged)
     Q_PROPERTY(bool profile READ profile WRITE setProfile NOTIFY profileChanged)
     Q_PROPERTY(int pixels READ pixels WRITE setPixels NOTIFY pixelsChanged)
+    Q_PROPERTY(qreal baselineP95 READ baselineP95 WRITE setBaselineP95 NOTIFY baselineP95Changed)
     Q_PROPERTY(qreal ceiling READ ceiling WRITE setCeiling NOTIFY ceilingChanged)
     Q_PROPERTY(qreal rowHeight READ rowHeight WRITE setRowHeight NOTIFY rowHeightChanged)
     Q_PROPERTY(qreal maxGap READ maxGap WRITE setMaxGap NOTIFY maxGapChanged)
@@ -26,6 +27,8 @@ public:
     void setSamples(const QVariantList &samples);
     void setProfile(bool profile);
     void setPixels(int pixels);
+    qreal baselineP95() const { return m_baselineP95; }
+    void setBaselineP95(qreal value);
     void setCeiling(qreal ceiling);
     void setRowHeight(qreal height);
     void setMaxGap(qreal gap);
@@ -35,6 +38,7 @@ signals:
     void profileChanged();
     void pixelsChanged();
     void ceilingChanged();
+    void baselineP95Changed();
     void rowHeightChanged();
     void maxGapChanged();
     void accentChanged();
@@ -45,6 +49,7 @@ private:
     QVariantList m_samples;
     bool m_profile = false;
     int m_pixels = 1;
+    qreal m_baselineP95 = -1;
     qreal m_ceiling = 100;
     qreal m_rowHeight = 30;
     qreal m_maxGap = 2;

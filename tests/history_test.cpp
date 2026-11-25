@@ -6,6 +6,7 @@
 #include "incident.h"
 #include <QFile>
 #include "routeevents.h"
+#include <cerrno>
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -97,7 +98,7 @@ void test(const QString &file) {
     const qint64 fStart = base + 109075, fEnd = base + 6485552;
     const int width = 83;
     const auto view = reader.view(id, start, end, fStart, fEnd, {1, 0, 3}, width);
-    require(reader.error().isEmpty(), "Reading historical view");
+    require(reader.error().isEmpty(), qPrintable("Reading historical view: " + reader.error()));
     const auto rows = view["rows"].toList(), charts = view["charts"].toList();
     require(rows.size() == 3 && charts.size() == 2, "Requested charts include destination once");
     Expected focus[3];
@@ -140,6 +141,59 @@ void test(const QString &file) {
     require(notes.size() == 1 && notes.first().toMap()["text"] == "updated", "Notes follow viewport");
     require(writer.addNote(id, base, QString()), "Delete annotation");
     require(reader.view(id, base, base + 50, base, base, {}, 1)["notes"].toList().isEmpty(), "Deleted note");
+}
+
+void testEndpointEvidence(const QTemporaryDir &dir) {
+    History history(dir.filePath("endpoint.db"));
+    const auto id = history.createSession("service.example",4,1000,"udp",443,{},1400,46,true);
+    const auto router = QStringLiteral("192.0.2.1"), target = QStringLiteral("192.0.2.10");
+    const QVariantMap settings{{"resolvedAddress",target},{"effectiveFamily",4},{"effectiveProtocol","udp"},
+        {"effectivePort",443},{"effectiveInterface","eth0"},{"sourceAddress","192.0.2.9"},{"flowMode","fixed-udp"}};
+    require(history.setMeasurement(id,1000,settings),"Persist effective configuration");
+    auto alternate = settings;
+    alternate["flowMode"] = "separate-ports";
+    require(history.setMeasurement(id,2000,alternate),"Record flow transition");
+    const ProbeFailure tooBig{"packet-too-big",router,3,4,1280,EMSGSIZE};
+    const ProbeFailure unsent{"local-unsent",{},-1,-1,0,EMSGSIZE};
+    const QVector<Sample> samples{
+        // Route lengthened. Every measured path TTL expires but a normal-TTL probe succeeds.
+        {id,1000,1,router,1,false}, {id,1000,8,router,2,false}, {id,1000,0,target,9,true},
+        // A successful sweep must not override an independent endpoint timeout.
+        {id,2000,0,{},-1,false},{id,2000,10,target,11,true},
+        {id,3000,0,{},-1,false,tooBig},{id,3000,1,{},-1,false,tooBig},
+        {id,4000,0,{},-2,false,unsent},{id,4000,1,{},-2,false,unsent}};
+    require(history.append(samples) && history.append(samples),"Retry independently attributed probes");
+    auto verify = [&](History &reader,qint64 session) {
+        auto view = reader.view(session,1000,4000,1000,4000,{0},8);
+        auto dst = view["endpoint"].toMap(), actual = view["measurement"].toMap();
+        require(dst["sent"].toInt()==3 && dst["received"].toInt()==1 && dst["avg"].toDouble()==9,
+                "Only transmitted endpoint probes determine destination statistics");
+        require(actual["mixed"].toBool() && actual["flowMode"]=="separate-ports","Focus flags flow change");
+        const auto ptb = reader.view(session,3000,3000,3000,3000,{0},1)["endpointFailure"].toMap();
+        require(ptb["router"]==router && ptb["mtu"]==1280 && ptb["type"]==3 && ptb["code"]==4,
+                "Packet too big carries reporter, ICMP code and MTU");
+        auto local = reader.view(session,4000,4000,4000,4000,{0},1);
+        require(local["endpoint"].toMap()["sent"].toInt()==0 && local["endpointFailure"].toMap()["kind"]=="local-unsent",
+                "Unsent probes retain local error and stay outside loss denominator");
+        const auto info = reader.sessions().first().toMap();
+        require(info["payloadBytes"].toInt()==1400 && info["dscp"]==46 && info["dontFragment"].toBool(),
+                "Stored test profile");
+    };
+    verify(history,id);
+    const auto csv = dir.filePath("endpoint.csv");
+    require(history.exportIncident(id,1000,4000,csv,true),"Export measured and configured profiles");
+    QFile exported(csv);
+    require(exported.open(QIODevice::ReadOnly),"Read profile CSV");
+    const auto content = exported.readAll();
+    require(content.contains("effective_interface") && content.contains("separate-ports") && content.contains("packet-too-big") &&
+            content.contains("local-unsent"),"CSV retains observed settings and explicit failures");
+    const auto file = dir.filePath("endpoint.hopview");
+    require(history.exportIncident(id,1000,4000,file,false),"Export endpoint evidence");
+    History replay(dir.filePath("endpoint-replay.db"));
+    IncidentRange range;
+    QString error;
+    require(importIncident(file,replay,range,error),"Replay endpoint evidence");
+    verify(replay,range.sessions.first());
 }
 
 void testRouteChange(const QString &file) {
@@ -586,6 +640,147 @@ void testManagedCollectors(const QString &path) {
             "Deliver an explicitly empty revision");
 }
 
+void preservedRouteIndex(const QTemporaryDir &dir) {
+    constexpr qint64 day = 86400000;
+    History h(dir.filePath("frozen-index.db"));
+    const auto id = h.createSession("upstream", 4, 1000);
+    for (int d = 1; d <= 3; ++d) {
+        QVector<Sample> batch;
+        for (int i = 0; i < 12; ++i) {
+            const auto t = d * day + 1000 * (i < 3 ? i : i + 12);
+            batch << Sample{id, t, 1, i < 5 ? "192.0.2.1" : "192.0.2.2", 2., false}
+                  << Sample{id, t, 2, "198.51.100.1", 8., true};
+        }
+        require(h.append(batch), "Append route epochs");
+    }
+    const auto frozen = h.timelineEvents(id, 2 * day, 3 * day - 1);
+    require(frozen.size() >= 2, "Capture original day-two transition and gap");
+    require(h.pinInterval({id}, day, day + 25000) && h.setRetention(1, 7) && h.maintainStorage(4 * day),
+            "Archive unpinned intervening day");
+    require(h.append({{id, day + 4000, 1, "192.0.2.7", 4., false}}), "Backfill an earlier pinned interval");
+    bool more;
+    do {
+        require(h.advanceRouteIndex(id, more), "Reindex late raw evidence");
+    } while (more);
+    require(h.timelineEvents(id, 2 * day, 3 * day - 1) == frozen,
+            "Reindex preserves frozen intervening events");
+}
+
+void operationalHistory(const QTemporaryDir &dir) {
+    const auto file = dir.filePath("operations.sqlite");
+    History h(file);
+    constexpr qint64 day = 86400000, start = 2 * day;
+    const auto id = h.createSession("target", 4, 1000);
+    const auto other = h.createSession("other", 4, 1000);
+    QVector<Sample> batch;
+    for (int i = 0; i < 12; ++i) {
+        const QString ip = i < 3 || i >= 7 ? "192.0.2.1" : "192.0.2.2";
+        batch << Sample{id, start + i * 1000, 1, ip, 3., false}
+              << Sample{id, start + i * 1000, 2, "198.51.100.1", 14., true};
+        batch << Sample{other, start + i * 1000, 1, "198.51.100.2", 20., true};
+    }
+    require(h.append(batch), qPrintable(h.error()));
+    require(h.append({{id, start + 25000, 2, "198.51.100.1", 15., true}}), "Append after a collection gap");
+    const auto responders = h.responders(id, 1, start, start + 11000);
+    require(responders.size() == 2 && responders[0].toMap()["replies"] == 8, "Responder reply frequencies");
+    bool more = false;
+    qint64 cursor = -1;
+    QVariantList events;
+    require(h.indexedRoutes(id, cursor, events, more) && !more && events.size() == 2 &&
+                events.last().toMap()["knownAlternate"].toBool(),
+            "Index returns known alternate across rounds");
+    require(h.addNote(id, start + 1000, "ticket"), "Add incident note");
+    const auto timeline = h.timelineEvents(id, start, start + 25000);
+    require(timeline.size() == 4 && timeline.first().toMap()["kind"] == "gap",
+            "Indexed routes, gap and note share the UTC interval");
+
+    QFile inventory(dir.filePath("inventory.tsv"));
+    require(inventory.open(QIODevice::WriteOnly), "Create inventory");
+    inventory.write("192.0.2.0/24\t64500\tmetro\ttransit\t\toperator snapshot\n"
+                    "192.0.2.1/32\t64501\tmetro-A\tpeer\tc-100\toperator inventory\n");
+    inventory.close();
+    require(h.importInventory(inventory.fileName()), qPrintable(h.error()));
+    auto identity = h.networkIdentity(id, "192.0.2.1");
+    require(identity["asn"] == "AS64501" && identity["circuit"] == "c-100", "Longest-prefix handoff context");
+    QFile routes(dir.filePath("demo.pfx2as"));
+    require(routes.open(QIODevice::WriteOnly), "Create origin snapshot");
+    routes.write("192.0.2.2\t32\t64510_64520,64530\n");
+    routes.close();
+    require(h.importInventory(routes.fileName()), qPrintable(h.error()));
+    const auto origin = h.networkIdentity(id, "192.0.2.2");
+    require(origin["asn"] == "AS64510_64520,64530" && origin["originPrefix"] == "192.0.2.2/32" &&
+                origin["pop"] == "metro" && origin["originSource"] == "demo.pfx2as",
+            "Combine routing origin and local labels");
+    const auto clip = dir.filePath("handoff.hopview");
+    require(h.exportIncident(id, start, start + 25000, clip, false), qPrintable(h.error()));
+    History replay(dir.filePath("handoff-replay.db"));
+    IncidentRange range;
+    QString error;
+    require(importIncident(clip, replay, range, error), qPrintable(error));
+    require(replay.networkIdentity(range.sessions.first(), "192.0.2.1") == identity,
+            "Carry label provenance in replay");
+    require(replay.networkIdentity(range.sessions.first(), "192.0.2.2") == origin,
+            "Replay preserves both inventory sources");
+    require(h.storeBaseline(id, "Weekday", start, start + 11000, h.destinationP95(id, start, start + 11000)),
+            "Save named baseline");
+    require(History(file).namedBaselines().first().toMap()["p95"] == 14., "Baseline survives reopening");
+
+    const auto copy = dir.filePath("healthy-backup.db");
+    require(h.onlineBackup(copy), qPrintable(h.error()));
+    require(!h.onlineBackup(copy), "Backup must not overwrite");
+    require(!h.onlineBackup(file + "-journal") && !QFileInfo::exists(file + "-journal"),
+            "Backup cannot create a live database sidecar");
+    require(History(copy).namedBaselines().size() == 1, "Backup includes committed WAL state");
+    require(h.pinInterval({id}, start, start + 1500), "Pin incident before expiry");
+    require(h.setRetention(2, 6) && h.maintainStorage(5 * day), "Enforce retention");
+    require(h.retainedResolution(id, start, start + 25000) == "Raw probes" &&
+                h.responders(id, 1, start, start + 11000).size() == 2,
+            "Pin preserves raw evidence");
+    require(h.retainedResolution(other, start, start + 11000) == "Includes 10-second summaries" &&
+                h.responders(other, 1, start, start + 11000).isEmpty(),
+            "Expire only unpinned raw evidence");
+    auto view = h.view(other, start, start + 19999, start, start + 19999, {0}, 400);
+    const auto buckets = view["charts"].toList().first().toMap()["buckets"].toList();
+    require(buckets.size() == 2 && buckets.first().toMap()["sent"] == 10 &&
+                buckets.last().toMap()["sent"] == 2,
+            "Fine viewport displays retained 10-second summaries exactly once");
+    const QVector<Sample> delayed = {{other, start + 1000, 1, "198.51.100.2", 20., true}};
+    require(h.append(delayed) && h.responders(other, 1, start, start + 11000).isEmpty(),
+            "Delayed upload cannot resurrect expired raw data or double-count rollups");
+    require(!h.exportIncident(other, start, start + 11000, dir.filePath("expired.csv"), true),
+            "Reject an incomplete raw export");
+    const auto archived = h.destinationPeriods(other, start, start + 19999)["incident"].toMap();
+    require(archived["sent"].toInt() == 12 && archived["received"].toInt() == 12 &&
+                archived["p95"].toInt() == -1 &&
+                h.lastDestinationSampleAt(other, start + 19999) == start + 11000,
+            "Archived fleet counts and last capture remain available");
+    require(h.comparePeriods(other, start, start + 9999, start + 10000, start + 19999, [] { return false; })
+                    .isEmpty() &&
+                !h.error().isEmpty(),
+            "Exact comparison reports expired raw evidence");
+    require(
+        h.maintainStorage(10 * day) &&
+            h.view(other, start, start + 19999, start, start + 19999, {0}, 400)["rows"].toList().isEmpty(),
+        "Expire summary tier");
+    require(h.responders(id, 1, start, start + 11000).size() == 2,
+            "Pinned raw evidence outlives both cutoffs");
+    require(h.releasePin(id, start, start + 3600000 - 1) &&
+                h.responders(id, 1, start, start + 11000).isEmpty() &&
+                h.view(id, start, start + 19999, start, start + 19999, {0}, 40)["rows"].toList().isEmpty(),
+            "Release a pin atomically and expire both overdue tiers without advancing the clock");
+    const auto later = 12 * day;
+    const QVector<Sample> adjacent = {{id, later, 1, "192.0.2.5", 12., true},
+                                      {id, later + 3600000, 1, "192.0.2.5", 17., true}};
+    require(h.append(adjacent) && h.pinInterval({id}, later, later) &&
+                h.pinInterval({id}, later + 3600000, later + 3600000) && h.maintainStorage(20 * day),
+            "Create adjacent pins through expiry");
+    require(h.retainedResolution(id, later, later + 3600000) == "Raw probes",
+            "Adjacent pins cover a shared focus");
+    require(h.pinInterval({id}, later, later + 3600000) && h.releasePin(id, later, later + 7199999) &&
+                h.retainedResolution(id, later, later + 3600000) == "Raw probes",
+            "Releasing an overlapping pin preserves other protected hours");
+}
+
 void benchmark(const QString &file) {
     constexpr qint64 base = 1720012345000;
     constexpr int hops = 15, seconds = 86400;
@@ -641,10 +836,13 @@ int main(int argc, char **argv) {
             benchmark(dir.filePath("bench.sqlite"));
         else {
             test(dir.filePath("history.sqlite"));
+            operationalHistory(dir);
+            preservedRouteIndex(dir);
             testIncident(dir);
             testManagedCollectors(dir.filePath("managed.db"));
             testPeriodComparison(dir.filePath("baseline.db"));
             testComparisonEvidence(dir);
+            testEndpointEvidence(dir);
             testRouteChange(dir.filePath("routes.sqlite"));
             testRouteEvents(dir.filePath("route-events.sqlite"));
             testDestinationAlerts(dir.filePath("alerts.sqlite"));

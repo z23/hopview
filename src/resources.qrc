@@ -1,5 +1,7 @@
 <RCC><qresource prefix="/">
   <file>Main.qml</file>
+  <file>FleetDialog.qml</file>
+  <file>SiteComparison.qml</file>
   <file>DiagnosticTrack.qml</file>
   <file>DiagnosticSettings.qml</file>
   <file>AlertsDialog.qml</file>
@@ -7,6 +9,9 @@
   <file>CollectorTargets.qml</file>
   <file>RemoteSources.qml</file>
   <file>BaselineDialog.qml</file>
+  <file>IncidentNavigator.qml</file>
+  <file>HopResponders.qml</file>
+  <file>StorageDialog.qml</file>
   <file>RouteHistory.qml</file>
   <file>TraceButton.qml</file>
   <file>TraceCombo.qml</file>

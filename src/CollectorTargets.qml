@@ -26,8 +26,8 @@ ColumnLayout {
     spacing: 8
 
     function target(t) {
-        return {target: t.target, family: Number(t.family || 0), protocol: t.protocol || "auto",
-                port: Number(t.port || 0), intervalMs: Number(t.intervalMs || 1000), interface: t.interface || ""}
+        return Object.assign({}, t, {target: t.target, family: Number(t.family || 0), protocol: t.protocol || "auto",
+                port: Number(t.port || 0), intervalMs: Number(t.intervalMs || 1000), interface: t.interface || ""})
     }
     function load(info) {
         site = info.site
@@ -42,7 +42,11 @@ ColumnLayout {
         const ip = t.family ? "IPv" + t.family : qsTr("Auto IP")
         let method = t.protocol.toUpperCase()
         if (t.port) method += " / " + t.port
-        return ip + "  ·  " + method + "  ·  " + t.intervalMs + " ms" + (t.interface ? "  ·  " + t.interface : "")
+        const summary = [ip, method, t.intervalMs + " ms"]
+        if (t.interface) summary.push(t.interface)
+        if (t.diagnostics?.url) summary.push(t.diagnostics.url)
+        if (t.diagnostics?.interface) summary.push(qsTr("%1 counters").arg(t.diagnostics.interface))
+        return summary.join("  ·  ")
     }
     function editRow(i, values) {
         editIndex = i
@@ -52,6 +56,12 @@ ColumnLayout {
         protocol.currentIndex = ["auto", "icmp", "udp", "tcp"].indexOf(t.protocol)
         port.text = String(t.port || (t.protocol === "tcp" ? 443 : 33434))
         interval.text = String(t.intervalMs)
+        serviceUrl.text = t.diagnostics?.url || ""
+        diagnosticInterface.text = t.diagnostics?.interface || ""
+        serviceInterval.text = String(t.diagnostics?.seconds || 30)
+        sizeBox.text = String(t.payloadBytes || 16)
+        dscpBox.text = String(t.dscp || 0)
+        df.checked = !!t.dontFragment
         iface.text = t.interface
         editing = true
         problem = ""
@@ -59,14 +69,27 @@ ColumnLayout {
     }
     function storeRow() {
         const name = destination.text.trim()
-        if (!name || !interval.acceptableInput || (protocol.currentIndex !== 1 && !port.acceptableInput)) {
+        if (serviceUrl.text.trim() && !serviceInterval.acceptableInput) {
+            problem = qsTr("Choose a service interval between 5 and 3600 seconds.")
+            return
+        }
+        if (!name || !sizeBox.acceptableInput || !dscpBox.acceptableInput || !interval.acceptableInput || (protocol.currentIndex !== 1 && !port.acceptableInput)) {
             problem = qsTr("Enter a destination, an interval from 250 to 60000 ms and a valid port.")
             return
         }
-        const row = target({target: name, family: [0,4,6][family.currentIndex],
+        const row = target(Object.assign({}, editIndex < 0 ? {} : draft[editIndex], {target: name, family: [0,4,6][family.currentIndex],
             protocol: ["auto","icmp","udp","tcp"][protocol.currentIndex],
             port: protocol.currentIndex === 1 ? 0 : Number(port.text),
-            intervalMs: Number(interval.text), interface: iface.text.trim()})
+            intervalMs: Number(interval.text), interface: iface.text.trim()}))
+        delete row.payloadBytes
+        delete row.dscp
+        delete row.dontFragment
+        if (protocol.currentIndex !== 3 && Number(sizeBox.text) !== 16) row.payloadBytes = Number(sizeBox.text)
+        if (Number(dscpBox.text)) row.dscp = Number(dscpBox.text)
+        if (protocol.currentIndex !== 3 && df.checked) row.dontFragment = true
+        delete row.diagnostics
+        if (serviceUrl.text.trim() || diagnosticInterface.text.trim())
+            row.diagnostics = {url: serviceUrl.text.trim(), interface: diagnosticInterface.text.trim(), seconds: Number(serviceInterval.acceptableInput ? serviceInterval.text : 30)}
         if (draft.some((t, i) => i !== editIndex && JSON.stringify(t) === JSON.stringify(row))) {
             problem = qsTr("That target is already in this list.")
             return
@@ -81,7 +104,7 @@ ColumnLayout {
     function current() {
         const t = activeTrace
         editRow(-1, {target: t.target, family: t.family, protocol: t.protocol, port: t.port,
-                     intervalMs: t.intervalMs, interface: ""})
+                     intervalMs: t.intervalMs, interface: "",payloadBytes:t.payloadBytes,dscp:t.dscp,dontFragment:t.dontFragment})
     }
     Connections {
         target: backend
@@ -197,7 +220,19 @@ ColumnLayout {
                     maximumLength: 5; validator: IntValidator { bottom: 250; top: 60000 }
                     Accessible.name: qsTr("Interval in milliseconds")
                 }
-                Info { text: qsTr("Interface") }
+                Info { text: qsTr("Payload bytes"); visible: protocol.currentIndex !== 3 }
+                EditField { id: sizeBox; visible: protocol.currentIndex !== 3; Layout.fillWidth: true; validator: IntValidator { bottom: 8; top: 65507 } Accessible.name: qsTr("Payload bytes") }
+                Info { text: qsTr("DSCP") }
+                EditField { id: dscpBox; Layout.fillWidth: true; validator: IntValidator { bottom: 0; top: 63 } Accessible.name: qsTr("DSCP") }
+                C.CheckBox { id: df; Layout.columnSpan: 2; visible: protocol.currentIndex !== 3; text: qsTr("Require unfragmented datagrams") }
+                Info { text: qsTr("Service URL") }
+                EditField { id: serviceUrl; objectName: "collectorServiceUrl"; Layout.fillWidth: true; maximumLength: 2048; placeholderText: qsTr("Optional HTTP(S) endpoint"); Accessible.name: qsTr("Service URL on collector") }
+                Info { text: qsTr("Service interval (s)"); visible: serviceUrl.text.length > 0 }
+                EditField { id: serviceInterval; visible: serviceUrl.text.length > 0; Layout.fillWidth: true; validator: IntValidator { bottom: 5; top: 3600 }
+                    Accessible.name: qsTr("Service interval in seconds") }
+                Info { text: qsTr("Interface counters") }
+                EditField { id: diagnosticInterface; objectName: "collectorDiagnosticInterface"; Layout.fillWidth: true; maximumLength: 15; placeholderText: qsTr("Optional device on collector"); Accessible.name: qsTr("Interface for traffic counters") }
+                Info { text: qsTr("Probe interface") }
                 EditField {
                     id: iface; Layout.fillWidth: true; maximumLength: 63
                     placeholderText: qsTr("System route"); Accessible.name: qsTr("Outgoing interface on the collector")

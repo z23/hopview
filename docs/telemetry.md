@@ -50,6 +50,18 @@ hopview --database /home/alex/hopview/remote.db
 
 On a dedicated receiver, the service stores its database at `/var/lib/hopview-receiver/history.sqlite` by default. For a live desktop sharing that file, both processes need access to the database and its directory on the same local filesystem. To inspect a snapshot on another machine, use your database’s online backup facility. Alternatively, stop all processes using the database, copy the file and any accompanying `-wal` and `-shm` files together, then restart collection. Open the transferred database with `hopview --database PATH`.
 
+## Open a recording from another desk
+
+A dedicated TLS receiver can serve recordings to read-only users over HTTPS. Add a separate listener to the receiver configuration and restart its service. It uses the receiver certificate and listen address. Supply a separate viewer password file readable by the receiver account, containing 32–256 random printable ASCII characters.
+
+```json
+"viewer": {"port": 8348, "tokenFile": "viewer.token"}
+```
+
+Open the receiver hostname on that port in a browser, accept a certificate issued by a trusted CA, and sign in as `reader` using the viewer password. Choose a recording and UTC range, then **Inspect**. Copy the resulting URL for a colleague to open the same time window. **Latest 15 min** refreshes the inventory and window. The endpoint supports concurrent readers while the receiver records samples. Desktop management of assignments still uses the receiver’s local database.
+
+Automated readers can use the same HTTPS Basic credentials with `GET /api/sessions` and `GET /api/view?session=ID&from=START&through=END`. Times are inclusive UTC epoch milliseconds. An interval can cover up to 31 days. The response includes per-hop statistics and destination chart buckets. Disable this listener by removing the `viewer` setting and restarting the receiver.
+
 ## Keep a manually configured collector
 
 Existing collectors can continue to use a local target list. On the receiver add a `sites` object mapping each site name to its token file, for example `{"sites":{"melbourne-vm":"melbourne-vm.token"}}`. Provision a separate random token for each site and copy that token to the corresponding VM. This mode accepts target changes through the local configuration file.
@@ -79,7 +91,13 @@ The receiver creates a recording for each location, resolved endpoint and probe 
 
 The timeline uses the original collector timestamps in UTC. After each acknowledged message the VM estimates its clock difference from the receiver using all four send/receive timestamps. The reported offset is the collector clock minus the receiver clock. A positive value means the VM clock runs ahead. The uncertainty includes half the observed network round trip and a two-millisecond timestamp allowance. It measures relative alignment between those machines. Keep them synchronized with their usual time service. Estimates expire after a minute or a detected wall-clock step. A queued batch carries the estimate available when it was collected, or unknown. The session displays the estimate for its most recent sample. Replaying an older batch preserves that estimate. Arrival time indicates upload freshness. Older samples can arrive after reconnection.
 
-The VM writes completed rounds to its on-disk outbox before upload. The receiver acknowledges a batch after storing the samples and metadata. Resending the same round preserves its original sample count. The retry interval grows to one minute. The default outbox holds 64 MiB of serialized telemetry, plus database overhead. Set `spoolMiB` to a value from 1 to 4096 to adjust the limit. When full, the collector discards its oldest batches and logs the count. `SIGTERM` preserves committed batches for the next launch. A spool is tied to its site and endpoint. Use a new path if either changes.
+The VM writes completed rounds to its on-disk outbox before upload. The SQLite outbox uses full-synchronous WAL transactions so an operator can inspect it through a read-only connection while collection continues. The receiver acknowledges a batch after storing the samples and metadata. Resending the same round preserves its original sample count. The retry interval grows to one minute. The default outbox holds 64 MiB of serialized telemetry, plus database overhead. Set `spoolMiB` to a value from 1 to 4096 to adjust the limit. When full, the collector discards its oldest batches and logs the count. `SIGTERM` preserves committed batches for the next launch. A spool is tied to its site and endpoint. Use a new path if either changes.
+
+### Check collector health and run remote diagnostics
+
+In **Collectors**, a managed or manually configured VM running this version reports its latest probe and acknowledged upload, queued and dropped batch counts, the timestamp of its oldest queued observation and target setup errors. A disconnected VM shows the health figures last received. The drop count survives a service restart. Updated receivers acknowledge up to 32 queued records in a single transfer within the existing frame-size limit. Acknowledgement follows storage of the entire group and retrying a partially stored group preserves observation counts.
+
+In the collector’s target editor, set **Service URL**, **Service interval** or **Interface counters**. Choose the interface name on the VM. These checks run at the PoP and follow the target’s recording, with the same diagnostic timeline and portable incident format as desktop checks. For a manually configured collector, set the target’s `diagnostics` object, for example `{"url":"https://service.example.net/health","seconds":30,"interface":"eth0"}`. Upgrade the receiver before assigning these checks.
 
 ## Build the headless binaries from source
 
@@ -91,3 +109,7 @@ build-node/hopview-node --help
 ```
 
 The same executable runs the collector and receiver without a display. The source tree includes the service units, service account definition and example configurations in [deploy/](../deploy/).
+
+## Receiver history retention
+
+The receiver uses the retention settings in its history database. To set them at startup, add a `retention` object to the receiver configuration, for example `{"rawDays": 30, "summaryDays": 365}`. Zero means unlimited. Configure the same values in the desktop if both processes share the database. The receiver performs maintenance at startup and every hour. Use **Recording storage** in the local desktop to pin an incident, check storage growth, or make an online backup. A full backup contains receiver management records and should be stored like the live database.

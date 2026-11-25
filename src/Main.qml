@@ -86,9 +86,47 @@ C.ApplicationWindow {
     property double rangeAnchorMs: -1
     property double rangeEndMs: -1
     readonly property bool selectingRange: rangeAnchorMs >= 0 && rangeEndMs >= 0
+    function failureText(f) {
+        if (!f || !f.kind) return ""
+        const name = {"local-unsent":qsTr("Local send failed"), "unreachable":qsTr("Unreachable"),
+            "filtered":qsTr("Administratively filtered"), "packet-too-big":qsTr("Packet too big"),
+            "icmp-error":qsTr("ICMP error")}[f.kind] || f.kind
+        return name + (f.router ? " · " + f.router : "") + (f.type >= 0 ? " · ICMP " + f.type + "/" + f.code : "")
+            + (f.mtu > 0 ? " · MTU " + f.mtu : "") + (f.kind === "local-unsent" ? " · errno " + f.errno : "")
+    }
     function sourceLabel(info) {
         if (!info) return ""
         return info.location ? info.location + " · " + info.target : info.target
+    }
+    function profileLabel(info, measured) {
+        if (!info) return ""
+        const v = measured || {}
+        const family = v.effectiveFamily || info.family
+        let method = (v.effectiveProtocol || info.protocol || "auto").toUpperCase()
+        const port = v.effectiveProtocol ? v.effectivePort : info.port
+        if (port && (method === "UDP" || method === "TCP")) method += "/" + port
+        if (method === "AUTO") method = qsTr("Auto")
+        let label = (family ? "IPv" + family : "Auto IP") + " " + method
+        if (info.payloadBytes && info.payloadBytes !== 16) label += " " + info.payloadBytes + " B"
+        if (info.dscp) label += " DSCP " + info.dscp
+        if (info.dontFragment) label += " DF"
+        return label
+    }
+    function measurementLabel(info, measured) {
+        if (!measured || !measured.effectiveProtocol) return qsTr("Effective settings unknown · configured %1").arg(profileLabel(info))
+        let result = profileLabel(info, measured) + " · " + measured.resolvedAddress
+        if (measured.effectiveInterface) result += " · " + measured.effectiveInterface
+        if (measured.mixed) result += qsTr(" · settings changed within focus")
+        if (measured.partial) result += qsTr(" · earlier settings unknown")
+        if (info && info.location)
+            result += measured.clockErrorMs >= 0 ? qsTr(" · clock offset %1 ± %2 ms").arg(measured.clockOffsetMs).arg(measured.clockErrorMs)
+                        : qsTr(" · clock alignment unknown")
+        return result
+    }
+    readonly property bool endpointMismatch: {
+        const primary = backend.snapshot.measurement || {}
+        return charts.some(c => c.comparisonId && (primary.mixed || c.measurement?.mixed ||
+            (primary.resolvedAddress && c.measurement?.resolvedAddress && c.measurement.resolvedAddress !== primary.resolvedAddress)))
     }
     property bool inputError: false
     property string exportStatus: ""
@@ -110,9 +148,9 @@ C.ApplicationWindow {
     function timeAt(x) { return Math.round(backend.viewStart + Math.max(0, Math.min(1, x)) * viewSpan) }
     function timeText(t, detailed) {
         if (t <= 0) return "—"
-        const pattern = detailed ? (viewSpan < 10000 ? "ddd d MMM, HH:mm:ss.zzz" : "ddd d MMM, HH:mm:ss")
-                                 : viewSpan >= 86400000 ? "ddd HH:mm" : viewSpan < 10000 ? "HH:mm:ss.zzz" : "HH:mm:ss"
-        return Qt.formatDateTime(new Date(t), pattern)
+        const iso = new Date(t).toISOString()
+        if (detailed) return iso.replace("T"," ").replace("Z"," UTC")
+        return viewSpan >= 86400000 ? iso.slice(5,16).replace("T"," ") : iso.slice(11, viewSpan < 10000 ? 23 : 19)
     }
     function durationText(ms) {
         if (ms < 1000) return Math.round(ms) + " ms"
@@ -161,8 +199,24 @@ C.ApplicationWindow {
         let target = destination.text.trim()
         if (!target.length) { inputError = true; destination.forceActiveFocus(); return }
         inputError = false
-        backend.startTrace(target, [0, 4, 6][family.currentIndex], [250, 500, 1000, 2500, 5000][interval.currentIndex],
-                           probeControls.protocol, probeControls.port, probeControls.interfaceName)
+        const cadence = [250, 500, 1000, 2500, 5000][interval.currentIndex]
+        const dual = family.currentIndex === 3
+        const af = [0, 4, 6, 4][family.currentIndex]
+        const profile = probeControls.comparison || "off"
+        if (dual && profile !== "off") {
+            app.exportStatus = qsTr("Choose one address family for a size or DSCP comparison.")
+            exportMessageTimer.restart()
+            return
+        }
+        if (dual || profile !== "off") {
+            backend.startTracePair(target, af, dual ? 6 : af, cadence, probeControls.protocol, probeControls.port,
+                probeControls.interfaceName, probeControls.dontFragment, probeControls.payloadBytes,
+                profile === "size" ? probeControls.comparisonPayloadBytes : probeControls.payloadBytes,
+                probeControls.dscp, profile === "dscp" ? probeControls.comparisonDscp : probeControls.dscp)
+        } else {
+            backend.startTrace(target, af, cadence, probeControls.protocol, probeControls.port, probeControls.interfaceName,
+                               false, probeControls.payloadBytes, probeControls.dscp, probeControls.dontFragment)
+        }
     }
     onChartWidthChanged: pixelTimer.restart()
     onUiScaleChanged: pixelTimer.restart()
@@ -263,12 +317,17 @@ C.ApplicationWindow {
                         border.color: app.inputError ? app.lossColor : destination.activeFocus ? app.accent : "#3a4956"
                     }
                 }
-                TraceCombo { id: family; visible: !backend.replayMode; implicitWidth: 83; model: ["Auto IP", "IPv4", "IPv6"]; hint: "Address family" }
+                TraceCombo { id: family; visible: !backend.replayMode; implicitWidth: 83; model: ["Auto IP", "IPv4", "IPv6", "IPv4 + IPv6"]; hint: "Address family or paired dual-stack comparison" }
                 TraceCombo { id: interval; visible: !backend.replayMode; implicitWidth: 85; model: ["0.25 s", "0.5 s", "1 s", "2.5 s", "5 s"]; currentIndex: 2; hint: "Interval between trace rounds" }
                 ProbeControls { id: probeControls; visible: !backend.replayMode; }
                 TraceButton { text: "Start trace"; visible: !backend.replayMode; primary: true; accent: app.accent; onClicked: app.launch() }
                 Caption { visible: backend.replayMode; text: "Offline incident replay" }
                 Item { Layout.fillWidth: true; visible: workspace.width > 950 || backend.replayMode }
+                TraceButton {
+                    visible: backend.sessions.length > 0 && workspace.width > 1060
+                    text: qsTr("Site health"); hint: qsTr("Compare destination health across sites")
+                    onClicked: fleet.open()
+                }
                 TraceButton {
                     visible: backend.collectorManagementAvailable && backend.sessions.length > 0 && workspace.width > 950
                     text: qsTr("Collectors…"); hint: qsTr("Enroll a VM or manage its targets")
@@ -313,7 +372,7 @@ C.ApplicationWindow {
                         leftPadding: 12
                         spacing: 7
                         Rectangle { width: 6; height: 6; radius: 3; anchors.verticalCenter: parent.verticalCenter; color: tab.modelData.running ? app.accent : app.faint }
-                        Caption { id: tabName; width: Math.min(210, implicitWidth); anchors.verticalCenter: parent.verticalCenter; color: tab.active ? app.ink : app.mute; text: app.sourceLabel(tab.modelData) }
+                        Caption { id: tabName; width: Math.min(210, implicitWidth); anchors.verticalCenter: parent.verticalCenter; color: tab.active ? app.ink : app.mute; text: app.sourceLabel(tab.modelData) + " · " + app.profileLabel(tab.modelData, tab.modelData) }
                     }
                     TapHandler {
                         enabled: !backend.replayMode
@@ -432,6 +491,7 @@ C.ApplicationWindow {
                 Row {
                     anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
                     TraceButton { visible: backend.groupNames.length > 0; text: qsTr("Saved comparisons…"); onClicked: compareDialog.open() }
+                    TraceButton { text: qsTr("Site health…"); onClicked: fleet.open() }
                     TraceButton { text: "Open incident…"; onClicked: openIncident.open() }
                     TraceButton { objectName: "openCollectors"; visible: backend.collectorManagementAvailable; text: qsTr("Collectors…"); onClicked: sourcesDialog.open() }
                     TraceButton { visible: backend.backgroundAvailable; text: "Recording and alerts…"; onClicked: alertsDialog.open() }
@@ -473,12 +533,18 @@ C.ApplicationWindow {
                                 width: 230
                                 background: Rectangle { color: app.panel; border.color: app.edge; radius: 5 }
                                 ActionItem { visible: backend.collectorManagementAvailable; text: qsTr("Collectors…"); onTriggered: sourcesDialog.open() }
+                                ActionItem { text: qsTr("Site health…"); onTriggered: fleet.open() }
+                                ActionItem { text: qsTr("Choose comparison sites…"); onTriggered: siteComparison.open() }
                                 ActionItem { text: qsTr("Compare time ranges…"); onTriggered: baselineDialog.open() }
                                 ActionItem { text: qsTr("Mark focus as baseline"); onTriggered: backend.markBaseline() }
                                 ActionItem { objectName: "diagnosticsAction"; text: qsTr("Service and interface…"); enabled: !backend.replayMode && !!app.currentSession && !app.currentSession.remote && !app.currentSession.imported; onTriggered: diagnosticSettings.open() }
+                                ActionItem { text: qsTr("Find incident by UTC time…"); onTriggered: incidentNavigator.open() }
+                                ActionItem { text: qsTr("Hop responders and inventory…"); onTriggered: hopResponders.open() }
+                                ActionItem { text: qsTr("Recording storage…"); enabled: !backend.replayMode; onTriggered: storageDialog.open() }
                                 ActionItem { text: "Route history…"; onTriggered: routeHistory.open() }
                                 ActionItem { text: "Recording and alerts…"; enabled: backend.backgroundAvailable; onTriggered: alertsDialog.open() }
                                 C.MenuSeparator {}
+                                ActionItem { objectName: "copySummary"; text: qsTr("Copy incident summary"); onTriggered: backend.copyIncidentSummary() }
                                 ActionItem { text: "Save graph as PNG…"; onTriggered: app.chooseExport() }
                                 ActionItem { text: "Export focus as CSV…"; onTriggered: app.chooseIncident(true) }
                                 ActionItem { objectName: "saveIncidentAction"; text: "Save replayable incident…"; onTriggered: app.chooseIncident(false) }
@@ -496,6 +562,34 @@ C.ApplicationWindow {
                             hint: "Time window used for hop statistics"
                         }
                         TraceButton { objectName: "pauseButton"; visible: !backend.replayMode && !app.currentSession?.remoteLive && !app.currentSession?.imported; text: backend.running ? "Pause" : "Resume"; onClicked: backend.toggleRunning(); hint: backend.running ? "Pause collection" : "Resume collection for this target" }
+                    }
+                    Caption {
+                        id: impactLabel
+                        objectName: "destinationImpact"
+                        readonly property var impact: backend.snapshot.impact || {}
+                        visible: impact.sent !== undefined
+                        Layout.fillWidth: true; Layout.leftMargin: 16; Layout.rightMargin: 16
+                        Layout.preferredHeight: 22
+                        color: impact.state === "affected" ? "#f7b891" : app.ink
+                        text: impact.description ? qsTr("Destination %1/%2 replies · %3").arg(impact.received).arg(impact.sent).arg(impact.description) : ""
+                        HoverHandler { id: impactHover }
+                        C.ToolTip.visible: impactHover.hovered
+                        C.ToolTip.text: impactLabel.text + qsTr("\nPersistence requires evidence in both halves of the focus. Latency is compared with the preceding equal interval.")
+                    }
+                    Caption {
+                        objectName: "roundReplies"
+                        Layout.fillWidth: true; Layout.leftMargin: 12; Layout.rightMargin: 12
+                        visible: backend.live && backend.running && backend.provisionalReplies.length > 0
+                        text: qsTr("Latest replies · ") + backend.provisionalReplies
+                        elide: Text.ElideRight
+                        C.ToolTip.visible: previewHover.hovered
+                        C.ToolTip.text: backend.provisionalReplies
+                        HoverHandler { id: previewHover }
+                    }
+                    Caption {
+                        Layout.fillWidth: true; Layout.leftMargin: 12
+                        visible: !!backend.snapshot.endpointFailure?.kind
+                        text: qsTr("Latest endpoint error in focus · ") + app.failureText(backend.snapshot.endpointFailure)
                     }
                     Rectangle {
                         Layout.fillWidth: true; implicitHeight: 29
@@ -542,7 +636,8 @@ C.ApplicationWindow {
                                         height: app.rowSize
                                         color: hover.hovered ? "#21313d" : index % 2 === 1 ? "#17242e" : app.panel
                                         HoverHandler { id: hover }
-                                        MouseArea { x: 22; width: parent.width - x; height: parent.height; onClicked: backend.toggleHop(hopRow.modelData.hop) }
+                                        MouseArea { x: 22; width: parent.width - x; height: parent.height; acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                            onClicked: e => { if (e.button === Qt.RightButton) hopResponders.showHop(hopRow.modelData.hop); else backend.toggleHop(hopRow.modelData.hop) } }
                                         Row {
                                             width: parent.width
                                             Item {
@@ -568,12 +663,13 @@ C.ApplicationWindow {
                                             Caption {
                                                 width: app.hostWidth; height: app.rowSize
                                                 rightPadding: 7
-                                                text: (hopRow.modelData.routeChanged ? "↪ " : "") + (hopRow.modelData.hostname || hopRow.modelData.address || "No reply")
+                                                text: (hopRow.modelData.routeChanged ? "↪ " : "") + (hopRow.modelData.hostname || hopRow.modelData.address || app.failureText(hopRow.modelData.lastFailure) || "No reply") + (hopRow.modelData.identity?.prefix
+                                                      ? "  " + [hopRow.modelData.identity.asn,hopRow.modelData.identity.pop,hopRow.modelData.identity.peer,hopRow.modelData.identity.circuit,hopRow.modelData.identity.prefix].filter(Boolean).join(" · ") : "")
                                                 color: hopRow.modelData.destination ? app.accent : hopRow.modelData.address ? app.ink : app.faint
                                                 font.family: "monospace"; font.pixelSize: 12
-                                                C.ToolTip.visible: addressHover.hovered && !!hopRow.modelData.address
-                                                C.ToolTip.text: (hopRow.modelData.hostname ? hopRow.modelData.hostname + " · " : "")
-                                                    + (hopRow.modelData.address || "") + (hopRow.modelData.routeChanged
+                                                C.ToolTip.visible: addressHover.hovered && (!!hopRow.modelData.address || !!hopRow.modelData.lastFailure?.kind)
+                                                C.ToolTip.text: (hopRow.modelData.lastFailure?.kind ? qsTr("Latest error in focus · ") + app.failureText(hopRow.modelData.lastFailure) + "\n" : "") + (hopRow.modelData.hostname ? hopRow.modelData.hostname + " · " : "")
+                                                    + (hopRow.modelData.address || "") + (hopRow.modelData.identity?.source ? "\n" + hopRow.modelData.identity.prefix + " · " + hopRow.modelData.identity.source + " · " + hopRow.modelData.identity.updated : "") + (hopRow.modelData.routeChanged
                                                     ? "\nResponder changed during focus · first " + hopRow.modelData.firstAddress : "")
                                                 C.ToolTip.delay: 500
                                                 HoverHandler { id: addressHover }
@@ -585,9 +681,9 @@ C.ApplicationWindow {
                                                     visible: hopRow.modelData.loss > 0
                                                     x: 3; anchors.verticalCenter: parent.verticalCenter; height: 16; radius: 2
                                                     width: Math.max(2, (parent.width - 9) * Math.min(1, hopRow.modelData.loss / 100))
-                                                    color: "#783940"
+                                                    color: backend.snapshot.impact?.state === "answered" ? "#394b58" : "#783940"
                                                 }
-                                                Metric { text: app.percent(hopRow.modelData.loss); color: hopRow.modelData.loss > 0 ? app.lossColor : app.mute }
+                                                Metric { text: app.percent(hopRow.modelData.loss); color: hopRow.modelData.loss > 0 && backend.snapshot.impact?.state !== "answered" ? app.lossColor : app.mute }
                                             }
                                             Metric { text: app.number(hopRow.modelData.min) }
                                             Metric { text: app.number(hopRow.modelData.avg); font.bold: true }
@@ -638,7 +734,9 @@ C.ApplicationWindow {
                     RowLayout {
                         Layout.fillWidth: true; Layout.leftMargin: 16; Layout.rightMargin: 16
                         implicitHeight: 50; spacing: 9
-                        Heading { text: "Timelines" }
+                        Heading { text: qsTr("Timelines · UTC") }
+                        Caption { visible: !!backend.snapshot.resolution && backend.snapshot.resolution !== "Raw probes"
+                            text: backend.snapshot.resolution || ""; color: "#e2bd86" }
                         Caption { visible: workspace.width > 970; text: "● RTT"; color: app.accent }
                         Caption { visible: workspace.width > 970; text: "▮ Loss"; color: app.lossColor }
                         Caption {
@@ -680,6 +778,10 @@ C.ApplicationWindow {
                             hint: "Follow the end of this trace"; onClicked: backend.goLive()
                         }
                     }
+                    Caption {
+                        visible: app.endpointMismatch; Layout.fillWidth: true; Layout.leftMargin: 16
+                        color: "#f7ca92"; text: qsTr("Compared tracks include different or changing endpoints. Inspect each track’s probe settings.")
+                    }
                     Flickable {
                         id: tracks
                         Layout.fillHeight: true; Layout.fillWidth: true
@@ -698,6 +800,8 @@ C.ApplicationWindow {
                                     required property int index
                                     readonly property var modelData: app.charts[index] || ({hop: 0, buckets: []})
                                     readonly property bool peer: !!modelData.comparisonId
+                                    readonly property var settings: peer ? modelData.measurement : backend.snapshot.measurement
+                                    readonly property var source: peer ? modelData : app.currentSession
                                     readonly property var info: peer ? null : app.findRow(modelData.hop)
                                     readonly property int intervalMs: modelData.intervalMs || (app.currentSession ? app.currentSession.intervalMs : 1000)
                                     readonly property var cursorSample: app.cursorSample(modelData.buckets, intervalMs)
@@ -707,8 +811,7 @@ C.ApplicationWindow {
                                     Rectangle { anchors.fill: parent; color: app.well }
                                     Caption {
                                         x: 7; y: 8; width: app.chartLabelWidth - 13
-                                        text: track.peer ? (track.modelData.location || qsTr("Comparison")) + " · " + (track.modelData.family ? "IPv" + track.modelData.family : "Auto IP")
-                                            : track.modelData.destination ? (app.currentSession?.location || qsTr("Destination")) : "Hop " + track.modelData.hop
+                                        text: track.peer || track.modelData.destination ? (track.source?.location || (track.peer ? qsTr("Local") : qsTr("Destination"))) + " · " + app.profileLabel(track.source, track.settings) : "Hop " + track.modelData.hop
                                         color: app.ink; font.weight: Font.DemiBold
                                     }
                                     Caption {
@@ -716,6 +819,12 @@ C.ApplicationWindow {
                                         text: track.peer ? track.modelData.target : track.modelData.destination ? app.activeTarget
                                             : track.info ? (track.info.hostname || track.info.address || "No reply") : ""
                                         font.family: "monospace"; font.pixelSize: 11
+                                    }
+                                    MouseArea {
+                                        width: app.chartLabelWidth - 8; height: 48
+                                        acceptedButtons: Qt.NoButton; hoverEnabled: true
+                                        C.ToolTip.visible: containsMouse && (track.peer || track.modelData.destination)
+                                        C.ToolTip.text: app.measurementLabel(track.source, track.settings)
                                     }
                                     Caption {
                                         x: 7; anchors.bottom: parent.bottom; anchors.bottomMargin: 9
@@ -725,7 +834,9 @@ C.ApplicationWindow {
                                             ? (track.cursorSample.avg >= 0 ? app.msLabel(+track.cursorSample.avg.toFixed(1)) : "No reply")
                                                 + "  ·  " + app.percent(track.cursorSample.loss) + " loss"
                                             : app.cursorFraction >= 0 ? "No samples"
-                                            : "0 – " + app.msLabel(app.timeCeiling)
+                                            : !track.peer && track.modelData.destination && backend.savedBaseline.p95 >= 0
+                                              ? qsTr("Baseline p95 %1 ms").arg(backend.savedBaseline.p95.toFixed(1))
+                                              : "0 – " + app.msLabel(app.timeCeiling)
                                         color: app.faint; font.pixelSize: 11
                                     }
                                     Item {
@@ -747,6 +858,7 @@ C.ApplicationWindow {
                                             samples: track.modelData.buckets
                                             pixels: Math.max(1, backend.snapshot.pixels || 1)
                                             ceiling: app.timeCeiling; accent: app.accent
+                                            baselineP95: !track.peer && track.modelData.destination ? (backend.savedBaseline.p95 ?? -1) : -1
                                             maxGap: Math.max(3, app.chartWidth * track.intervalMs * 3 / app.viewSpan)
                                         }
                                         Repeater {
@@ -858,6 +970,32 @@ C.ApplicationWindow {
                         }
                     }
                     Item {
+                        Layout.fillWidth: true
+                        implicitHeight: lane.events.length ? 17 : 0
+                        visible: implicitHeight > 0
+                        Caption { x: 16; height: 17; text: qsTr("Events · UTC"); font.pixelSize: 10 }
+                        Item {
+                            id: lane
+                            readonly property var events: backend.snapshot.events || []
+                            x: 13 + app.chartLabelWidth; width: app.chartWidth; height: parent.height
+                            clip: true
+                            Repeater {
+                                model: lane.events.slice(0,500)
+                                Rectangle {
+                                    id: marker
+                                    required property var modelData
+                                    x: (modelData.t - backend.viewStart) / app.viewSpan * (lane.width - 5)
+                                    width: 5; height: 12; radius: 2
+                                    color: ({route:"#c99bf4",alert:"#ee8581",gap:"#95a2ad",note:"#e5c576",service:"#7dcabb","interface":"#88aedf"})[modelData.kind] || app.faint
+                                    C.ToolTip.visible: hoverMarker.hovered
+                                    C.ToolTip.text: new Date(modelData.t).toISOString() + " · " + modelData.text
+                                    HoverHandler { id: hoverMarker }
+                                    TapHandler { onTapped: incidentNavigator.openAt(marker.modelData.t) }
+                                }
+                            }
+                        }
+                    }
+                    Item {
                         Layout.fillWidth: true; implicitHeight: 24
                         Item {
                             x: 13 + app.chartLabelWidth; width: app.chartWidth; height: parent.height
@@ -960,8 +1098,14 @@ C.ApplicationWindow {
     }
     DiagnosticSettings { id: diagnosticSettings; uiScale: app.uiScale }
     AlertsDialog { id: alertsDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    SiteComparison { id: siteComparison; parent: C.Overlay.overlay; uiScale: app.uiScale
+        source: app.currentSession; profile: app.profileLabel(app.currentSession) }
+    FleetDialog { id: fleet; parent: C.Overlay.overlay; uiScale: app.uiScale }
     RemoteSources { id: sourcesDialog; parent: C.Overlay.overlay; uiScale: app.uiScale; activeTrace: app.currentSession }
     BaselineDialog { id: baselineDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    IncidentNavigator { id: incidentNavigator; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    StorageDialog { id: storageDialog; parent: C.Overlay.overlay; uiScale: app.uiScale }
+    HopResponders { id: hopResponders; parent: C.Overlay.overlay; uiScale: app.uiScale }
     RouteHistory { id: routeHistory; parent: C.Overlay.overlay; uiScale: app.uiScale }
     C.Dialog {
         id: compareDialog
@@ -974,6 +1118,11 @@ C.ApplicationWindow {
         contentItem: ColumnLayout {
             spacing: 10
             Heading { text: "Compare destinations" }
+            RowLayout {
+                visible: !!app.currentSession
+                TraceButton { text: qsTr("All matching sites"); onClicked: { backend.compareSites(); compareDialog.close() } }
+                TraceButton { text: qsTr("Choose sites…"); onClicked: { compareDialog.close(); siteComparison.open() } }
+            }
             RowLayout {
                 visible: backend.groupNames.length > 0
                 TraceCombo { id: groupPicker; objectName: "savedGroupPicker"; model: backend.groupNames; Layout.fillWidth: true; hint: qsTr("Saved comparison groups") }
