@@ -1,4 +1,5 @@
 #include "history.h"
+#include "databasepath.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
 #include <QDir>
@@ -255,16 +256,8 @@ bool History::onlineBackup(const QString &destination) {
     sqlite3 *copy = nullptr;
     try {
         const QFileInfo target(destination);
-        const auto output = target.dir().canonicalPath() + "/" + target.fileName();
-        const auto source = QFileInfo(path_).canonicalFilePath();
-#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
-        constexpr auto pathCase = Qt::CaseInsensitive;
-#else
-        constexpr auto pathCase = Qt::CaseSensitive;
-#endif
-        for (const auto &suffix : {"", "-wal", "-shm", "-journal"})
-            if (output.compare(source + suffix, pathCase) == 0)
-                throw std::runtime_error("Choose a backup file outside the live database and its journals.");
+        if (isDatabaseFile(path_, destination))
+            throw std::runtime_error("Choose a backup file outside the live database and its journals.");
         if (destination.isEmpty() || target.exists() || !temp.open())
             throw std::runtime_error("Choose a new backup filename in a writable directory.");
         temp.close();

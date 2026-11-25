@@ -70,7 +70,8 @@ public:
         for (const auto &[token, request] : pending_)
             transport_->discard(token);
         pending_.clear();
-        rounds_.clear();
+        // Signals can stop this session during a synchronous send. Leave its
+        // current round alive until Probe::stop's deferred destruction.
     }
 
     void finish() override {
@@ -109,6 +110,7 @@ private:
                        {"effectiveProtocol", "icmp"}, {"effectivePort", 0}, {"flowMode", "icmp"}};
             clock_.start();
             emit owner_->resolved(id_, address.toString(), "icmp", 0);
+            if (!active_) return;
             emit owner_->status(id_, tr("%1 via ICMP").arg(address.toString()), false);
             tick();
             return;
@@ -176,6 +178,7 @@ private:
                     auto settings = actual_;
                     settings.insert(route);
                     emit owner_->measurement(id_, QDateTime::currentMSecsSinceEpoch(), settings);
+                    if (!active_) return;
                 }
                 nextRoute_ = now + 5000;
             }
@@ -184,12 +187,15 @@ private:
             r.limit = limit_;
             nextRound_ = now + interval_;
             send(round_, r, 0);
+            if (!active_) return;
         }
         auto wake = finishing_ ? now + responseTimeoutMs : nextRound_;
         for (auto &[number, r] : rounds_) {
             if (r.nextHop <= r.limit && now >= r.nextSend) {
-                for (int i = 0; i < burst && r.nextHop <= r.limit; ++i)
+                for (int i = 0; i < burst && r.nextHop <= r.limit; ++i) {
                     send(number, r, r.nextHop++);
+                    if (!active_) return;
+                }
                 r.nextSend = now + burstSpacingMs;
             }
             if (r.nextHop <= r.limit) wake = std::min(wake, r.nextSend);

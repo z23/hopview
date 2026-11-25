@@ -34,10 +34,12 @@ def serve_notifications(log):
 
 def verify(binary, work, private_bus=None):
     db = work / "capture.db"
-    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="generic",
-               QT_QUICK_BACKEND="software", XDG_RUNTIME_DIR=str(work),
-               XDG_CONFIG_HOME=str(work / "config"), XDG_CACHE_HOME=str(work / "cache"),
-               DBUS_SESSION_BUS_ADDRESS=private_bus or f"unix:path={work}/unused")
+    env = dict(os.environ, QT_QUICK_BACKEND="software")
+    if sys.platform.startswith("linux"):
+        env.update(QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="generic",
+                   XDG_RUNTIME_DIR=str(work), XDG_CONFIG_HOME=str(work / "config"),
+                   XDG_CACHE_HOME=str(work / "cache"),
+                   DBUS_SESSION_BUS_ADDRESS=private_bus or f"unix:path={work}/unused")
     command = [binary, "--database", str(db)]
     target = ["--family", "4", "--interval", "250", "127.0.0.1"]
 

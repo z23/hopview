@@ -6,7 +6,7 @@ win32-msvc* {
     INCLUDEPATH += "$$deps/include"
     LIBS += -L"$$deps/lib" -lsqlite3
     contains(CONFIG, hopview_probes): LIBS += -llibcurl
-    QMAKE_CXXFLAGS += /utf-8
+    QMAKE_CXXFLAGS += /utf-8 /MP
 } else:macx {
     LIBS += -lsqlite3
     contains(CONFIG, hopview_probes): LIBS += -lcurl
@@ -15,6 +15,8 @@ win32-msvc* {
     PKGCONFIG += sqlite3
     contains(CONFIG, hopview_probes): PKGCONFIG += libcurl
 }
+
+win32: DEFINES += NOMINMAX
 
 contains(CONFIG, hopview_probes) {
     SOURCES += $$PWD/src/probecontrol.cpp

@@ -46,7 +46,7 @@ jobs:
           if ($setup.ExitCode) { exit $setup.ExitCode }
           $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -notlike "$env:QT_ROOT_DIR*" -and $_ -notlike "$env:HOPVIEW_DEPS*" }) -join ';'
           Remove-Item Env:QT_PLUGIN_PATH,Env:QML2_IMPORT_PATH,Env:QML_IMPORT_PATH -ErrorAction SilentlyContinue
-          python tests/native-capture.py "$install/hopview.exe"
+          python tests/native-capture.py "$install/hopview.exe" "$install/hopview-node.exe"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python tests/background-recorder.py "$install/hopview.exe"
       - name: Verify installed macOS capture and recording
@@ -59,7 +59,7 @@ jobs:
           unset QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH DYLD_FRAMEWORK_PATH DYLD_LIBRARY_PATH
           app="$RUNNER_TEMP/Hopview.app/Contents/MacOS/hopview"
           lipo "$app" -verify_arch x86_64 arm64
-          python3 tests/native-capture.py "$app"
+          python3 tests/native-capture.py "$app" "$(dirname "$app")/hopview-node"
           python3 tests/background-recorder.py "$app"
       - name: Verify Windows desktop history and UI
         if: runner.os == 'Windows'
@@ -68,7 +68,7 @@ jobs:
           set "PATH=%HOPVIEW_DEPS%\bin;%PATH%"
           set "QT_QPA_PLATFORM=offscreen"
           set "QT_QUICK_BACKEND=software"
-          for %%s in (history integration) do (
+          for %%s in (history integration portableprobe) do (
             mkdir build-native\%%s
             pushd build-native\%%s
             qmake ..\..\tests\%%s.pro CONFIG+=release CONFIG-=debug_and_release || exit /b 1
@@ -79,7 +79,7 @@ jobs:
       - name: Verify macOS desktop history, UI and ICMP decoding
         if: runner.os == 'macOS'
         run: |
-          for suite in history integration darwinicmp; do
+          for suite in history integration darwinicmp portableprobe; do
             mkdir -p "build-native/$suite"
             (cd "build-native/$suite" && qmake "../../tests/$suite.pro" CONFIG+=release &&
              make -j4 && QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software "./${suite}_test")

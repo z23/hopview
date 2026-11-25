@@ -406,7 +406,8 @@ C.ApplicationWindow {
                     C.ToolTip.text: modelData.target + " · " + app.timeText(modelData.startMs, true)
                                     + (modelData.imported ? "\n" + app.correctionText(modelData) : "")
                                     + "\n" + (modelData.effectiveProtocol || modelData.protocol || "auto").toUpperCase()
-                                    + (modelData.effectivePort ? "/" + modelData.effectivePort : "")
+                                    + (modelData.effectivePort ? "/" + modelData.effectivePort
+                                       : !modelData.effectiveProtocol && modelData.protocol !== "auto" && modelData.port ? "/" + modelData.port : "")
                                     + (modelData.interfaceName ? " · " + modelData.interfaceName : "")
                 }
                 WheelHandler {

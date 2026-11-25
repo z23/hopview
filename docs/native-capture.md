@@ -13,7 +13,7 @@ Enter a hostname or IP address and choose **Start trace**. Windows and macOS use
 | DSCP marking | Unavailable | Yes |
 | UDP and TCP TTL sweeps | Linux collectors | Linux collectors |
 
-Windows reports the ICMP status and whole-millisecond RTT supplied by IP Helper. A successful loopback probe can read 0 ms. macOS uses ICMP datagram sockets and decodes quoted echo requests from routers. Firewalls and routers can suppress ICMP replies. The endpoint check, half-completed rounds and timeouts follow the same rules as in Linux capture. Replay and remote recordings retain their original protocols on every desktop.
+Windows reports the ICMP status and whole-millisecond RTT supplied by IP Helper. A successful loopback probe can read 0 ms. macOS uses ICMP datagram sockets and decodes quoted echo requests from routers. Firewalls and routers can suppress ICMP replies. Live replies appear as they arrive, and loss counts update when each round finishes. Replay and remote recordings retain their original protocols on every desktop.
 
 For a ten-second JSON capture in PowerShell:
 

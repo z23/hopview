@@ -108,10 +108,11 @@ struct Request {
         if (event) CloseHandle(event);
     }
 
-    EchoReply decoded() const {
+    EchoReply decoded(DWORD error = NO_ERROR) const {
         if (ipv6) {
             ICMPV6_ECHO_REPLY reply{};
             std::memcpy(&reply, buffer.constData(), sizeof(reply));
+            if (error && reply.Status != error) return resultOf(error);
             // IP Helper packs IPV6_ADDRESS_EX at byte alignment: it is a sockaddr_in6
             // without its family. Some MinGW headers leave padding before the flow field.
             sockaddr_in6 address{};
@@ -123,6 +124,7 @@ struct Request {
         // The fields used here have identical offsets in ICMP_ECHO_REPLY and ICMP_ECHO_REPLY32.
         ICMP_ECHO_REPLY reply{};
         std::memcpy(&reply, buffer.constData(), sizeof(reply));
+        if (error && reply.Status != error) return resultOf(error);
         return resultOf(reply.Status, QHostAddress(ntohl(reply.Address)), reply.RoundTripTime);
     }
 
@@ -204,7 +206,7 @@ public:
             auto *request = req.release();
             SetThreadpoolWait(request->wait, request->event, nullptr);
         } else {
-            reply_(token, resultOf(error));
+            reply_(token, req->decoded(error));
         }
     }
 
@@ -228,7 +230,9 @@ void CALLBACK Request::completed(PTP_CALLBACK_INSTANCE, void *context, PTP_WAIT,
     const DWORD size = DWORD(request->buffer.size());
     const DWORD count = request->ipv6 ? Icmp6ParseReplies(buffer, size) : IcmpParseReplies(buffer, size);
     const DWORD error = count ? NO_ERROR : GetLastError();
-    auto result = count ? request->decoded() : resultOf(error);
+    // A received ICMP error can produce zero echo replies while the buffer
+    // still contains the router address and RTT for the matching status.
+    auto result = request->decoded(error);
     std::lock_guard lock(request->delivery->mutex);
     if (auto *receiver = request->delivery->receiver) {
         QMetaObject::invokeMethod(receiver, [receiver, token = request->token, result = std::move(result)] {

@@ -200,11 +200,16 @@ int main(int argc, char **argv) {
     parser.addHelpOption();
     parser.addVersionOption();
     parser.addPositionalArgument("target", "Start a new trace when the window opens.", "[target]");
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    const QString methods = QStringLiteral("Use auto or icmp for native IPv4/IPv6 echo probes.");
+#else
+    const QString methods = QStringLiteral("Select auto, icmp, udp, or tcp.");
+#endif
     parser.addOptions(
         {{"report", "Collect a finite trace and print per-hop JSON without opening a window.", "target"},
          {"seconds", "Duration in seconds for a headless report (1–3600).", "seconds", "10"},
          {"family", "Select auto, 4, or 6.", "family", "auto"},
-         {"protocol", "Select auto, icmp, udp, or tcp.", "method", "auto"},
+         {"protocol", methods, "method", "auto"},
          {"port", "Fixed destination port for TCP (default 443) or UDP (default 33434).", "port"},
          {"payload-bytes", "ICMP/UDP payload in bytes, excluding network and transport headers.", "bytes", "16"},
          {"dscp", "Set the IP differentiated services code point (0–63).", "value", "0"},
@@ -234,6 +239,10 @@ int main(int argc, char **argv) {
         return fail("Check the protocol, port, payload (8–65507 bytes) and DSCP (0–63). TCP uses the system SYN size.");
     const int family = familyText.toInt();
     const auto args = parser.positionalArguments();
+    if (!args.isEmpty() || parser.isSet("report")) {
+        const auto error = localProbeError(options, family);
+        if (!error.isEmpty()) return fail(error);
+    }
     if (args.size() > 1)
         return fail("Supply at most one target.");
     const bool isolated = parser.isSet("demo") || parser.isSet("replay");
