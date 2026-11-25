@@ -16,6 +16,8 @@ class CollectorManagement {
     QString createKey();
     QVariantList nodes();
     bool setTargets(const QString &site, qint64 expectedRevision, const QVariantList &targets);
+    bool removeCollector(const QString &site);
+    int revokeUnusedKeys();
     QString error() const { return error_; }
 
     void setCertificateFingerprint(const QString &fingerprint);

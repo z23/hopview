@@ -22,9 +22,10 @@
 #include <sqlite3.h>
 #include <algorithm>
 #include <atomic>
-#include <utility>
 #include <cstdlib>
 #include <memory>
+#include <optional>
+#include <utility>
 
 namespace telemetry {
 namespace {
@@ -94,6 +95,24 @@ class Spool {
         size.next();
         bytes_ = size.integer(0);
         tx.commit();
+        insertStmt_.emplace(db, "INSERT INTO outbox(body) VALUES(?)");
+        oldestStmt_.emplace(db, "SELECT id,length(cast(body AS blob)) FROM outbox ORDER BY id LIMIT 1");
+        deleteOneStmt_.emplace(db, "DELETE FROM outbox WHERE id=?");
+        updateDroppedStmt_.emplace(db, "UPDATE spool_stats SET dropped=dropped+? WHERE id=1");
+        pendingStmt_.emplace(db, "SELECT id,body FROM outbox ORDER BY id LIMIT ?");
+        sumThroughStmt_.emplace(db, "SELECT coalesce(sum(length(cast(body AS blob))),0) FROM outbox WHERE id<=?");
+        deleteThroughStmt_.emplace(db, "DELETE FROM outbox WHERE id<=?");
+    }
+
+    ~Spool() {
+        deleteThroughStmt_.reset();
+        sumThroughStmt_.reset();
+        pendingStmt_.reset();
+        updateDroppedStmt_.reset();
+        deleteOneStmt_.reset();
+        oldestStmt_.reset();
+        insertStmt_.reset();
+        db_.reset();
     }
 
     QJsonObject assignment() const {
@@ -110,32 +129,49 @@ class Spool {
         save.string(3, QString::fromUtf8(QJsonDocument(targets).toJson(QJsonDocument::Compact)));
         save.next();
     }
-    void push(const QJsonObject &body) {
-        const auto json = QJsonDocument(body).toJson(QJsonDocument::Compact);
-        if (json.size() > maxFrame - 1024)
-            throw Error("Probe batch exceeds the telemetry frame size");
+    void push(const QJsonObject &body) { pushBatch({body}); }
+    void pushBatch(const QList<QJsonObject> &bodies) {
+        if (bodies.isEmpty())
+            return;
+        QList<QByteArray> encoded;
+        encoded.reserve(bodies.size());
+        for (const auto &body : bodies) {
+            const auto json = QJsonDocument(body).toJson(QJsonDocument::Compact);
+            if (json.size() > maxFrame - 1024)
+                throw Error("Probe batch exceeds the telemetry frame size");
+            encoded.append(json);
+        }
         auto db = db_.get();
         Transaction tx(db, true);
-        Statement insert(db, "INSERT INTO outbox(body) VALUES(?)");
-        insert.string(1, QString::fromUtf8(json));
-        insert.next();
-        auto total = bytes_ + json.size();
+        auto total = bytes_;
+        for (const auto &json : encoded) {
+            insertStmt_->reset();
+            insertStmt_->string(1, QString::fromUtf8(json));
+            insertStmt_->next();
+            insertStmt_->reset();
+            total += json.size();
+        }
         int dropped = 0;
         while (total > limit_) {
-            Statement oldest(db, "SELECT id,length(cast(body AS blob)) FROM outbox ORDER BY id LIMIT 1");
-            if (!oldest.next())
+            oldestStmt_->reset();
+            if (!oldestStmt_->next()) {
+                oldestStmt_->reset();
                 throw Error("Invalid spool accounting");
-            auto id = oldest.integer(0);
-            total -= oldest.integer(1);
-            Statement remove(db, "DELETE FROM outbox WHERE id=?");
-            remove.integer(1, id);
-            remove.next();
+            }
+            const auto id = oldestStmt_->integer(0);
+            total -= oldestStmt_->integer(1);
+            oldestStmt_->reset();
+            deleteOneStmt_->reset();
+            deleteOneStmt_->integer(1, id);
+            deleteOneStmt_->next();
+            deleteOneStmt_->reset();
             ++dropped;
         }
         if (dropped) {
-            Statement save(db, "UPDATE spool_stats SET dropped=dropped+? WHERE id=1");
-            save.integer(1, dropped);
-            save.next();
+            updateDroppedStmt_->reset();
+            updateDroppedStmt_->integer(1, dropped);
+            updateDroppedStmt_->next();
+            updateDroppedStmt_->reset();
         }
         tx.commit();
         bytes_ = total;
@@ -149,20 +185,29 @@ class Spool {
         }
     }
 
-    QPair<qint64, QJsonArray> pending(int limit) const {
-        Statement rows(db_.get(), "SELECT id,body FROM outbox ORDER BY id LIMIT ?");
-        rows.integer(1, limit);
+    QPair<qint64, QList<QByteArray>> pendingRaw(int limit) const {
+        pendingStmt_->reset();
+        pendingStmt_->integer(1, limit);
         int size = 256;
         qint64 last = 0;
-        QJsonArray entries;
-        while (rows.next()) {
-            const auto bytes = rows.string(1).toUtf8();
+        QList<QByteArray> entries;
+        while (pendingStmt_->next()) {
+            const auto bytes = pendingStmt_->string(1).toUtf8();
             if (size + bytes.size() + 1 > maxFrame)
                 break;
             size += bytes.size() + 1;
-            entries.append(QJsonDocument::fromJson(bytes).object());
-            last = rows.integer(0);
+            entries.append(bytes);
+            last = pendingStmt_->integer(0);
         }
+        pendingStmt_->reset();
+        return {last, entries};
+    }
+
+    QPair<qint64, QJsonArray> pending(int limit) const {
+        const auto [last, raw] = pendingRaw(limit);
+        QJsonArray entries;
+        for (const auto &bytes : raw)
+            entries.append(QJsonDocument::fromJson(bytes).object());
         return {last, entries};
     }
     QJsonObject health() const {
@@ -183,13 +228,15 @@ class Spool {
     void confirm(qint64 through) {
         auto db = db_.get();
         Transaction tx(db, true);
-        Statement item(db, "SELECT coalesce(sum(length(cast(body AS blob))),0) FROM outbox WHERE id<=?");
-        item.integer(1, through);
-        item.next();
-        const auto size = item.integer(0);
-        Statement del(db, "DELETE FROM outbox WHERE id<=?");
-        del.integer(1, through);
-        del.next();
+        sumThroughStmt_->reset();
+        sumThroughStmt_->integer(1, through);
+        sumThroughStmt_->next();
+        const auto size = sumThroughStmt_->integer(0);
+        sumThroughStmt_->reset();
+        deleteThroughStmt_->reset();
+        deleteThroughStmt_->integer(1, through);
+        deleteThroughStmt_->next();
+        deleteThroughStmt_->reset();
         tx.commit();
         bytes_ -= size;
     }
@@ -197,6 +244,8 @@ class Spool {
   private:
     QLockFile lock_;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db_{nullptr, sqlite3_close};
+    mutable std::optional<Statement> insertStmt_, oldestStmt_, deleteOneStmt_, updateDroppedStmt_,
+        pendingStmt_, sumThroughStmt_, deleteThroughStmt_;
     qint64 limit_, bytes_ = 0, drops_ = 0;
     QElapsedTimer dropLog_;
 };
@@ -231,12 +280,9 @@ class Collector final : public QObject {
         connect(&diagnosticThread_, &QThread::finished, diagnostics_, &QObject::deleteLater);
         connect(diagnostics_, &Diagnostics::observation, this, [this](qint64 id, const QVariantMap &record) {
             if (!traces_.contains(id) || addresses_.value(id).isEmpty()) return;
-            try {
-                auto body = recordHeader(id, record["t"].toLongLong());
-                body["diagnostic"] = QJsonObject::fromVariantMap(record);
-                spool_.push(body);
-                pump();
-            } catch (const std::exception &e) { fatal(e); }
+            auto body = recordHeader(id, record["t"].toLongLong());
+            body["diagnostic"] = QJsonObject::fromVariantMap(record);
+            stageBody(std::move(body));
         });
         diagnosticThread_.start();
         probe_ = new Probe;
@@ -265,12 +311,7 @@ class Collector final : public QObject {
                 return;
             }
             QMetaObject::invokeMethod(this, [this, samples = std::move(samples), count] {
-                try {
-                    enqueue(samples);
-                    pump();
-                } catch (const std::exception &e) {
-                    fatal(e);
-                }
+                enqueue(samples);
                 queuedSamples_.fetch_sub(count);
             });
         });
@@ -284,6 +325,9 @@ class Collector final : public QObject {
                 QTimer::singleShot(30000, this, [this, id] { startProbe(id); });
         });
         probeThread_.start();
+        flushTimer_.setSingleShot(true);
+        flushTimer_.setInterval(50);
+        connect(&flushTimer_, &QTimer::timeout, this, [this] { flushStaged(); });
         reconnect_.setSingleShot(true);
         connect(&reconnect_, &QTimer::timeout, this, [this] { connectReceiver(); });
         deadline_.setSingleShot(true);
@@ -296,6 +340,7 @@ class Collector final : public QObject {
         connect(qApp, &QCoreApplication::aboutToQuit, this, [this] {
             stopProbes();
             QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+            flushStaged();
         });
     }
 
@@ -389,6 +434,29 @@ class Collector final : public QObject {
                                 {"clockErrorMs", validClock ? clockErrorMs_ : -1}};
     }
 
+    void stageBody(QJsonObject body) {
+        stagedBodies_.append(std::move(body));
+        if (stagedBodies_.size() >= 32) {
+            flushStaged();
+        } else if (!flushTimer_.isActive()) {
+            flushTimer_.start();
+        }
+    }
+
+    void flushStaged(bool triggerPump = true) {
+        flushTimer_.stop();
+        if (stagedBodies_.isEmpty())
+            return;
+        auto batch = std::exchange(stagedBodies_, {});
+        try {
+            spool_.pushBatch(batch);
+            if (triggerPump)
+                pump();
+        } catch (const std::exception &e) {
+            fatal(e);
+        }
+    }
+
     void enqueue(const QVector<Sample> &samples) {
         lastProbeMs_ = std::max(lastProbeMs_, samples.back().timeMs);
         auto id = samples.front().session;
@@ -412,7 +480,7 @@ class Collector final : public QObject {
         }
         if (!detailed.isEmpty()) body["observations"] = detailed;
         body["samples"] = rows;
-        spool_.push(body);
+        stageBody(std::move(body));
     }
 
     void connectReceiver() {
@@ -449,6 +517,7 @@ class Collector final : public QObject {
                 lost("Receiver certificate does not match the enrollment key");
                 return;
             }
+            flushStaged(false);
             QJsonObject message{{"type", "hello"}, {"token", token_}};
             try { message["health"] = health(); }
             catch (const std::exception &e) { fatal(e); return; }
@@ -499,11 +568,8 @@ class Collector final : public QObject {
         backoff_ = std::min(60000, backoff_ * 2);
     }
 
-    void send(QJsonObject message, qint64 seq) {
+    void sendRaw(const QByteArray &line, qint64 seq) {
         seq_ = seq;
-        message["v"] = 1;
-        message["seq"] = seq;
-        auto line = QJsonDocument(message).toJson(QJsonDocument::Compact) + '\n';
         sentWall_ = now();
         sentTimer_.start();
         if (socket_->write(line) != line.size()) {
@@ -511,6 +577,12 @@ class Collector final : public QObject {
             return;
         }
         deadline_.start(15000);
+    }
+
+    void send(QJsonObject message, qint64 seq) {
+        message["v"] = 1;
+        message["seq"] = seq;
+        sendRaw(QJsonDocument(message).toJson(QJsonDocument::Compact) + '\n', seq);
     }
 
     QJsonObject health() const {
@@ -537,6 +609,7 @@ class Collector final : public QObject {
         if (!ready_ || seq_ >= 0)
             return;
         if (std::exchange(pingPending_, false)) {
+            flushStaged(false);
             QJsonObject message{{"type", "ping"}};
             try { message["health"] = health(); }
             catch (const std::exception &e) { fatal(e); return; }
@@ -547,27 +620,54 @@ class Collector final : public QObject {
             send(message, 0);
             return;
         }
-        const auto [through, records] = spool_.pending(grouped_ ? 32 : 1);
+        if (grouped_) {
+            const auto [through, rawRecords] = spool_.pendingRaw(32);
+            if (rawRecords.size() == 1) {
+                QByteArray line;
+                line.reserve(rawRecords.first().size() + 64);
+                line.append("{\"v\":1,\"seq\":");
+                line.append(QByteArray::number(through));
+                line.append(",\"type\":\"batch\",\"body\":");
+                line.append(rawRecords.first());
+                line.append("}\n");
+                sendRaw(line, through);
+            } else if (!rawRecords.isEmpty()) {
+                qsizetype total = 64;
+                for (const auto &r : rawRecords)
+                    total += r.size() + 1;
+                QByteArray line;
+                line.reserve(total);
+                line.append("{\"v\":1,\"seq\":");
+                line.append(QByteArray::number(through));
+                line.append(",\"type\":\"batches\",\"bodies\":[");
+                for (qsizetype i = 0; i < rawRecords.size(); ++i) {
+                    if (i)
+                        line.append(',');
+                    line.append(rawRecords[i]);
+                }
+                line.append("]}\n");
+                sendRaw(line, through);
+            }
+            return;
+        }
+        const auto [through, records] = spool_.pending(1);
         if (records.size() == 1) {
             auto body = records.first().toObject();
-            if (!grouped_) {
-                auto rows = body["samples"].toArray();
-                for (const auto &entry : body.take("observations").toArray()) {
-                    auto row = entry.toArray();
-                    if (row.at(1).toInt() > 0 && row.at(3).toDouble() >= -1) {
-                        row.removeLast();
-                        rows.append(row);
-                    }
+            auto rows = body["samples"].toArray();
+            for (const auto &entry : body.take("observations").toArray()) {
+                auto row = entry.toArray();
+                if (row.at(1).toInt() > 0 && row.at(3).toDouble() >= -1) {
+                    row.removeLast();
+                    rows.append(row);
                 }
-                if (rows.isEmpty()) {
-                    lost("Upgrade receiver to store the queued diagnostic or detailed probe result");
-                    return;
-                }
-                body["samples"] = rows;
             }
+            if (rows.isEmpty()) {
+                lost("Upgrade receiver to store the queued diagnostic or detailed probe result");
+                return;
+            }
+            body["samples"] = rows;
             send({{"type", "batch"}, {"body", body}}, through);
-        } else if (!records.isEmpty())
-            send({{"type", "batches"}, {"bodies", records}}, through);
+        }
     }
 
     void readAck() {
@@ -664,8 +764,9 @@ class Collector final : public QObject {
     QHash<qint64, Trace> traces_;
     QHash<qint64, QString> addresses_;
     QHash<qint64, QJsonObject> measurements_;
+    QList<QJsonObject> stagedBodies_;
     QSslSocket *socket_ = nullptr;
-    QTimer reconnect_, deadline_, ping_;
+    QTimer flushTimer_, reconnect_, deadline_, ping_;
     QElapsedTimer sentTimer_, estimateAge_;
     qint64 sentWall_ = 0, estimateAt_ = 0, offsetMs_ = 0, clockErrorMs_ = -1, seq_ = -1;
     int backoff_ = 1000;

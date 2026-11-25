@@ -62,15 +62,15 @@ def verify(binary, work):
                                         certificate=str(cert), privateKey=str(private),
                                         viewer=dict(port=viewer_port, tokenFile="viewer-token"))))
 
-    def http(path, token=reader, method="GET"):
+    def http(path, token=reader, method="GET", with_headers=False):
         credentials = base64.b64encode(("reader:" + token).encode()).decode()
         request = urllib.request.Request(f"https://127.0.0.1:{viewer_port}" + path,
                                          headers={"Authorization": "Basic " + credentials}, method=method)
         try:
             with urllib.request.urlopen(request, context=ctx, timeout=6) as response:
-                return response.status, response.read()
+                return (response.status, response.read(), response.headers) if with_headers else (response.status, response.read())
         except urllib.error.HTTPError as error:
-            return error.code, error.read()
+            return (error.code, error.read(), error.headers) if with_headers else (error.code, error.read())
 
     class Delay(BaseRequestHandler):
         def handle(self):
@@ -153,7 +153,9 @@ def verify(binary, work):
         assert http("/", token="bad")[0] == 401
         assert http("/", method="POST")[0] == 405
         assert http("/api/view?session=1&from=0&through=9999999999999")[0] == 400
-        assert http("/")[0] == 200 and http("/app.js")[0] == 200
+        status_root, _, headers_root = http("/", with_headers=True)
+        assert status_root == 200 and "max-age=" in headers_root.get("Strict-Transport-Security", "")
+        assert http("/app.js")[0] == 200
         sessions = json.loads(http("/api/sessions")[1])
         assert len(sessions) == 20 and all(s["id"] != private_session for s in sessions)
         assert http(f"/api/view?session={private_session}&from=0&through=1")[0] == 404
@@ -166,6 +168,11 @@ def verify(binary, work):
         assert first["measurement"]["effectiveProtocol"] == "tcp" and first["endpoint"]["sent"] > 0
         health = json.loads(scalar(database, "SELECT report FROM collector_health"))
         assert health["lastUploadMs"] and health["lastProbeMs"] and health["droppedBatches"] == 0
+        # Verify per-IP authentication failure rate limiting returns 429 with Retry-After.
+        for _ in range(10):
+            assert http("/", token="wrong")[0] == 401
+        limited_code, _, limited_headers = http("/", token="wrong", with_headers=True)
+        assert limited_code == 429 and int(limited_headers.get("Retry-After", "0")) >= 1
 
 
 if __name__ == "__main__":

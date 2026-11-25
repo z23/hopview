@@ -97,13 +97,28 @@ class Receiver final : public QTcpServer {
                     }
                     ack["multiBatch"] = true;
                 } else if (type == "batches" && seq > 0) {
+                    if (managed && !management_.hasSite(site))
+                        throw Error("Collector access revoked");
                     const auto bodies = message["bodies"].toArray();
                     if (bodies.isEmpty() || bodies.size() > 32)
                         throw Error("Invalid telemetry batch group");
-                    // Each record is idempotent if the connection is lost during the group.
-                    for (const auto &body : bodies) store(site, body.toObject(), received);
+                    // Commit the full batch group in one WAL transaction; each record stays idempotent on retry.
+                    QHash<QPair<QString, QString>, qint64> created;
+                    if (!history_.withWriteTransaction([&] {
+                            for (const auto &body : bodies)
+                                store(site, body.toObject(), received, created);
+                        }))
+                        throw Error(history_.error());
+                    cacheSessions(created);
                 } else if (type == "batch" && seq > 0) {
-                    store(site, message.value("body").toObject(), received);
+                    if (managed && !management_.hasSite(site))
+                        throw Error("Collector access revoked");
+                    QHash<QPair<QString, QString>, qint64> created;
+                    if (!history_.withWriteTransaction([&] {
+                            store(site, message.value("body").toObject(), received, created);
+                        }))
+                        throw Error(history_.error());
+                    cacheSessions(created);
                 } else if (type == "ping" && seq == 0) {
                     if (managed)
                         ack = management_.heartbeat(site, integer(message, "appliedRevision", 0, 9007199254740991LL),
@@ -131,7 +146,17 @@ class Receiver final : public QTcpServer {
         }
     }
 
-    void store(const QString &site, const QJsonObject &body, qint64 received) {
+    void cacheSessions(const QHash<QPair<QString, QString>, qint64> &created) {
+        if (created.isEmpty())
+            return;
+        if (sessions_.size() + created.size() > 8192)
+            sessions_.clear();
+        for (auto it = created.cbegin(); it != created.cend(); ++it)
+            sessions_.insert(it.key(), it.value());
+    }
+
+    void store(const QString &site, const QJsonObject &body, qint64 received,
+               QHash<QPair<QString, QString>, qint64> &created) {
         const auto trace = parseTrace(body.value("trace").toObject());
         auto address = body.value("resolvedAddress").toString();
         const auto ip = QHostAddress(address);
@@ -182,11 +207,16 @@ class Receiver final : public QTcpServer {
             QCryptographicHash::hash(QJsonDocument(identity).toJson(QJsonDocument::Compact),
                                      QCryptographicHash::Sha256)
                 .toHex());
-        const auto session =
-            history_.receiverSession(site, key, trace.target, family, trace.intervalMs, trace.probes.protocol,
-                                     trace.probes.port, trace.probes.interfaceName, trace.probes.payloadBytes, trace.probes.dscp, trace.probes.dontFragment);
-        if (!session)
-            throw Error(history_.error());
+        const auto cacheKey = qMakePair(site, key);
+        qint64 session = sessions_.value(cacheKey, created.value(cacheKey, 0));
+        if (!session) {
+            session = history_.receiverSession(site, key, trace.target, family, trace.intervalMs,
+                                               trace.probes.protocol, trace.probes.port, trace.probes.interfaceName,
+                                               trace.probes.payloadBytes, trace.probes.dscp, trace.probes.dontFragment);
+            if (!session)
+                throw Error(history_.error());
+            created.insert(cacheKey, session);
+        }
         if (!measurement.isEmpty()) {
             measurement["clockOffsetMs"] = offset;
             measurement["clockErrorMs"] = uncertainty;
@@ -205,6 +235,7 @@ class Receiver final : public QTcpServer {
     History &history_;
     CollectorManagement &management_;
     QHash<QString, QByteArray> tokens_;
+    QHash<QPair<QString, QString>, qint64> sessions_;
     bool plain_;
     QSslConfiguration ssl_;
     int clients_ = 0;

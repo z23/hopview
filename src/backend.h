@@ -73,6 +73,8 @@ class Backend : public QObject {
     Q_INVOKABLE QString collectorJoinCommand(const QString &address) const;
     Q_INVOKABLE void createCollectorKey();
     Q_INVOKABLE void saveCollectorTargets(QString site, qint64 revision, QVariantList targets);
+    Q_INVOKABLE void removeCollector(QString site);
+    Q_INVOKABLE void revokeUnusedKeys();
     qint64 sessionId() const { return m_session; }
     QString status() const { return m_status; }
     bool running() const { return m_active.contains(m_session); }
@@ -157,6 +159,7 @@ class Backend : public QObject {
     void collectorListError(QString error);
     void collectorKeyCreated(QString key, QString error);
     void collectorTargetsSaved(QString site, QString error);
+    void collectorActionDone(QString message, QString error);
     void selectionChanged();
     void snapshotChanged();
     void storageUpdated(QVariantMap settings,QString message);

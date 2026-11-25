@@ -954,6 +954,19 @@ void Integration::collectorControls() {
     QVERIFY(waitFor([&] { return saved.size() == 2; }));
     for (const auto &entry : receiver.nodes())
         QCOMPARE(entry.toMap()["targets"].toList().first().toMap()["target"].toString(), QString("::1"));
+    // Revoke an unused enrollment key and remove a collector via the Collectors dialog.
+    QVERIFY(!receiver.createKey().isEmpty());
+    QSignalSpy actionDone(&b, &Backend::collectorActionDone);
+    QVERIFY(click("revokeUnusedKeys"));
+    QVERIFY(waitFor([&] { return actionDone.size() == 1; }));
+    QVERIFY(actionDone.last()[1].toString().isEmpty());
+    QVERIFY(actionDone.last()[0].toString().contains("1"));
+    QVERIFY(click("removeCollector-" + peer));
+    QVERIFY(waitFor([&] { return item("confirmRemoveCollector-" + peer) && item("confirmRemoveCollector-" + peer)->isVisible(); }));
+    QVERIFY(click("confirmRemoveCollector-" + peer));
+    QVERIFY(waitFor([&] { return actionDone.size() == 2 && b.collectors().size() == 1; }));
+    QVERIFY(actionDone.last()[1].toString().isEmpty());
+    QCOMPARE(b.collectors().first().toMap()["site"].toString(), site);
     QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
 
     Backend replay(dir.filePath("replay.db"));

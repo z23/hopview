@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QProcess>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <memory>
 
 class LocalReceiver : public QObject {
@@ -31,6 +32,7 @@ class LocalReceiver : public QObject {
     void launchServer();
     void report(bool busy, bool ready, const QString &message);
     QProcess certificate_, server_;
+    QTimer killTimer_;
     std::unique_ptr<QTemporaryDir> staging_;
     telemetry::ReceiverEndpoint endpoint_;
     QString database_, directory_, message_, lastLine_;

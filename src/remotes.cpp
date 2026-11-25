@@ -73,6 +73,44 @@ void Backend::saveCollectorTargets(QString site, qint64 revision, QVariantList t
     });
 }
 
+void Backend::removeCollector(QString site) {
+    if (!m_ready || !collectorManagementAvailable()) {
+        emit collectorActionDone({}, tr("Open the receiver history to manage collectors."));
+        return;
+    }
+    QMetaObject::invokeMethod(m_writerContext, [this, site] {
+        auto &management = collectorManagement();
+        const bool ok = management.removeCollector(site);
+        const auto error = ok ? QString{} : management.error();
+        QMetaObject::invokeMethod(this, [this, site, ok, error] {
+            emit collectorActionDone(
+                ok ? tr("Removed collector %1. Historical recordings were kept.").arg(site) : QString{}, error);
+            refreshCollectors();
+        });
+    });
+}
+
+void Backend::revokeUnusedKeys() {
+    if (!m_ready || !collectorManagementAvailable()) {
+        emit collectorActionDone({}, tr("Open the receiver history to manage collectors."));
+        return;
+    }
+    QMetaObject::invokeMethod(m_writerContext, [this] {
+        auto &management = collectorManagement();
+        const int removed = management.revokeUnusedKeys();
+        const auto error = removed < 0 ? management.error() : QString{};
+        QMetaObject::invokeMethod(this, [this, removed, error] {
+            if (removed < 0)
+                emit collectorActionDone({}, error);
+            else
+                emit collectorActionDone(removed ? tr("Revoked %n unused enrollment key(s).", nullptr, removed)
+                                                 : tr("No unused enrollment keys to revoke."),
+                                         {});
+            refreshCollectors();
+        });
+    });
+}
+
 qint64 History::dataVersion() {
     if (!open())
         return -1;

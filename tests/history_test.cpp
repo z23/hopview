@@ -638,6 +638,25 @@ void testManagedCollectors(const QString &path) {
     const auto empty = receiver.heartbeat(site, 2, {}, 120);
     require(empty["revision"] == 3 && empty["targets"].isArray() && empty["targets"].toArray().isEmpty(),
             "Deliver an explicitly empty revision");
+    // Revoke unused enrollment keys without affecting already-enrolled collectors.
+    const auto unusedExtra = desktop.createKey().section('.', 1, 1);
+    require(desktop.revokeUnusedKeys() == 2, "Revoke both unused enrollment keys");
+    require(desktop.revokeUnusedKeys() == 0, "No remaining unused keys");
+    require(denied(unpinned.section('.', 1, 1), QUuid::createUuid().toString(QUuid::WithoutBraces)) &&
+                denied(unusedExtra, QUuid::createUuid().toString(QUuid::WithoutBraces)),
+            "Revoked unused keys can no longer enroll");
+    require(desktop.nodes().size() == 2, "Enrolled collectors remain after unused key revocation");
+    // Remove an enrolled collector while keeping its recorded trace history intact.
+    const auto sess = history.receiverSession(site, "stream-1", "127.0.0.1", 4, 1000, "icmp", 0, {});
+    const QVector<Sample> seed{{sess, 1000, 1, "127.0.2.1", 5.0, true}};
+    require(sess > 0 && history.append(seed), "Seed collector history");
+    require(desktop.removeCollector(site) && !desktop.removeCollector(site), "Remove collector once");
+    require(desktop.nodes().size() == 1 && !receiver.hasSite(site), "Removed collector disappears from management");
+    require(denied(key[1], id), "Removed collector credentials are rejected on reconnect");
+    bool heartbeatRejected = false;
+    try { receiver.heartbeat(site, 3, {}, 130); } catch (const std::exception &) { heartbeatRejected = true; }
+    require(heartbeatRejected, "Removed collector is rejected on heartbeat");
+    require(history.sessions(true, sess).size() == 1, "Historical recordings survive collector removal");
 }
 
 void preservedRouteIndex(const QTemporaryDir &dir) {

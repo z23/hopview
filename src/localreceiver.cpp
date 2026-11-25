@@ -1,21 +1,62 @@
 #include "localreceiver.h"
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSaveFile>
+#include <QSslCertificate>
 #include <QStandardPaths>
 
+namespace {
+QString certificateExpiryWarning(const QString &certPath) {
+    QFile file(certPath);
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+    const auto certs = QSslCertificate::fromDevice(&file, QSsl::Pem);
+    if (certs.isEmpty() || certs.first().isNull())
+        return {};
+    const auto expiry = certs.first().expiryDate();
+    if (!expiry.isValid())
+        return {};
+    const auto now = QDateTime::currentDateTimeUtc();
+    if (expiry <= now)
+        return LocalReceiver::tr(" Receiver certificate expired on %1.").arg(expiry.date().toString(Qt::ISODate));
+    const auto daysLeft = now.daysTo(expiry);
+    if (daysLeft <= 30)
+        return LocalReceiver::tr(" Receiver certificate expires in %n day(s).", nullptr, int(daysLeft));
+    return {};
+}
+} // namespace
+
 LocalReceiver::LocalReceiver(QObject *parent) : QObject(parent) {
+    killTimer_.setSingleShot(true);
+    killTimer_.setInterval(3000);
+    connect(&killTimer_, &QTimer::timeout, this, [this] {
+        if (certificate_.state() != QProcess::NotRunning)
+            certificate_.kill();
+        if (server_.state() != QProcess::NotRunning)
+            server_.kill();
+    });
     connect(&certificate_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
         if (e == QProcess::FailedToStart) {
+            killTimer_.stop();
             staging_.reset();
+            stopping_ = false;
             report(false, false, tr("Could not start certificate generation: %1").arg(certificate_.errorString()));
         }
     });
     connect(&certificate_, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        killTimer_.stop();
+        if (stopping_) {
+            staging_.reset();
+            stopping_ = false;
+            report(false, false, tr("Receiver stopped."));
+            return;
+        }
         const bool created = status == QProcess::NormalExit && code == 0 && staging_ &&
                              QDir().rename(staging_->path(), directory_ + "/identity");
         staging_.reset();
@@ -30,20 +71,29 @@ LocalReceiver::LocalReceiver(QObject *parent) : QObject(parent) {
         while (server_.canReadLine()) {
             lastLine_ = QString::fromUtf8(server_.readLine()).trimmed().left(512);
             if (!stopping_ && lastLine_.startsWith("Receiving telemetry on "))
-                report(false, true, tr("Listening on port %1 while Hopview is running.").arg(endpoint_.port));
+                report(false, true,
+                       tr("Listening on port %1 while Hopview is running.").arg(endpoint_.port) +
+                           certificateExpiryWarning(directory_ + "/identity/cert.pem"));
         }
     });
     connect(&server_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
-        if (error == QProcess::FailedToStart)
+        if (error == QProcess::FailedToStart) {
+            killTimer_.stop();
+            stopping_ = false;
             report(false, false, tr("Could not start the receiver: %1").arg(server_.errorString()));
+        }
     });
     connect(&server_, &QProcess::finished, this, [this] {
-        report(false, false, stopping_ ? tr("Receiver stopped.") :
+        killTimer_.stop();
+        const bool wasStopping = stopping_;
+        stopping_ = false;
+        report(false, false, wasStopping ? tr("Receiver stopped.") :
                tr("Receiver exited. %1").arg(lastLine_.isEmpty() ? server_.errorString() : lastLine_));
     });
 }
 
 LocalReceiver::~LocalReceiver() {
+    killTimer_.stop();
     for (auto *process : {&certificate_, &server_}) {
         disconnect(process, nullptr, this, nullptr);
         if (process->state() != QProcess::NotRunning) {
@@ -132,9 +182,23 @@ void LocalReceiver::launchServer() {
 }
 
 void LocalReceiver::stop() {
-    if (ready_) {
-        stopping_ = true;
+    if (!ready_ && !busy_)
+        return;
+    stopping_ = true;
+    if (certificate_.state() != QProcess::NotRunning) {
+        report(true, false, tr("Stopping receiver…"));
+        certificate_.terminate();
+        killTimer_.start();
+        return;
+    }
+    if (server_.state() != QProcess::NotRunning) {
         report(true, false, tr("Stopping receiver…"));
         server_.terminate();
+        killTimer_.start();
+        return;
     }
+    killTimer_.stop();
+    staging_.reset();
+    stopping_ = false;
+    report(false, false, tr("Receiver stopped."));
 }

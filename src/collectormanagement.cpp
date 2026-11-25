@@ -199,6 +199,43 @@ bool CollectorManagement::setTargets(const QString &site, qint64 expectedRevisio
     }
 }
 
+bool CollectorManagement::removeCollector(const QString &site) {
+    try {
+        open();
+        Transaction tx(db_, true);
+        Statement delManaged(db_, "DELETE FROM managed_collectors WHERE site=?");
+        delManaged.string(1, site);
+        delManaged.next();
+        const int removedManaged = sqlite3_changes(db_);
+        Statement delHealth(db_, "DELETE FROM collector_health WHERE site=?");
+        delHealth.string(1, site);
+        delHealth.next();
+        const int removedHealth = sqlite3_changes(db_);
+        if (removedManaged == 0 && removedHealth == 0)
+            throw telemetry::Error("Unknown collector.");
+        tx.commit();
+        return true;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return false;
+    }
+}
+
+int CollectorManagement::revokeUnusedKeys() {
+    try {
+        open();
+        Transaction tx(db_, true);
+        Statement del(db_, "DELETE FROM managed_collectors WHERE node_id IS NULL");
+        del.next();
+        const int removed = sqlite3_changes(db_);
+        tx.commit();
+        return removed;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return -1;
+    }
+}
+
 void CollectorManagement::saveHealth(const QString &site, const QJsonObject &report, qint64 received) {
     open();
     QJsonObject clean{{"lastSeenMs", received}};
