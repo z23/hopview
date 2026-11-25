@@ -10,7 +10,7 @@ Prebuilt desktop and VM collector packages are available in the [Hopview release
 
 Windows and macOS can capture traces directly on the affected computer. Install the Windows x64 setup program or drag **Hopview** from the macOS disk image into **Applications**. Native builds and their test results are available from the [desktop build workflow](https://github.com/z23/hopview/actions/workflows/native.yml). For installation details, supported probe settings and source builds, see [Windows and macOS capture](docs/native-capture.md).
 
-Use a C++20 compiler and install the development files for the dependencies listed in the [desktop package manifest](pkgbuild/PKGBUILD). Run these commands from the project directory to build the desktop client and the headless node, then open the client.
+To build on Linux, use a C++20 compiler and install the development files for the dependencies listed in the [desktop package manifest](pkgbuild/PKGBUILD). Run these commands from the project directory to build the desktop client and the headless node, then open the client.
 
 ```sh
 bin/build
@@ -30,7 +30,7 @@ The demo opens two simultaneous recordings. Compare the IPv6 service with the IP
 
 On a system that supports the desktop package manifest, `bin/package` writes binary and source packages to `pkgbuild/`. Installing the binary package adds Hopview to the desktop launcher.
 
-Use **Probes** to choose ICMP, UDP, or TCP and an outgoing interface. Auto tries ICMP first and falls back to UDP if ping sockets are unavailable. TCP defaults to port 443 and UDP to 33434. The capture records the resolved address, effective family, protocol, port, selected source address, interface and flow mode when a trace starts or resumes. With the system route selected, Hopview reads the kernel’s routing decision at startup and checks for changes every five seconds while probing. A UDP switch to separate source ports also creates a new measurement record. Older recordings can have missing fields.
+Use **Probes** to choose a protocol and an outgoing interface. Windows and macOS support Auto and ICMP. Linux also supports UDP and TCP, and Auto falls back to UDP if ping sockets are unavailable. TCP defaults to port 443 and UDP to 33434. The capture records the resolved address, effective family, protocol, port and flow mode, plus source address and interface when available. With the system route selected, Hopview checks for routing changes every five seconds. A UDP switch to separate source ports also creates a new measurement record. Older recordings can have missing fields.
 
 For a paired test, choose **Payload size** or **DSCP** in **Probes**, set the two values, select one IP family, and start the trace. Both tracks open on the same timeline. Payload size means ICMP or UDP payload bytes, excluding IP and transport headers. TCP uses the kernel's SYN size and supports DSCP. **Require unfragmented datagrams** enables path MTU discovery on the chosen datagram sockets. A large probe that receives Packet Too Big can identify an advertised MTU; silence alone leaves the cause unknown. The CLI accepts the same settings, for example `--protocol udp --payload-bytes 1400 --dscp 46 --dont-fragment`.
 

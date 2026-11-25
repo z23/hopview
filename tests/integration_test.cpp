@@ -1085,6 +1085,10 @@ void Integration::saveFocus() {
     };
     findSave(picker->contentItem());
     QVERIFY(confirm && confirm->isEnabled());
+    // Qt's Quick file picker commits the filename when its text field loses focus.
+    // On macOS clicking a button does not normally transfer keyboard focus.
+    confirm->forceActiveFocus(Qt::TabFocusReason);
+    QVERIFY(!name->hasActiveFocus());
     QTest::mouseClick(picker, Qt::LeftButton, Qt::NoModifier,
                       confirm->mapToScene(confirm->boundingRect().center()).toPoint());
     QVERIFY(waitFor([&] { return !result.isEmpty(); }));

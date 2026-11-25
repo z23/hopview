@@ -8,6 +8,9 @@
 #include "probe.h"
 #include <QDateTime>
 #include <QHostInfo>
+#ifdef Q_OS_MACOS
+#include "macresolver.h"
+#endif
 #include <QHostAddress>
 #include <QProcess>
 #include <QCoreApplication>
@@ -845,15 +848,21 @@ void Backend::resolveNames() {
             m_lookups.contains(address) || QHostAddress(address).isNull())
             continue;
         m_lookups.insert(address);
-        QHostInfo::lookupHost(address, this, [this, address](const QHostInfo &info) {
+        auto resolved = [this, address](const QString &name) {
             m_lookups.remove(address);
             if (m_names.size() >= 4096)
                 m_names.clear();
-            const auto name = info.error() == QHostInfo::NoError ? info.hostName() : QString();
             m_names.insert(address, name == address ? QString() : name);
             refreshNames();
             emit snapshotChanged();
+        };
+#ifdef Q_OS_MACOS
+        lookupMacPtr(QHostAddress(address), this, std::move(resolved));
+#else
+        QHostInfo::lookupHost(address, this, [resolved](const QHostInfo &info) {
+            resolved(info.error() == QHostInfo::NoError ? info.hostName() : QString());
         });
+#endif
     }
 }
 

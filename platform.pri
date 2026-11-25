@@ -25,7 +25,7 @@ contains(CONFIG, hopview_probes) {
         SOURCES += $$PWD/src/probeportable.cpp $$PWD/src/echowindows.cpp
         LIBS += -liphlpapi -lws2_32
     } else:macx {
-        SOURCES += $$PWD/src/probeportable.cpp $$PWD/src/echomac.cpp
+        SOURCES += $$PWD/src/probeportable.cpp $$PWD/src/echomac.cpp $$PWD/src/macresolver.cpp
     } else:linux {
         QT += dbus
         SOURCES += $$PWD/src/probe.cpp

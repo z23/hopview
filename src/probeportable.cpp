@@ -3,6 +3,9 @@
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QHostInfo>
+#ifdef Q_OS_MACOS
+#include "macresolver.h"
+#endif
 #include <QTimer>
 #include <algorithm>
 #include <array>
@@ -55,18 +58,31 @@ public:
             return;
         }
         emit owner_->status(id_, tr("Resolving %1").arg(target), false);
+#ifdef Q_OS_MACOS
+        lookup_ = lookupMacHost(target, family, this, [this, family](const QList<QHostAddress> &addresses, const QString &error) {
+            lookup_ = nullptr;
+            if (!active_) return;
+            if (!error.isEmpty()) return fail(error);
+            select(addresses, family);
+        });
+#else
         lookup_ = QHostInfo::lookupHost(target, this, [this, family](const QHostInfo &info) {
             lookup_ = -1;
             if (!active_) return;
             if (info.error() != QHostInfo::NoError) return fail(info.errorString());
             select(info.addresses(), family);
         });
+#endif
     }
 
     void cancel() override {
         active_ = false;
         timer_.stop();
+#ifdef Q_OS_MACOS
+        delete std::exchange(lookup_, nullptr);
+#else
         if (lookup_ >= 0) QHostInfo::abortHostLookup(std::exchange(lookup_, -1));
+#endif
         for (const auto &[token, request] : pending_)
             transport_->discard(token);
         pending_.clear();
@@ -215,7 +231,12 @@ private:
     Probe *owner_;
     qint64 id_;
     ProbeOptions options_;
-    int interval_, lookup_ = -1, limit_ = maxHops;
+    int interval_, limit_ = maxHops;
+#ifdef Q_OS_MACOS
+    QObject *lookup_ = nullptr;
+#else
+    int lookup_ = -1;
+#endif
     bool active_ = true, finishing_ = false, insideTick_ = false;
     quint64 round_ = 0, token_ = 0;
     qint64 nextRound_ = 0, nextRoute_ = 0;

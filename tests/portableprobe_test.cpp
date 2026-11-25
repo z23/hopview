@@ -1,5 +1,9 @@
 #include "nativeecho.h"
 #include "probe.h"
+#ifdef Q_OS_MACOS
+#include "macresolver.h"
+#include <QPointer>
+#endif
 #include <QTimer>
 #include <QtTest>
 
@@ -35,6 +39,38 @@ class PortableProbeTest : public QObject {
     Q_OBJECT
 private slots:
     void init() { script = {}; }
+
+#ifdef Q_OS_MACOS
+    void cancelNativeNameLookups() {
+        int lateCallbacks = 0;
+        QList<QHostAddress> addresses;
+        QString error;
+        bool completed = false;
+        QObject context;
+        auto *forward = lookupMacHost("localhost", 4, &context,
+            [&](const QList<QHostAddress> &, const QString &) { ++lateCallbacks; });
+        QVERIFY(forward);
+        delete forward; // Stopping a probe cancels its pending forward lookup.
+
+        QPointer<QObject> reverse;
+        {
+            QObject owner;
+            reverse = lookupMacPtr(QHostAddress::LocalHost, &owner, [&](const QString &) { ++lateCallbacks; });
+            QVERIFY(reverse);
+        }
+        QVERIFY(reverse.isNull()); // Desktop teardown releases pending reverse lookups.
+
+        lookupMacHost("localhost", 4, &context, [&](const QList<QHostAddress> &result, const QString &message) {
+            addresses = result;
+            error = message;
+            completed = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(completed, 5000);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(addresses.contains(QHostAddress::LocalHost));
+        QCOMPARE(lateCallbacks, 0);
+    }
+#endif
 
     void overlappingRounds() {
         Probe probe;
