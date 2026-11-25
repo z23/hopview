@@ -109,6 +109,7 @@ void CollectorManagement::open() {
         const auto result = sqlite3_open_v2(path.constData(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
         check(db_, result);
         check(db_, sqlite3_busy_timeout(db_, 4000));
+        execute(db_, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL");
         execute(db_, schema);
     } catch (...) {
         sqlite3_close(db_);

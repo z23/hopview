@@ -22,27 +22,46 @@ void Backend::selectBaseline(QString name) {
         return;
     m_baselines[id] = mark;
     emit baselineChanged();
-    QMetaObject::invokeMethod(m_readContext, [=, this] {
-        const auto from = mark["from"].toLongLong(), through = mark["through"].toLongLong();
-        const auto p95 = mark["p95"].toDouble() >= 0 ? mark["p95"].toDouble()
-                                                     : m_reader->destinationP95(id, from, through);
-        const bool ok = (mark["p95"].toDouble() >= 0 || m_reader->error().isEmpty()) &&
-                        m_reader->storeBaseline(id, name, from, through, p95);
-        const auto error = m_reader->error();
-        QMetaObject::invokeMethod(this, [=, this] {
-            if (!ok) {
-                setStatus(error);
+    const auto from = mark["from"].toLongLong(), through = mark["through"].toLongLong();
+    const auto cachedP95 = mark["p95"].toDouble();
+    auto persist = [this, id, name, mark, from, through](double p95) {
+        if (m_closing.load())
+            return;
+        QMetaObject::invokeMethod(m_writerContext, [this, id, name, mark, from, through, p95] {
+            if (!m_writer)
                 return;
-            }
-            if (m_namedBaselines.value(id).value(name) != mark)
-                return;
-            m_namedBaselines[id][name]["p95"] = p95;
-            if (m_baselines.value(id) == mark) {
-                m_baselines[id]["p95"] = p95;
-                if (id == m_session)
-                    emit baselineChanged();
-            }
+            const bool ok = m_writer->storeBaseline(id, name, from, through, p95);
+            const auto error = m_writer->error();
+            QMetaObject::invokeMethod(this, [=, this] {
+                if (!ok) {
+                    setStatus(error);
+                    return;
+                }
+                if (m_namedBaselines.value(id).value(name) != mark)
+                    return;
+                m_namedBaselines[id][name]["p95"] = p95;
+                if (m_baselines.value(id) == mark) {
+                    m_baselines[id]["p95"] = p95;
+                    if (id == m_session)
+                        emit baselineChanged();
+                }
+            });
         });
+    };
+    if (cachedP95 >= 0) {
+        persist(cachedP95);
+        return;
+    }
+    QMetaObject::invokeMethod(m_readContext, [this, id, from, through, persist = std::move(persist)] {
+        if (!m_reader)
+            return;
+        const auto p95 = m_reader->destinationP95(id, from, through);
+        const auto error = m_reader->error();
+        if (!error.isEmpty()) {
+            QMetaObject::invokeMethod(this, [this, error] { setStatus(error); });
+            return;
+        }
+        persist(p95);
     });
 }
 

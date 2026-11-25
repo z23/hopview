@@ -133,6 +133,7 @@ class Integration : public QObject {
     void saveFocus();
     void replayWhileProbing();
     void firstVisibleReply();
+    void backendFixes();
 };
 
 void Integration::pairedTraces() {
@@ -1405,9 +1406,90 @@ void Integration::replayWhileProbing() {
     QCOMPARE(b.viewEnd(), stoppedEnd);
     QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
 }
+void Integration::backendFixes() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const auto path = dir.filePath("backend-fixes.sqlite");
+    const auto id = fill(path, 150);
+    QVERIFY(id > 0);
+    // Simulate a pre-index recording by clearing route index tables before opening Backend.
+    {
+        sqlite3 *db = nullptr;
+        QCOMPARE(sqlite3_open_v2(QFile::encodeName(path).constData(), &db, SQLITE_OPEN_READWRITE, nullptr),
+                 SQLITE_OK);
+        QCOMPARE(sqlite3_exec(db,
+                              "DELETE FROM route_index; DELETE FROM route_transitions; "
+                              "DELETE FROM route_gaps; DELETE FROM route_checkpoints;",
+                              nullptr, nullptr, nullptr),
+                 SQLITE_OK);
+        sqlite3_close(db);
+    }
+    // Verify warmRouteIndex populates route transitions automatically on session selection.
+    {
+        Backend b(path);
+        b.zoomToRange(base, base + 149000);
+        auto hasRouteEvent = [&] {
+            for (const auto &v : b.snapshot()["events"].toList())
+                if (v.toMap()["kind"] == "route")
+                    return true;
+            return false;
+        };
+        QVERIFY(waitFor([&] { return fresh(b) && hasRouteEvent(); }));
+    }
+    // Add >500 newer notes and verify copyIncidentSummary still reports the route change.
+    {
+        History h(path);
+        QVERIFY(h.withWriteTransaction([&] {
+            for (int i = 0; i < 510; ++i)
+                QVERIFY(h.addNote(id, base + 40000 + i * 100, QString("Filler %1").arg(i)));
+        }));
+        Backend b(path);
+        b.zoomToRange(base, base + 149000);
+        QVERIFY(waitFor([&] { return fresh(b); }));
+        QSignalSpy summary(&b, &Backend::incidentSummaryReady);
+        b.copyIncidentSummary();
+        QVERIFY(summary.wait());
+        QVERIFY2(summary.first()[1].toString().isEmpty(), qPrintable(summary.first()[1].toString()));
+        const auto text = summary.first()[0].toString();
+        QVERIFY2(text.contains("Indexed route changes in incident: 1."), qPrintable(text));
+        QVERIFY2(text.contains("changed"), qPrintable(text));
+    }
+    // Verify storageAction("save") invalidates comparison chart caches across all sessions.
+    {
+        const auto retPath = dir.filePath("retention-cache.sqlite");
+        History h(retPath);
+        const auto s1 = h.createSession("primary.test", 4, 1000);
+        const auto s2 = h.createSession("peer.test", 4, 1000);
+        QVector<Sample> samples;
+        for (int i = 0; i < 20; ++i) {
+            samples.append({s1, base + i * 1000LL, 1, "192.0.2.1", 10.0, true});
+            samples.append({s2, base + i * 1000LL, 1, "192.0.2.2", 25.0, true});
+        }
+        QVERIFY(h.append(samples));
+        Backend b(retPath);
+        b.selectSession(s1);
+        b.toggleComparison(s2);
+        b.zoomToRange(base, base + 19000);
+        auto peerSent = [&] {
+            const auto charts = b.snapshot()["charts"].toList();
+            if (charts.size() < 2)
+                return -1;
+            int total = 0;
+            for (const auto &bucket : charts[1].toMap()["buckets"].toList())
+                total += bucket.toMap()["sent"].toInt();
+            return total;
+        };
+        QVERIFY(waitFor([&] { return fresh(b) && peerSent() > 0; }));
+        QSignalSpy updated(&b, &Backend::storageUpdated);
+        b.storageAction("save", 1, 1);
+        QVERIFY(updated.wait());
+        QVERIFY(waitFor([&] { return fresh(b) && peerSent() == 0; }));
+    }
+}
 } // namespace
 
 int main(int argc, char **argv) {
+    CurlGlobalInit curlInit;
     QTemporaryDir config;
     if (!config.isValid())
         return 1;

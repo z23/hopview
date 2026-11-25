@@ -152,8 +152,10 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
     return more || cursor < finalTime;
 }
 
-bool History::advanceRouteIndex(qint64 id, bool &more) {
+bool History::advanceRouteIndex(qint64 id, bool &more, bool *updated) {
     more = false;
+    if (updated)
+        *updated = false;
     if (!open())
         return false;
     error_.clear();
@@ -167,6 +169,33 @@ bool History::advanceRouteIndex(qint64 id, bool &more) {
         Transaction tx(db_, true);
         more = updateRouteIndex(id, -1);
         tx.commit();
+        if (updated)
+            *updated = true;
+        return true;
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+        return false;
+    }
+}
+
+bool History::readIndexedRoutes(qint64 id, qint64 &cursor, QVariantList &events, bool &more) {
+    events.clear();
+    more = false;
+    if (!open())
+        return false;
+    error_.clear();
+    try {
+        Transaction tx(db_, false);
+        Statement list(db_,
+                       "SELECT t,data FROM route_transitions WHERE session=? AND t>? ORDER BY t LIMIT 256");
+        list.integer(1, id);
+        list.integer(2, cursor);
+        while (list.next()) {
+            cursor = list.integer(0);
+            events << decode(list.string(1));
+        }
+        more = events.size() == 256;
+        tx.commit();
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
@@ -179,26 +208,14 @@ bool History::indexedRoutes(qint64 id, qint64 &cursor, QVariantList &events, boo
     more = false;
     if (!open())
         return false;
-    error_.clear();
-    try {
-        if (!advanceRouteIndex(id, more))
-            return false;
-        Transaction tx(db_, false);
-        Statement list(db_,
-                       "SELECT t,data FROM route_transitions WHERE session=? AND t>? ORDER BY t LIMIT 256");
-        list.integer(1, id);
-        list.integer(2, cursor);
-        while (list.next()) {
-            cursor = list.integer(0);
-            events << decode(list.string(1));
-        }
-        more |= events.size() == 256;
-        tx.commit();
-        return true;
-    } catch (const std::exception &e) {
-        error_ = QString::fromUtf8(e.what());
+    bool indexMore = false;
+    if (!advanceRouteIndex(id, indexMore))
         return false;
-    }
+    bool pageMore = false;
+    if (!readIndexedRoutes(id, cursor, events, pageMore))
+        return false;
+    more = indexMore || pageMore;
+    return true;
 }
 
 QVariantList History::timelineEvents(qint64 id, qint64 from, qint64 through) {

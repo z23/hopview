@@ -72,7 +72,8 @@ class History {
     QVariantList timelineEvents(qint64 session, qint64 from, qint64 through);
     QVariantList routeTransitions(qint64 session, qint64 from, qint64 through, int limit = 0);
     bool withWriteTransaction(const std::function<void()> &work);
-    bool advanceRouteIndex(qint64 session,bool &more);
+    bool advanceRouteIndex(qint64 session, bool &more, bool *updated = nullptr);
+    bool readIndexedRoutes(qint64 session, qint64 &cursor, QVariantList &events, bool &more);
     bool indexedRoutes(qint64 session, qint64 &cursor, QVariantList &events, bool &more);
     bool routePage(qint64 session, RouteEvents &detector, qint64 &cursor, qint64 &until,
                    QVariantList &events, bool &more);

@@ -226,7 +226,7 @@ void Backend::applySiteComparison(QVariantList selectedSites) {
     if (primary.value("payloadBytes",16).toInt() != 16) target["payloadBytes"] = primary["payloadBytes"];
     if (primary["dscp"].toInt()) target["dscp"] = primary["dscp"];
     if (primary["dontFragment"].toBool()) target["dontFragment"] = true;
-    QMetaObject::invokeMethod(m_readContext, [=, this]() mutable {
+    QMetaObject::invokeMethod(m_writerContext, [=, this]() mutable {
         for (const auto &v : additions) {
             const auto choice = v.toMap();
             const auto site = choice["site"].toString();
@@ -328,14 +328,18 @@ void Backend::copyIncidentSummary() {
     const auto baseEnd = mark.value("through", from - 1).toLongLong();
     QVariantList members{sessionInfo(m_session)};
     for (auto id : std::as_const(m_comparisons)) members.append(sessionInfo(id));
+    const auto request = ++m_summaryRequest;
     setStatus(tr("Preparing incident summary…"));
     m_exports.start([=, this] {
+        const auto cancelled = [this, request] { return m_summaryRequest.load() != request; };
+        if (cancelled()) return;
         History reader(m_historyPath);
         QStringList lines{QString("Hopview incident  %1 – %2").arg(utc(from), utc(through)),
                           QString("Baseline  %1 – %2").arg(utc(baseFrom), utc(baseEnd))};
         QString error;
         if (!reader.openReadOnly()) error = reader.error();
         for (const auto &v : members) {
+            if (cancelled()) return;
             if (!error.isEmpty()) break;
             const auto info = v.toMap();
             const auto id = info["id"].toLongLong();
@@ -343,7 +347,8 @@ void Backend::copyIncidentSummary() {
             QVariantMap dst;
             if (reader.retainedResolution(id,from,through) == "Raw probes" &&
                 reader.retainedResolution(id,baseFrom,baseEnd) == "Raw probes") {
-                comparison = reader.comparePeriods(id, baseFrom, baseEnd, from, through, [] { return false; });
+                comparison = reader.comparePeriods(id, baseFrom, baseEnd, from, through, cancelled);
+                if (cancelled()) return;
                 dst = comparison.value(0).toMap();
             } else {
                 dst = reader.destinationPeriods(id,from,through,baseFrom,baseEnd);
@@ -376,19 +381,19 @@ void Backend::copyIncidentSummary() {
                             .arg(row["baseline"].toMap()["addresses"].toStringList().join(", "),
                                  row["incident"].toMap()["addresses"].toStringList().join(", "));
             }
-            const auto events = reader.timelineEvents(id, from, through);
+            const auto routes = reader.routeTransitions(id, from, through);
             if (!reader.error().isEmpty()) { error = reader.error(); break; }
             int count = 0;
-            for (const auto &e : events) {
+            for (const auto &e : routes) {
                 const auto event = e.toMap();
-                if (event["kind"] != "route") continue;
                 if (++count <= 8) lines << utc(event["t"].toLongLong()) + "  " + event["text"].toString();
             }
-            if (events.size() >= 501) lines << QString("Confirmed route changes among the latest events: %1.").arg(count);
-            else lines << QString("Indexed route changes in incident: %1.").arg(count);
+            lines << QString("Indexed route changes in incident: %1.").arg(count);
         }
+        if (cancelled()) return;
         const auto text = lines.join('\n');
-        QMetaObject::invokeMethod(this, [this, text, error] {
+        QMetaObject::invokeMethod(this, [this, request, text, error] {
+            if (m_summaryRequest.load() != request) return;
             if (error.isEmpty()) QGuiApplication::clipboard()->setText(text);
             setStatus(error.isEmpty() ? tr("Incident summary copied.") : error);
             emit incidentSummaryReady(error.isEmpty() ? text : QString(), error);

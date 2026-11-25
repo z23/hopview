@@ -444,7 +444,9 @@ void ProbeSession::tick() {
         // replaces this placeholder with a reply or a recorded timeout.
         r.values[0] = Sample{id_, r.wallMs, 0, {}, -2, false};
         sendProbe(roundId_, r, 0);
-        nextRound_ = now + interval_; // Missed intervals do not produce catch-up traffic.
+        nextRound_ += interval_;
+        if (nextRound_ <= now)
+            nextRound_ = now + interval_; // Missed intervals do not produce catch-up traffic.
     }
     auto wake = finishing_ ? now + responseTimeout : nextRound_;
     for (auto &[number, r] : rounds_) {
@@ -528,6 +530,12 @@ void ProbeSession::sendError(Round &r, int hop, int error) {
 void ProbeSession::switchUdpSockets() {
     if (separateUdp_) return;
     separateUdp_ = true;
+    if (notifier_) {
+        notifier_->setEnabled(false);
+        notifier_->deleteLater();
+        notifier_ = nullptr;
+    }
+    if (fd_ >= 0) ::close(std::exchange(fd_, -1));
     actual_["flowMode"] = "separate-ports";
     emit owner_->measurement(id_,QDateTime::currentMSecsSinceEpoch(),actual_);
     emit owner_->status(id_, description() + " (using separate source ports for untagged replies)", false);
@@ -594,12 +602,16 @@ void ProbeSession::socketReady(quint16 key) {
     const int fd = it->second.fd;
     if (method_ == "tcp") {
         // The kernel queues ICMP errors with the responding router while the connection is pending.
-        const bool networkError = receive(fd, true, key);
+        for (int count = 0; count < 16 && sockets_.contains(key) && receive(fd, true, key); ++count) {}
         if (sockets_.contains(key)) {
             int error = 0;
             socklen_t len = sizeof(error);
-            if (!networkError && getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0
-                && (error == 0 || error == ECONNREFUSED)) {
+            const bool gotError = getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0;
+            sockaddr_storage peer{};
+            socklen_t peerLen = sizeof(peer);
+            const bool connected = gotError && error == 0
+                && ::getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &peerLen) == 0;
+            if (gotError && (connected || error == ECONNREFUSED)) {
                 complete(key, target_, true, 0);
             } else {
                 // Filtering or routing failures provide no successful RTT. Leave the pending
@@ -618,7 +630,7 @@ void ProbeSession::drain() {
     if (fd_ < 0) return;
     // Bound each callback so queued responses cannot starve other sessions or controls.
     for (const bool errors : {true, false})
-        for (int count = 0; count < 256 && receive(fd_, errors); ++count) {}
+        for (int count = 0; count < 256 && fd_ >= 0 && receive(fd_, errors); ++count) {}
 }
 
 bool ProbeSession::receive(int fd, bool errors, std::optional<quint16> socketKey) {

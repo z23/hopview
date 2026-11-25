@@ -1,6 +1,7 @@
 #include "probeoptions.h"
 #include "backend.h"
 #include "background.h"
+#include "diagnostics.h"
 #include "graph.h"
 #include "localreceiver.h"
 #include "history.h"
@@ -172,6 +173,7 @@ QColor desktopAccent(const QString &fileName) {
 } // namespace
 
 int main(int argc, char **argv) {
+    CurlGlobalInit curlInit;
     bool graphical = true;
     for (int i = 1; i < argc; ++i) {
         const QByteArray arg(argv[i]);

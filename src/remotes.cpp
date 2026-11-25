@@ -16,7 +16,7 @@ QString Backend::collectorJoinCommand(const QString &address) const {
 }
 
 CollectorManagement &Backend::collectorManagement() {
-    // The history reader thread serializes management requests from the desktop.
+    // The history writer thread serializes collector management access from the desktop.
     if (!m_management)
         m_management = std::make_unique<CollectorManagement>(m_historyPath);
     return *m_management;
@@ -26,7 +26,7 @@ void Backend::refreshCollectors() {
     if (!m_ready || !collectorManagementAvailable() || m_collectorsLoading)
         return;
     m_collectorsLoading = true;
-    QMetaObject::invokeMethod(m_readContext, [this] {
+    QMetaObject::invokeMethod(m_writerContext, [this] {
         auto &management = collectorManagement();
         const auto nodes = management.nodes();
         const auto error = management.error();
@@ -49,7 +49,7 @@ void Backend::createCollectorKey() {
         emit collectorKeyCreated({}, tr("Open the receiver history to enroll a collector."));
         return;
     }
-    QMetaObject::invokeMethod(m_readContext, [this] {
+    QMetaObject::invokeMethod(m_writerContext, [this] {
         auto &management = collectorManagement();
         const auto key = management.createKey();
         const auto error = management.error();
@@ -62,7 +62,7 @@ void Backend::saveCollectorTargets(QString site, qint64 revision, QVariantList t
         emit collectorTargetsSaved(site, tr("Open the receiver history to edit collector targets."));
         return;
     }
-    QMetaObject::invokeMethod(m_readContext, [this, site, revision, targets] {
+    QMetaObject::invokeMethod(m_writerContext, [this, site, revision, targets] {
         auto &management = collectorManagement();
         const bool saved = management.setTargets(site, revision, targets);
         const auto error = saved ? QString{} : management.error();

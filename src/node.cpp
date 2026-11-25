@@ -1,3 +1,4 @@
+#include "diagnostics.h"
 #include "nodeconfig.h"
 #include "nodejoin.h"
 #include <QDir>
@@ -10,6 +11,7 @@
 #include <unistd.h>
 
 int main(int argc, char **argv) {
+    CurlGlobalInit curlInit;
     umask(0077);
     const bool joining = argc > 1 && QByteArray(argv[1]) == "join";
     sigset_t signalsToHandle;

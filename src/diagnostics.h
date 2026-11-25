@@ -9,6 +9,13 @@
 #include <atomic>
 #include <memory>
 
+struct CurlGlobalInit {
+    CurlGlobalInit();
+    ~CurlGlobalInit();
+    CurlGlobalInit(const CurlGlobalInit &) = delete;
+    CurlGlobalInit &operator=(const CurlGlobalInit &) = delete;
+};
+
 struct InterfaceReading {
     QString name, ap;
     qint64 tick = 0;
@@ -24,7 +31,9 @@ QVariantMap measureService(const QString &url, int family, const QString &bindIn
 class Diagnostics : public QObject {
     Q_OBJECT
   public:
+    struct WifiCache;
     Diagnostics();
+    ~Diagnostics() override;
     void configure(qint64 id, const QVariantMap &settings, int family, const QString &bindInterface);
     void shutdown();
   signals:
@@ -41,6 +50,7 @@ class Diagnostics : public QObject {
     };
     void poll();
     QHash<qint64, Watch> watches_;
+    std::unique_ptr<WifiCache> wifiCache_;
     QElapsedTimer clock_;
     QTimer *timer_;
     QThreadPool pool_;
