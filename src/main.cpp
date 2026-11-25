@@ -12,6 +12,9 @@
 #include <QFile>
 #include <QFileSystemWatcher>
 #include <QGuiApplication>
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+#include <QApplication>
+#endif
 #include <QJsonDocument>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -158,6 +161,7 @@ bool seedExample(const QString &file) {
     return h.append(batch) && h.addNote(id,end - 139000, "Upstream latency increased");
 }
 
+#ifdef Q_OS_LINUX
 QColor desktopAccent(const QString &fileName) {
     QFile file(fileName);
     if (file.open(QIODevice::ReadOnly)) {
@@ -169,6 +173,7 @@ QColor desktopAccent(const QString &fileName) {
     }
     return QColor("#58d5af");
 }
+#endif
 } // namespace
 
 int main(int argc, char **argv) {
@@ -181,7 +186,11 @@ int main(int argc, char **argv) {
     }
     std::unique_ptr<QCoreApplication> app;
     if (graphical)
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+        app = std::make_unique<QApplication>(argc, argv);
+#else
         app = std::make_unique<QGuiApplication>(argc, argv);
+#endif
     else
         app = std::make_unique<QCoreApplication>(argc, argv);
     app->setApplicationName("hopview");
@@ -259,7 +268,7 @@ int main(int argc, char **argv) {
         if (!importIncident(parser.value("replay"), imported, incident, error))
             return fail(error);
     } else if (file.isEmpty()) {
-        const QString path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        const QString path = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
         file = QDir(path).filePath("history.sqlite");
         const auto previous = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
                                   .filePath("hopline/history.sqlite");
@@ -300,6 +309,7 @@ int main(int argc, char **argv) {
     }
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("backend", &backend);
+#ifdef Q_OS_LINUX
     const auto themeDir = QDir::homePath() + "/.local/state/omarchy/current/theme";
     const auto themeFile = themeDir + "/colors.toml";
     QFileSystemWatcher watcher;
@@ -313,6 +323,9 @@ int main(int argc, char **argv) {
     QObject::connect(&watcher, &QFileSystemWatcher::directoryChanged, &engine, applyTheme);
     QObject::connect(&watcher, &QFileSystemWatcher::fileChanged, &engine, applyTheme);
     applyTheme();
+#else
+    engine.rootContext()->setContextProperty("themeAccent", QColor("#58d5af"));
+#endif
     engine.setInitialProperties({{"startHidden", action == "background"}});
     engine.load(QUrl("qrc:/Main.qml"));
     if (engine.rootObjects().isEmpty())

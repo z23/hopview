@@ -1,0 +1,91 @@
+name: Native desktop probes
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            arch: win64_msvc2022_64
+            package: Hopview-Windows-x64.exe
+          - os: macos-15
+            arch: clang_64
+            package: Hopview-macOS.dmg
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          arch: ${{ matrix.arch }}
+          cache: true
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install sqlite3:x64-windows curl:x64-windows
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "HOPVIEW_DEPS=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" >> $env:GITHUB_ENV
+      - name: Build and package
+        run: python bin/package-native.py
+      - name: Verify installed Windows capture and recording
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "Installed Hopview"
+          $setup = Start-Process .\build-native\Hopview-Windows-x64.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$install`"" -Wait -PassThru
+          if ($setup.ExitCode) { exit $setup.ExitCode }
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -notlike "$env:QT_ROOT_DIR*" -and $_ -notlike "$env:HOPVIEW_DEPS*" }) -join ';'
+          Remove-Item Env:QT_PLUGIN_PATH,Env:QML2_IMPORT_PATH,Env:QML_IMPORT_PATH -ErrorAction SilentlyContinue
+          python tests/native-capture.py "$install/hopview.exe"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/background-recorder.py "$install/hopview.exe"
+      - name: Verify installed macOS capture and recording
+        if: runner.os == 'macOS'
+        run: |
+          mount="$RUNNER_TEMP/Hopview image"
+          hdiutil attach build-native/Hopview-macOS.dmg -mountpoint "$mount" -nobrowse
+          trap 'hdiutil detach "$mount"' EXIT
+          cp -R "$mount/Hopview.app" "$RUNNER_TEMP/"
+          unset QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH DYLD_FRAMEWORK_PATH DYLD_LIBRARY_PATH
+          app="$RUNNER_TEMP/Hopview.app/Contents/MacOS/hopview"
+          lipo "$app" -verify_arch x86_64 arm64
+          python3 tests/native-capture.py "$app"
+          python3 tests/background-recorder.py "$app"
+      - name: Verify Windows desktop history and UI
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          set "PATH=%HOPVIEW_DEPS%\bin;%PATH%"
+          set "QT_QPA_PLATFORM=offscreen"
+          set "QT_QUICK_BACKEND=software"
+          for %%s in (history integration) do (
+            mkdir build-native\%%s
+            pushd build-native\%%s
+            qmake ..\..\tests\%%s.pro CONFIG+=release CONFIG-=debug_and_release || exit /b 1
+            nmake /NOLOGO || exit /b 1
+            %%s_test.exe || exit /b 1
+            popd
+          )
+      - name: Verify macOS desktop history, UI and ICMP decoding
+        if: runner.os == 'macOS'
+        run: |
+          for suite in history integration darwinicmp; do
+            mkdir -p "build-native/$suite"
+            (cd "build-native/$suite" && qmake "../../tests/$suite.pro" CONFIG+=release &&
+             make -j4 && QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software "./${suite}_test")
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: build-native/${{ matrix.package }}
+          if-no-files-found: error

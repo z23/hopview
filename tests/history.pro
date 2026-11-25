@@ -1,7 +1,9 @@
 QT += core network
 QT -= gui
-CONFIG += c++20 link_pkgconfig
-PKGCONFIG += sqlite3
+CONFIG += c++20
+include(../platform.pri)
+CONFIG += console
+CONFIG -= app_bundle
 TARGET = history_test
 INCLUDEPATH += ../src
 SOURCES += ../src/collectormanagement.cpp ../src/nodeconfig.cpp

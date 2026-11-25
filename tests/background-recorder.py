@@ -53,7 +53,7 @@ def verify(binary, work, private_bus=None):
             if owner.poll() is not None:
                 raise AssertionError(f"collector exited with status {owner.returncode}")
             try:
-                if count("SELECT count(*) FROM samples WHERE hop=0") >= minimum:
+                if count("SELECT count(*) FROM samples WHERE hop=0 AND rtt>=0") >= minimum:
                     return
             except sqlite3.OperationalError:
                 pass  # The initial schema may still be opening.
@@ -97,7 +97,10 @@ def verify(binary, work, private_bus=None):
         wait_for_rounds(stopped + 3)
         run()
         assert count("SELECT count(*) FROM sessions") == 1
-        owner.terminate()
+        if sys.platform == "win32":
+            run("--quit")  # Popen.terminate() forcibly ends a Windows process.
+        else:
+            owner.terminate()
         assert owner.wait(timeout=5) == 0
         assert count("PRAGMA integrity_check") == "ok"
     finally:
@@ -115,6 +118,8 @@ if __name__ == "__main__":
     parser.add_argument("--notifications", action="store_true",
                         help="Also exercise a private D-Bus daemon and notification service (dbus-python, PyGObject).")
     args = parser.parse_args()
+    if args.notifications and not sys.platform.startswith("linux"):
+        parser.error("--notifications runs the Linux desktop notification fixture")
     binary = str(Path(args.binary).resolve())
     with tempfile.TemporaryDirectory(prefix="hopview-recorder-") as tmp:
         work = Path(tmp)

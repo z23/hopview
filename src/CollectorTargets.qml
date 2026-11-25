@@ -231,7 +231,7 @@ ColumnLayout {
                 EditField { id: serviceInterval; visible: serviceUrl.text.length > 0; Layout.fillWidth: true; validator: IntValidator { bottom: 5; top: 3600 }
                     Accessible.name: qsTr("Service interval in seconds") }
                 Info { text: qsTr("Interface counters") }
-                EditField { id: diagnosticInterface; objectName: "collectorDiagnosticInterface"; Layout.fillWidth: true; maximumLength: 15; placeholderText: qsTr("Optional device on collector"); Accessible.name: qsTr("Interface for traffic counters") }
+                EditField { id: diagnosticInterface; objectName: "collectorDiagnosticInterface"; Layout.fillWidth: true; maximumLength: 63; placeholderText: qsTr("Optional device on collector"); Accessible.name: qsTr("Interface for traffic counters") }
                 Info { text: qsTr("Probe interface") }
                 EditField {
                     id: iface; Layout.fillWidth: true; maximumLength: 63

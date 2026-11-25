@@ -105,7 +105,7 @@ void CollectorManagement::open() {
     if (db_)
         return;
     try {
-        const auto path = QFile::encodeName(path_);
+        const auto path = path_.toUtf8();
         const auto result = sqlite3_open_v2(path.constData(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
         check(db_, result);
         check(db_, sqlite3_busy_timeout(db_, 4000));

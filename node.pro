@@ -1,12 +1,12 @@
-QT = core network dbus
-CONFIG += c++20 console link_pkgconfig
+QT = core network
+CONFIG += c++20 console hopview_probes
 CONFIG -= app_bundle
-PKGCONFIG += sqlite3 libcurl
+include(platform.pri)
 TEMPLATE = app
 TARGET = hopview-node
 INCLUDEPATH += src
 SOURCES += src/node.cpp src/nodecollector.cpp src/nodereceiver.cpp src/nodeconfig.cpp \
-           src/probe.cpp src/history.cpp src/monitoring.cpp src/routeevents.cpp
+           src/history.cpp src/monitoring.cpp src/routeevents.cpp
 SOURCES += src/collectormanagement.cpp src/nodejoin.cpp
 SOURCES += src/routeindex.cpp src/networkidentity.cpp src/storage.cpp
 RESOURCES += src/node-resources.qrc

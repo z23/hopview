@@ -9,13 +9,16 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QScopeGuard>
-#include <fcntl.h>
 #include <QUuid>
+#ifdef Q_OS_LINUX
+#include <fcntl.h>
 #include <grp.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace telemetry {
+#ifdef Q_OS_LINUX
 namespace {
 QString readKey() {
     QByteArray input;
@@ -36,6 +39,7 @@ QString readKey() {
     return QString::fromLatin1(input);
 }
 }
+#endif
 
 EnrollmentKey parseEnrollmentKey(const QString &text) {
     static const QRegularExpression format(QStringLiteral(R"(\Ahv1\.([a-f0-9]{64})(?:\.([a-f0-9]{64}))?\z)"));
@@ -46,6 +50,7 @@ EnrollmentKey parseEnrollmentKey(const QString &text) {
 }
 
 int joinCollector(const QString &endpoint) {
+#ifdef Q_OS_LINUX
     ReceiverEndpoint address;
     if (!parseReceiverEndpoint(endpoint, address))
         throw Error("Expected a receiver hostname, address, or [IPv6]:port");
@@ -105,5 +110,9 @@ int joinCollector(const QString &endpoint) {
         throw Error("Enrollment saved. Could not start the collector service; rerun join to retry.");
     log("Collector service enabled. Check its connection under Collectors in Hopview.");
     return 0;
+#else
+    Q_UNUSED(endpoint)
+    throw Error("Service enrollment requires a Linux collector. Start this node with collect COLLECTOR.json.");
+#endif
 }
 }

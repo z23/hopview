@@ -319,7 +319,7 @@ C.ApplicationWindow {
                 }
                 TraceCombo { id: family; visible: !backend.replayMode; implicitWidth: 83; model: ["Auto IP", "IPv4", "IPv6", "IPv4 + IPv6"]; hint: "Address family or paired dual-stack comparison" }
                 TraceCombo { id: interval; visible: !backend.replayMode; implicitWidth: 85; model: ["0.25 s", "0.5 s", "1 s", "2.5 s", "5 s"]; currentIndex: 2; hint: "Interval between trace rounds" }
-                ProbeControls { id: probeControls; visible: !backend.replayMode; }
+                ProbeControls { id: probeControls; visible: !backend.replayMode; ipv4Selected: family.currentIndex === 1 }
                 TraceButton { text: "Start trace"; visible: !backend.replayMode; primary: true; accent: app.accent; onClicked: app.launch() }
                 Caption { visible: backend.replayMode; text: "Offline incident replay" }
                 Item { Layout.fillWidth: true; visible: workspace.width > 950 || backend.replayMode }
@@ -405,8 +405,8 @@ C.ApplicationWindow {
                     C.ToolTip.delay: 600
                     C.ToolTip.text: modelData.target + " · " + app.timeText(modelData.startMs, true)
                                     + (modelData.imported ? "\n" + app.correctionText(modelData) : "")
-                                    + "\n" + (modelData.protocol || "auto").toUpperCase()
-                                    + (modelData.protocol === "auto" ? " (UDP/" + modelData.port + " fallback)" : modelData.port ? "/" + modelData.port : "")
+                                    + "\n" + (modelData.effectiveProtocol || modelData.protocol || "auto").toUpperCase()
+                                    + (modelData.effectivePort ? "/" + modelData.effectivePort : "")
                                     + (modelData.interfaceName ? " · " + modelData.interfaceName : "")
                 }
                 WheelHandler {

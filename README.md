@@ -8,6 +8,8 @@ Hopview is a native desktop client for continuous traceroute. It records IPv4 an
 
 Prebuilt desktop and VM collector packages are available in the [Hopview releases](https://github.com/z23/hopview/releases).
 
+Windows and macOS can capture traces directly on the affected computer. Install the Windows x64 setup program or drag **Hopview** from the macOS disk image into **Applications**. Native builds and their test results are available from the [desktop build workflow](https://github.com/z23/hopview/actions/workflows/native.yml). For installation details, supported probe settings and source builds, see [Windows and macOS capture](docs/native-capture.md).
+
 Use a C++20 compiler and install the development files for the dependencies listed in the [desktop package manifest](pkgbuild/PKGBUILD). Run these commands from the project directory to build the desktop client and the headless node, then open the client.
 
 ```sh

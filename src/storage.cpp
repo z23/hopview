@@ -257,14 +257,19 @@ bool History::onlineBackup(const QString &destination) {
         const QFileInfo target(destination);
         const auto output = target.dir().canonicalPath() + "/" + target.fileName();
         const auto source = QFileInfo(path_).canonicalFilePath();
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+        constexpr auto pathCase = Qt::CaseInsensitive;
+#else
+        constexpr auto pathCase = Qt::CaseSensitive;
+#endif
         for (const auto &suffix : {"", "-wal", "-shm", "-journal"})
-            if (output == source + suffix)
+            if (output.compare(source + suffix, pathCase) == 0)
                 throw std::runtime_error("Choose a backup file outside the live database and its journals.");
         if (destination.isEmpty() || target.exists() || !temp.open())
             throw std::runtime_error("Choose a new backup filename in a writable directory.");
         temp.close();
         const auto rc =
-            sqlite3_open_v2(QFile::encodeName(temp.fileName()), &copy, SQLITE_OPEN_READWRITE, nullptr);
+            sqlite3_open_v2(temp.fileName().toUtf8(), &copy, SQLITE_OPEN_READWRITE, nullptr);
         if (rc != SQLITE_OK)
             throw std::runtime_error("Cannot open backup destination.");
         // A stable WAL read transaction prevents a busy writer from repeatedly

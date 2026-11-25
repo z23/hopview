@@ -64,7 +64,7 @@ class Spool {
         if (!lock_.tryLock())
             throw Error("Cannot acquire collector spool " + path);
         sqlite3 *opened = nullptr;
-        const auto rc = sqlite3_open_v2(QFile::encodeName(path).constData(), &opened,
+        const auto rc = sqlite3_open_v2(path.toUtf8().constData(), &opened,
                                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
         db_.reset(opened);
         if (rc != SQLITE_OK)

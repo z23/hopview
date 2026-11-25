@@ -388,8 +388,9 @@ QStringList Backend::interfaceNames() const {
 void Backend::startTrace(QString target, int family, int intervalMs, QString protocol, int port, QString interfaceName, bool reuseRunning, int payloadBytes, int dscp, bool dontFragment) {
     if (m_replayMode) return;
     const ProbeOptions options{protocol, port, interfaceName,payloadBytes,dscp,dontFragment};
-    if (!options.valid()) {
-        setStatus(tr("Check protocol, port, payload size and DSCP. TCP uses the system SYN size."));
+    const auto unsupported = localProbeError(options, family);
+    if (!unsupported.isEmpty()) {
+        setStatus(unsupported);
         return;
     }
     port = options.destinationPort();

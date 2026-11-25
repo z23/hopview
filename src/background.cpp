@@ -1,12 +1,19 @@
 #include "background.h"
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#ifdef Q_OS_LINUX
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
+#else
+#include "portableexit.h"
+#include <QIcon>
+#include <QSystemTrayIcon>
+#endif
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QLocalSocket>
@@ -16,6 +23,7 @@
 #include <QTimer>
 #include <cerrno>
 #include <csignal>
+#ifdef Q_OS_LINUX
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -28,8 +36,13 @@ void requestExit(int) {
     errno = saved;
 }
 }
+#elif defined(Q_OS_MACOS)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 void BackgroundInstance::enableGracefulExit() {
+#ifdef Q_OS_LINUX
     int ends[2];
     if (pipe2(ends, O_NONBLOCK | O_CLOEXEC) != 0)
         return;
@@ -49,11 +62,33 @@ void BackgroundInstance::enableGracefulExit() {
         ::close(read);
         ::close(write);
     });
+#else
+    installPortableExitHandlers(*qApp);
+#endif
 }
 
 BackgroundInstance::Result BackgroundInstance::acquire(const QString &database, const QJsonObject &request,
                                                          QString &error) {
+#ifdef Q_OS_MACOS
+    // Keep the Unix socket within sockaddr_un's path length even for long home names.
+    const QString runtime = QStringLiteral("/tmp/hopview-%1").arg(getuid());
+    const auto path = QFile::encodeName(runtime);
+    struct stat info{};
+    if ((mkdir(path.constData(), 0700) != 0 && errno != EEXIST) ||
+        lstat(path.constData(), &info) != 0 || !S_ISDIR(info.st_mode) || info.st_uid != getuid() ||
+        (info.st_mode & 077) != 0) {
+        error = tr("Cannot prepare a private recorder directory.");
+        return Failed;
+    }
+#elif defined(Q_OS_WIN)
+    const QString runtime = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    if (!QDir().mkpath(runtime)) {
+        error = tr("Cannot create the recorder directory.");
+        return Failed;
+    }
+#else
     const QString runtime = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+#endif
     if (runtime.isEmpty()) {
         error = tr("A private runtime directory is required for the recorder.");
         return Failed;
@@ -65,10 +100,19 @@ BackgroundInstance::Result BackgroundInstance::acquire(const QString &database, 
     }
     const QString canonical = file.exists() ? file.canonicalFilePath() :
         QDir(file.absoluteDir().canonicalPath()).absoluteFilePath(file.fileName());
-    const auto hash = QCryptographicHash::hash(canonical.toUtf8(), QCryptographicHash::Sha256).toHex().left(32);
+    auto identity = canonical;
+#ifdef Q_OS_WIN
+    identity = runtime.toCaseFolded() + "/" + canonical.toCaseFolded();
+#endif
+    const auto hash = QCryptographicHash::hash(identity.toUtf8(), QCryptographicHash::Sha256).toHex().left(32);
     // All recorder versions must use the same lock and socket for a given history.
-    const QString name = QDir(runtime).filePath("hopline-" + hash);
-    lock_ = std::make_unique<QLockFile>(name + ".lock");
+    const QString lockPath = QDir(runtime).filePath("hopline-" + hash);
+    lock_ = std::make_unique<QLockFile>(lockPath + ".lock");
+#ifdef Q_OS_WIN
+    const QString name = "hopview-" + hash;
+#else
+    const QString name = lockPath;
+#endif
     lock_->setStaleLockTime(0);
     if (lock_->tryLock()) {
         if (request["action"] == "quit") {
@@ -130,11 +174,23 @@ void BackgroundInstance::handleRequests(std::function<void(const QJsonObject &)>
     handler_ = std::move(fn);
     connect(&server_, &QLocalServer::newConnection, this, &BackgroundInstance::acceptClients);
     acceptClients();
+#ifdef Q_OS_LINUX
     auto bus = QDBusConnection::sessionBus();
     bus.connect("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                 "org.freedesktop.Notifications", "ActionInvoked", this, SLOT(notificationAction(uint,QString)));
     bus.connect("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                 "org.freedesktop.Notifications", "NotificationClosed", this, SLOT(notificationClosed(uint,uint)));
+#else
+    tray_ = new QSystemTrayIcon(QIcon(":/hopview.svg"), this);
+    tray_->setToolTip(tr("Hopview · Open recordings"));
+    connect(tray_, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason reason) {
+        if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick)
+            handler_({{"action", "show"}});
+    });
+    // Native tray callbacks do not identify which historical notification was clicked.
+    connect(tray_, &QSystemTrayIcon::messageClicked, this, [this] { handler_({{"action", "show"}}); });
+    tray_->show();
+#endif
 }
 
 void BackgroundInstance::acceptClients() {
@@ -163,13 +219,15 @@ void BackgroundInstance::acceptClients() {
 }
 
 void BackgroundInstance::notify(const QVariantMap &event) {
-    auto message = QDBusMessage::createMethodCall("org.freedesktop.Notifications",
-        "/org/freedesktop/Notifications", "org.freedesktop.Notifications", "Notify");
     const double latency = event["latency"].toDouble();
-    const auto summary = QString("%1 — %2").arg(event.value("sourceLabel", event["target"]).toString().toHtmlEscaped(), event["label"].toString());
+    const auto label = event.value("sourceLabel", event["target"]).toString();
     const auto body = tr("Destination loss %1% · Mean RTT %2")
         .arg(QString::number(event["loss"].toDouble(), 'f', 1),
              latency < 0 ? tr("unavailable") : QString::number(latency, 'f', 1) + " ms");
+#ifdef Q_OS_LINUX
+    const auto summary = QString("%1 — %2").arg(label.toHtmlEscaped(), event["label"].toString());
+    auto message = QDBusMessage::createMethodCall("org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications", "org.freedesktop.Notifications", "Notify");
     message.setArguments({QStringLiteral("Hopview"), 0u, QStringLiteral("hopview"), summary, body,
                           QStringList{"default", tr("View interval")}, QVariantMap{}, -1});
     auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(message), this);
@@ -179,10 +237,16 @@ void BackgroundInstance::notify(const QVariantMap &event) {
             notices_.insert(reply.value(), event);
         watcher->deleteLater();
     });
+#else
+    if (tray_)
+        tray_->showMessage(QString("%1 — %2").arg(label, event["label"].toString()), body);
+#endif
 }
 
+#ifdef Q_OS_LINUX
 void BackgroundInstance::notificationAction(uint id, const QString &action) {
     if (action == "default" && notices_.contains(id))
         emit openEvent(notices_[id]);
 }
 void BackgroundInstance::notificationClosed(uint id, uint) { notices_.remove(id); }
+#endif
