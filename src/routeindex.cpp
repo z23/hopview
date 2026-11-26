@@ -67,12 +67,15 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
                 clear.next();
             }
         } else {
+            previousStateJson = get.string(1);
             auto cachedIt = c.routeStates.find(id);
-            if (cachedIt != c.routeStates.end() && cachedIt->cursor == cursor) {
+            // Another connection can rewind for a late sample and replay to this same cursor
+            // with a different detector state, so the cursor alone does not identify it.
+            if (cachedIt != c.routeStates.end() && cachedIt->cursor == cursor &&
+                cachedIt->state == previousStateJson) {
                 detector = cachedIt->detector;
                 lastCheckpoint = cachedIt->lastCheckpoint;
             } else {
-                previousStateJson = get.string(1);
                 detector.restore(decode(previousStateJson));
             }
         }
@@ -90,8 +93,9 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
     if (!next.next())
         return false;
     const auto first = next.integer(0);
-    // Before crossing into a new UTC hour, ensure the completed hour's final state is checkpointed.
-    if (cursor >= 0 && first / hour != cursor / hour && lastCheckpoint != cursor) {
+    // Before crossing into a new UTC hour, checkpoint the completed hour's final state. Write it
+    // even when this connection believes it has: another connection's rebuild may have removed it.
+    if (cursor >= 0 && first / hour != cursor / hour) {
         Statement flushCkpt(db_, "INSERT OR REPLACE INTO route_checkpoints VALUES(?,?,?,?)");
         flushCkpt.integer(1, id);
         flushCkpt.integer(2, cursor / hour);
@@ -148,7 +152,7 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
     }
     if (c.routeStates.size() > 256 && !c.routeStates.contains(id))
         c.routeStates.clear();
-    c.routeStates[id] = {cursor, lastCheckpoint, std::move(detector)};
+    c.routeStates[id] = {cursor, lastCheckpoint, state, std::move(detector)};
     return more || cursor < finalTime;
 }
 
