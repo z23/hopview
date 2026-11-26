@@ -183,6 +183,9 @@ class Backend : public QObject {
     QList<QVariantMap> m_pairSettings;
     QList<qint64> m_pairIds;
     std::atomic<quint64> m_fleetRequest{0};
+    std::atomic<quint64> m_summaryRequest{0};
+    std::atomic<int> m_pendingDiagnostics{0};
+    std::atomic_bool m_closing{false};
     QVariantMap m_diagnosticsSettings;
     QThread m_diagnosticThread;
     Diagnostics *m_diagnostics = nullptr;
@@ -195,7 +198,7 @@ class Backend : public QObject {
     void flushSamples();
     void recordingError(QString message);
     struct RouteScan;
-    void warmRouteIndex(qint64 session,quint64 generation);
+    void warmRouteIndex(qint64 session, quint64 generation, bool anyUpdated = false);
     quint64 m_indexGeneration = 0;
     void readRoutePage(std::shared_ptr<RouteScan> scan);
     quint64 m_routeRequest = 0;
@@ -226,7 +229,7 @@ class Backend : public QObject {
     struct ChartCache {
         qint64 id = 0, start = 0, end = 0;
         int pixels = 0;
-        quint64 revision = 0;
+        quint64 revision = 0, storageRevision = 0;
         QList<int> hops;
         QVariantList charts;
         double timeMax = 0;
@@ -234,6 +237,7 @@ class Backend : public QObject {
     ChartCache m_chartCache;
     QHash<qint64, ChartCache> m_comparisonCache;
     QHash<qint64, quint64> m_revisions;
+    quint64 m_storageRevision = 0;
     QHash<qint64, QString> m_messages;
     QSet<qint64> m_active;
     QList<QVariantList> m_pendingStarts;

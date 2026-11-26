@@ -1,3 +1,4 @@
+#include "diagnostics.h"
 #include "nodeconfig.h"
 #include "nodejoin.h"
 #include <QDir>
@@ -20,6 +21,7 @@
 #endif
 
 int main(int argc, char **argv) {
+    CurlGlobalInit curlInit;
 #ifdef Q_OS_UNIX
     umask(0077);
 #endif

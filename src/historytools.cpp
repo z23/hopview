@@ -57,7 +57,7 @@ void Backend::storageAction(QString action, int rawDays, int summaryDays, QUrl f
         QMetaObject::invokeMethod(this, [=, this] {
             emit storageUpdated(status, message);
             if (ok && action == "save") {
-                ++m_revisions[m_session];
+                ++m_storageRevision;
                 scheduleView();
             }
         });

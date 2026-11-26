@@ -67,7 +67,7 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
             m_readContext,
             [&] {
                 m_reader = std::make_unique<History>(file);
-                m_ready = m_reader->open();
+                m_ready = m_reader->openReadOnly();
                 if (!m_ready)
                     m_status = m_reader->error();
             },
@@ -139,6 +139,8 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
                 if (!store.maintainStorage(now())) {
                     const auto error = store.error();
                     QMetaObject::invokeMethod(this,[this,error] { setStatus(error); });
+                } else {
+                    QMetaObject::invokeMethod(this,[this] { ++m_storageRevision; });
                 }
             });
     });
@@ -151,11 +153,13 @@ Backend::Backend(const QString &file, QObject *parent) : QObject(parent), m_hist
 }
 
 Backend::~Backend() {
+    m_closing.store(true);
     m_remotePoll.stop();
     m_refresh.stop();
     m_coalesce.stop();
     cancelBaseline();
     cancelFleet();
+    ++m_summaryRequest;
     m_baselinePool.waitForDone();
     m_exports.waitForDone();
     if (m_diagnostics) {
@@ -166,18 +170,17 @@ Backend::~Backend() {
     QMetaObject::invokeMethod(m_probe, [this] { m_probe->shutdown(); }, Qt::BlockingQueuedConnection);
     m_collectorThread.quit();
     m_collectorThread.wait();
-    // The worker's final samples are already queued ahead of this teardown.
+    // Flush pending samples and drain writer-to-reader posts before closing reader,
+    // then drain any reader-to-writer posts (such as baseline persistence) before closing writer.
+    QMetaObject::invokeMethod(m_writerContext, [this] { flushSamples(); }, Qt::BlockingQueuedConnection);
+    QMetaObject::invokeMethod(m_readContext, [this] { m_reader.reset(); }, Qt::BlockingQueuedConnection);
     QMetaObject::invokeMethod(
         m_writerContext,
         [this] {
-            flushSamples();
             m_writer.reset();
+            m_management.reset();
         },
         Qt::BlockingQueuedConnection);
-    QMetaObject::invokeMethod(m_readContext, [this] {
-        m_reader.reset();
-        m_management.reset();
-    }, Qt::BlockingQueuedConnection);
     m_writerThread.quit();
     m_readThread.quit();
     m_writerThread.wait();
@@ -577,6 +580,9 @@ void Backend::selectSession(qint64 id) {
     }
     emit viewportChanged();
     scheduleView();
+    ++m_indexGeneration;
+    if (id && m_ready && !m_replayMode)
+        warmRouteIndex(id, m_indexGeneration);
 }
 void Backend::closeSession(qint64 id) { changeTabVisibility(id, true); }
 void Backend::reopenSession(qint64 id) { changeTabVisibility(id, false); }
@@ -733,6 +739,7 @@ void Backend::fetchView() {
     const auto version = m_version;
     const auto pixels = m_pixels;
     const auto revision = m_revisions.value(id);
+    const auto storageRevision = m_storageRevision;
     QVariantList peers;
     for (auto peer : m_comparisons) {
         auto info = sessionInfo(peer);
@@ -740,10 +747,11 @@ void Backend::fetchView() {
         peers.append(info);
     }
     QMetaObject::invokeMethod(
-        m_readContext, [this, id, start, end, fs, fe, hops, version, pixels, revision, peers] {
+        m_readContext, [this, id, start, end, fs, fe, hops, version, pixels, revision, storageRevision, peers] {
             auto &cache = m_chartCache;
             const bool reuse = cache.id == id && cache.start == start && cache.end == end &&
-                               cache.hops == hops && cache.pixels == pixels && cache.revision == revision;
+                               cache.hops == hops && cache.pixels == pixels && cache.revision == revision &&
+                               cache.storageRevision == storageRevision;
             auto view = m_reader->view(id, start, end, fs, fe, reuse ? QList<int>{} : hops, pixels);
             if (reuse) {
                 view["charts"] = cache.charts;
@@ -754,6 +762,7 @@ void Backend::fetchView() {
                          end,
                          pixels,
                          revision,
+                         storageRevision,
                          hops,
                          view.value("charts").toList(),
                          view.value("timeMax").toDouble()};
@@ -768,7 +777,8 @@ void Backend::fetchView() {
                 const auto peerRevision = peer.value("revision").toULongLong();
                 auto entry = m_comparisonCache.take(peerId);
                 if (entry.id != peerId || entry.start != start || entry.end != end ||
-                    entry.pixels != pixels || entry.revision != peerRevision) {
+                    entry.pixels != pixels || entry.revision != peerRevision ||
+                    entry.storageRevision != storageRevision) {
                     const auto comparison = m_reader->view(peerId, start, end, fs, fe, {0}, pixels, true);
                     if (!m_reader->error().isEmpty()) {
                         error = m_reader->error();
@@ -779,6 +789,7 @@ void Backend::fetchView() {
                              end,
                              pixels,
                              peerRevision,
+                             storageRevision,
                              {0},
                              comparison.value("charts").toList(),
                              comparison.value("timeMax").toDouble()};
@@ -875,16 +886,24 @@ void Backend::cancelRouteHistory() {
     ++m_routeRequest;
 }
 
-void Backend::warmRouteIndex(qint64 id,quint64 generation) {
-    QMetaObject::invokeMethod(m_readContext,[this,id,generation] {
-        bool more;
-        const bool ok=m_reader->advanceRouteIndex(id,more);
-        const auto error=m_reader->error();
-        QMetaObject::invokeMethod(this,[this,id,generation,more,ok,error] {
-            if (generation!=m_indexGeneration) return;
-            if (!ok) { setStatus(error); return; }
-            if (more) warmRouteIndex(id,generation);
-            else scheduleView(false);
+void Backend::warmRouteIndex(qint64 id, quint64 generation, bool anyUpdated) {
+    QMetaObject::invokeMethod(m_writerContext, [this, id, generation, anyUpdated] {
+        if (!m_writer)
+            return;
+        bool more = false, updated = false;
+        const bool ok = m_writer->advanceRouteIndex(id, more, &updated);
+        const auto error = m_writer->error();
+        QMetaObject::invokeMethod(this, [this, id, generation, more, anyUpdated = anyUpdated || updated, ok, error] {
+            if (generation != m_indexGeneration)
+                return;
+            if (!ok) {
+                setStatus(error);
+                return;
+            }
+            if (more)
+                warmRouteIndex(id, generation, anyUpdated);
+            else if (anyUpdated)
+                scheduleView(false);
         });
     });
 }
@@ -902,17 +921,37 @@ void Backend::requestRouteHistory() {
 }
 
 void Backend::readRoutePage(std::shared_ptr<RouteScan> scan) {
-    QMetaObject::invokeMethod(m_readContext, [this, scan] {
-        QVariantList events;
-        bool more = false;
-        m_reader->indexedRoutes(scan->session, scan->cursor, events, more);
-        const QString error = m_reader->error();
-        QMetaObject::invokeMethod(this, [this, scan, events = std::move(events), more, error] {
-            if (scan->request != m_routeRequest || scan->session != m_session)
+    QMetaObject::invokeMethod(m_writerContext, [this, scan] {
+        if (!m_writer)
+            return;
+        bool indexMore = false;
+        const bool advanced = m_writer->advanceRouteIndex(scan->session, indexMore);
+        if (!advanced) {
+            const QString error = m_writer->error();
+            QMetaObject::invokeMethod(this, [this, scan, error] {
+                if (scan->request != m_routeRequest || scan->session != m_session)
+                    return;
+                emit routeHistoryPage({}, true, error);
+            });
+            return;
+        }
+        if (m_closing.load())
+            return;
+        QMetaObject::invokeMethod(m_readContext, [this, scan, indexMore] {
+            if (!m_reader)
                 return;
-            emit routeHistoryPage(events, !more || !error.isEmpty(), error);
-            if (more && error.isEmpty() && scan->request == m_routeRequest)
-                readRoutePage(scan);
+            QVariantList events;
+            bool pageMore = false;
+            m_reader->readIndexedRoutes(scan->session, scan->cursor, events, pageMore);
+            const QString error = m_reader->error();
+            const bool more = indexMore || pageMore;
+            QMetaObject::invokeMethod(this, [this, scan, events = std::move(events), more, error] {
+                if (scan->request != m_routeRequest || scan->session != m_session)
+                    return;
+                emit routeHistoryPage(events, !more || !error.isEmpty(), error);
+                if (more && error.isEmpty() && scan->request == m_routeRequest)
+                    readRoutePage(scan);
+            });
         });
     });
 }
@@ -1041,14 +1080,37 @@ void Backend::syncDiagnostics(qint64 id) {
         m_diagnostics = new Diagnostics;
         m_diagnostics->moveToThread(&m_diagnosticThread);
         connect(&m_diagnosticThread, &QThread::finished, m_diagnostics, &QObject::deleteLater);
-        // Backpressure stays on the diagnostics thread when storage is slow.
-        connect(m_diagnostics, &Diagnostics::observation, m_writerContext,
-                [this](qint64 id, const QVariantMap &record) {
-                    if (!m_writer->appendDiagnostic(id, record)) {
-                        const auto error = m_writer->error();
-                        QMetaObject::invokeMethod(this, [this, error] { setStatus(error); });
-                    }
-                }, Qt::BlockingQueuedConnection);
+        // Bound queued observations without stalling interface counter sampling on disk I/O.
+        connect(m_diagnostics, &Diagnostics::observation, m_diagnostics,
+                [this](qint64 id, QVariantMap record) {
+                    constexpr int maxPendingDiagnostics = 256;
+                    int pending = m_pendingDiagnostics.load(std::memory_order_relaxed);
+                    while (pending < maxPendingDiagnostics &&
+                           !m_pendingDiagnostics.compare_exchange_weak(
+                               pending, pending + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+                    if (pending >= maxPendingDiagnostics)
+                        return;
+                    QMetaObject::invokeMethod(
+                        m_writerContext,
+                        [this, id, record = std::move(record)] {
+                            const struct Guard {
+                                std::atomic<int> &count;
+                                ~Guard() { count.fetch_sub(1, std::memory_order_release); }
+                            } guard{m_pendingDiagnostics};
+                            if (!m_writer)
+                                return;
+                            if (!m_writer->appendDiagnostic(id, record)) {
+                                const auto error = m_writer->error();
+                                QMetaObject::invokeMethod(this, [this, error] { setStatus(error); });
+                            } else {
+                                QMetaObject::invokeMethod(this, [this, id] {
+                                    if (id == m_session)
+                                        m_dirty = true;
+                                });
+                            }
+                        },
+                        Qt::QueuedConnection);
+                });
         m_diagnosticThread.start();
     }
     QMetaObject::invokeMethod(m_diagnostics, [this, id, config, info] {
