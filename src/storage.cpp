@@ -324,21 +324,31 @@ bool History::maintainStorage(qint64 now) {
             Statement sids(db_, "SELECT id FROM sessions WHERE id NOT IN (SELECT session FROM imported_sessions)");
             while (sids.next())
                 targets.append(sids.integer(0));
-            // Nothing is stored before the first recording, so the first step can start there.
-            // With no recorded samples at all, one step reaches both cutoffs.
-            Statement earliest(db_, "SELECT coalesce(min(first_ms),-1) FROM sessions WHERE id NOT IN "
-                                    "(SELECT session FROM imported_sessions)");
-            earliest.next();
-            const qint64 firstHour = earliest.integer(0) < 0 ? raw : earliest.integer(0) / hour * hour;
-            earliest.reset();
+            // The hour after the earliest row that is still to be retired, or the cutoff when no
+            // recording has one before it. Stretches of time without data then cost nothing.
+            Statement rawFrom(db_, "SELECT coalesce(min(t),-1) FROM samples WHERE session=? AND hop=0 AND t>=?");
+            Statement summaryFrom(db_, "SELECT coalesce(min(t),-1) FROM bins WHERE session=? AND hop=0 "
+                                       "AND span=3600000 AND t>=?");
+            auto stepTo = [&](Statement &q, qint64 from, qint64 cutoff) {
+                qint64 first = cutoff;
+                for (const qint64 sid : targets) {
+                    q.reset();
+                    q.integer(1, sid);
+                    q.integer(2, from);
+                    if (q.next() && q.integer(0) >= 0)
+                        first = std::min(first, q.integer(0));
+                }
+                q.reset();
+                return std::min(cutoff, first / hour * hour + hour);
+            };
             // Retire one hour per transaction and publish its watermark in that same transaction.
             // Readers and late samples then never meet pruned rows above the watermark, a failure
             // leaves the previous hour's consistent state, and a long first prune does not hold
             // the write lock away from live recorders.
             qint64 atRaw = oldRaw, atSummary = oldSummary;
             while (atRaw < raw || atSummary < summary) {
-                const qint64 nextRaw = std::min(raw, std::max(atRaw, firstHour) + hour);
-                const qint64 nextSummary = std::min(summary, std::max(atSummary, firstHour) + hour);
+                const qint64 nextRaw = atRaw < raw ? stepTo(rawFrom, atRaw, raw) : atRaw;
+                const qint64 nextSummary = atSummary < summary ? stepTo(summaryFrom, atSummary, summary) : atSummary;
                 Transaction tx(db_, true);
                 Statement marks(db_, "SELECT raw_before,summary_before FROM retention WHERE id=1");
                 marks.next();
