@@ -1,5 +1,9 @@
 name: Native desktop probes
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 
@@ -85,7 +89,9 @@ jobs:
             (cd "build-native/$suite" && qmake "../../tests/$suite.pro" CONFIG+=release &&
              make -j4 && QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software "./${suite}_test")
           done
+      # Pull requests from forks are built and tested, but they do not publish installers.
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         with:
           name: ${{ matrix.package }}
           path: build-native/${{ matrix.package }}

@@ -1,6 +1,6 @@
 # Windows and macOS capture
 
-Download the artifact for your operating system from a successful [Native desktop probes run](https://github.com/z23/hopview/actions/workflows/native.yml) and unzip it. On Windows x64, run `Hopview-Windows-x64.exe` to install Hopview for your user. On macOS, open `Hopview-macOS.dmg` and drag **Hopview** to **Applications**. The app includes Intel and Apple silicon binaries. Development builds use ad-hoc signing on macOS and an unsigned Windows installer.
+Download the artifact for your operating system from a successful [Native desktop probes run on `main`](https://github.com/z23/hopview/actions/workflows/native.yml?query=branch%3Amain) and unzip it. On Windows x64, run `Hopview-Windows-x64.exe` to install Hopview for your user. On macOS, open `Hopview-macOS.dmg` and drag **Hopview** to **Applications**. The app includes Intel and Apple silicon binaries. Development builds use ad-hoc signing on macOS and an unsigned Windows installer.
 
 Enter a hostname or IP address and choose **Start trace**. Windows and macOS use ordinary-user ICMP echo for the route and a separate destination probe. The desktop and the bundled headless collector use the same measurement engine. **Recording and alerts** can keep a desktop trace running after the window closes. **Export focus as CSV** and **Save replayable incident** use the same formats as Linux.
 
