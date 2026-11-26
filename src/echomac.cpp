@@ -101,6 +101,15 @@ public:
             error = systemMessage(errno);
             return false;
         }
+        // Darwin gives ICMP datagram sockets 8 KB queues. A larger probe could not be sent,
+        // and two replies of a few kilobytes could not wait in the receive queue together.
+        const int queue = 1 << 20;
+        const bool roomy = setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &queue, sizeof(queue)) == 0 &&
+                           setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &queue, sizeof(queue)) == 0;
+        if (!roomy && packet_.size() > 2048) {
+            error = "Cannot reserve socket queues for this payload: " + systemMessage(errno);
+            return false;
+        }
         // Verify that the selected family is routable before accepting a DNS candidate.
         if (sourceAddress().isNull()) {
             error = "No route to " + address_.toString();

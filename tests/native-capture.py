@@ -72,9 +72,11 @@ def collector_capture(binary):
 
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve()
-    for host, family, method in [("127.0.0.1", "4", "auto"), ("::1", "6", "icmp"),
-                                 ("localhost", "4", "icmp")]:
-        result = report(binary, host, family, "--protocol", method, "--payload-bytes", "32")
+    # The 12000-byte probes exceed the 8 KB queues that macOS gives a new ICMP datagram socket.
+    for host, family, method, payload in [("127.0.0.1", "4", "auto", "32"), ("::1", "6", "icmp", "32"),
+                                          ("localhost", "4", "icmp", "32"),
+                                          ("127.0.0.1", "4", "icmp", "12000"), ("::1", "6", "icmp", "12000")]:
+        result = report(binary, host, family, "--protocol", method, "--payload-bytes", payload)
         assert result.returncode == 0, (result.stderr, result.stdout)
         data = json.loads(result.stdout)
         assert data["effectiveProtocol"] == "icmp" and data["effectivePort"] == 0, data
