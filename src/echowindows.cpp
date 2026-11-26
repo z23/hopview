@@ -118,6 +118,10 @@ struct Request {
             sockaddr_in6 address{};
             static_assert(offsetof(ICMPV6_ECHO_REPLY, Status) == 28);
             std::memcpy(&address.sin6_port, buffer.constData(), sizeof(address) - offsetof(sockaddr_in6, sin6_port));
+            // As on Linux and macOS, an echo reply from another host is not the target answering.
+            if (reply.Status == IP_SUCCESS &&
+                std::memcmp(&address.sin6_addr, &target.Ipv6.sin6_addr, sizeof(address.sin6_addr)) != 0)
+                return {};
             return resultOf(reply.Status, ipv6Address(&address.sin6_addr, address.sin6_scope_id),
                             reply.RoundTripTime);
         }
@@ -125,6 +129,8 @@ struct Request {
         ICMP_ECHO_REPLY reply{};
         std::memcpy(&reply, buffer.constData(), sizeof(reply));
         if (error && reply.Status != error) return resultOf(error);
+        if (reply.Status == IP_SUCCESS && reply.Address != target.Ipv4.sin_addr.s_addr)
+            return {};
         return resultOf(reply.Status, QHostAddress(ntohl(reply.Address)), reply.RoundTripTime);
     }
 
