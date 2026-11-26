@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # The tree needs Qt 6.5 or newer. Ubuntu 24.04 packages 6.4.
+    container: ubuntu:26.04
+    timeout-minutes: 30
+    steps:
+      - name: Install build and test dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            git \
+            build-essential \
+            pkg-config \
+            qmake6 \
+            qt6-base-dev \
+            qt6-declarative-dev \
+            qml6-module-qtquick \
+            qml6-module-qtquick-window \
+            qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts \
+            qml6-module-qtquick-dialogs \
+            qml6-module-qtquick-templates \
+            qml6-module-qtqml-workerscript \
+            qml6-module-qtcore \
+            libsqlite3-dev \
+            libcurl4-openssl-dev \
+            openssl \
+            python3
+
+      - uses: actions/checkout@v4
+
+      - name: Build hopview and hopview-node
+        run: JOBS="$(nproc)" bin/build
+
+      - name: Run C++ unit and integration tests
+        run: JOBS="$(nproc)" bin/test
+
+      - name: Run CLI and loopback verification scripts
+        run: |
+          python3 tests/replay-cli.py ./build/hopview
+          python3 tests/background-recorder.py ./build/hopview
+          python3 tests/diagnostics-loopback.py ./build-tests/integration/integration_test
+          python3 tests/telemetry.py ./build-node/hopview-node --viewer ./build-tests/integration/integration_test
+          python3 tests/receiver-workflows.py ./build-node/hopview-node
+          python3 tests/managed-collector.py ./build-node/hopview-node

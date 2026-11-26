@@ -11,15 +11,27 @@
 #include <QScopeGuard>
 #include <QUuid>
 #ifdef Q_OS_LINUX
+#include <csignal>
 #include <fcntl.h>
 #include <grp.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <unistd.h>
 #endif
 
 namespace telemetry {
 #ifdef Q_OS_LINUX
 namespace {
+// The terminal settings to put back if a signal ends the process at the hidden prompt.
+termios promptSettings;
+volatile std::sig_atomic_t promptHidden = 0;
+void restorePrompt(int signal) {
+    if (promptHidden)
+        ::tcsetattr(STDIN_FILENO, TCSANOW, &promptSettings);
+    std::signal(signal, SIG_DFL);
+    ::raise(signal);
+}
+
 QString readKey() {
     QByteArray input;
     if (::isatty(STDIN_FILENO)) {
@@ -27,9 +39,51 @@ QString readKey() {
         prompt.setInputChannelMode(QProcess::ForwardedInputChannel);
         prompt.setProcessChannelMode(QProcess::ForwardedErrorChannel);
         prompt.start("/usr/bin/systemd-ask-password", {"--timeout=0", "Hopview enrollment key:"});
-        if (!prompt.waitForStarted() || !prompt.waitForFinished(-1) || prompt.exitCode() != 0)
+        if (prompt.waitForStarted()) {
+            if (!prompt.waitForFinished(-1) || prompt.exitCode() != 0)
+                throw Error("Enrollment key entry cancelled");
+            input = prompt.readAllStandardOutput().trimmed();
+        } else if (prompt.error() == QProcess::FailedToStart) {
+            termios saved{};
+            if (::tcgetattr(STDIN_FILENO, &saved) != 0)
+                throw Error("Cannot configure terminal for hidden enrollment key entry");
+            // Ctrl-C, a hangup or a kill at the prompt would otherwise leave the shell without echo.
+            static constexpr int interrupts[] = {SIGINT, SIGTERM, SIGQUIT, SIGHUP};
+            struct sigaction previous[std::size(interrupts)], handler{};
+            handler.sa_handler = restorePrompt;
+            sigemptyset(&handler.sa_mask);
+            promptSettings = saved;
+            for (size_t i = 0; i < std::size(interrupts); ++i)
+                ::sigaction(interrupts[i], &handler, &previous[i]);
+            const auto restore = qScopeGuard([&] {
+                if (promptHidden) {
+                    ::tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+                    promptHidden = 0;
+                    const char newline = '\n';
+                    if (::write(STDERR_FILENO, &newline, 1) < 0) {}
+                }
+                for (size_t i = 0; i < std::size(interrupts); ++i)
+                    ::sigaction(interrupts[i], &previous[i], nullptr);
+            });
+            termios hidden = saved;
+            hidden.c_lflag &= ~tcflag_t(ECHO);
+            promptHidden = 1;
+            if (::tcsetattr(STDIN_FILENO, TCSANOW, &hidden) != 0) {
+                promptHidden = 0;
+                throw Error("Cannot disable terminal echo for enrollment key entry");
+            }
+            const char label[] = "Hopview enrollment key: ";
+            if (::write(STDERR_FILENO, label, sizeof(label) - 1) < 0) {}
+            QFile tty;
+            if (!tty.open(STDIN_FILENO, QIODevice::ReadOnly))
+                throw Error("Cannot read enrollment key from terminal");
+            const auto line = tty.readLine(160);
+            if (line.isEmpty())
+                throw Error("Enrollment key entry cancelled");
+            input = line.trimmed();
+        } else {
             throw Error("Enrollment key entry cancelled");
-        input = prompt.readAllStandardOutput().trimmed();
+        }
     } else {
         QFile pipe;
         if (!pipe.open(STDIN_FILENO, QIODevice::ReadOnly))

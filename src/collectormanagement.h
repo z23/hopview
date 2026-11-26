@@ -16,6 +16,9 @@ class CollectorManagement {
     QString createKey();
     QVariantList nodes();
     bool setTargets(const QString &site, qint64 expectedRevision, const QVariantList &targets);
+    // A collector listed in the receiver's own configuration only has its status entry cleared.
+    bool removeCollector(const QString &site, bool *revoked = nullptr);
+    int revokeUnusedKeys();
     QString error() const { return error_; }
 
     void setCertificateFingerprint(const QString &fingerprint);

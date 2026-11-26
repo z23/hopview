@@ -14,9 +14,10 @@ C.Dialog {
     property string joinKey: ""
     property string problem: ""
     property string notice: ""
+    property string confirmRemoveSite: ""
     property bool generating: false
     property double clock: Date.now()
-    readonly property var recordings: backend.sessions.concat(backend.closedSessions).filter(s => s.remoteLive)
+    readonly property var recordings: dialog.opened ? backend.sessions.concat(backend.closedSessions).filter(s => s.remoteLive) : []
     readonly property var currentNode: backend.collectors.find(n => n.site === targets.site) || ({})
     modal: true; focus: true; anchors.centerIn: parent; scale: uiScale
     width: Math.min(740, parent.width / uiScale - 20)
@@ -25,12 +26,12 @@ C.Dialog {
     closePolicy: page === "targets" && (targets.dirty || targets.editing || targets.saving)
                  ? C.Popup.NoAutoClose : C.Popup.CloseOnEscape
     onAboutToShow: {
-        page = "nodes"; problem = ""; notice = ""; clock = Date.now()
+        page = "nodes"; problem = ""; notice = ""; confirmRemoveSite = ""; clock = Date.now()
         address.text = preferences.receiverAddress
         backend.refreshCollectors()
     }
-    onClosed: { joinKey = ""; generating = false; problem = "" }
-    onPageChanged: { if (page !== "join") joinKey = ""; problem = "" }
+    onClosed: { joinKey = ""; generating = false; problem = ""; confirmRemoveSite = "" }
+    onPageChanged: { if (page !== "join") joinKey = ""; problem = ""; confirmRemoveSite = "" }
     function timestamp(ms) { return ms ? new Date(ms).toISOString() : qsTr("Unknown") }
     function age(ms) {
         const seconds = Math.max(0, Math.floor((clock - ms) / 1000))
@@ -88,6 +89,12 @@ C.Dialog {
             dialog.problem = error
         }
         function onCollectorListError(error) { if (dialog.opened) dialog.problem = error }
+        function onCollectorActionDone(message, error) {
+            if (!dialog.opened) return
+            dialog.confirmRemoveSite = ""
+            dialog.problem = error
+            dialog.notice = message
+        }
     }
     component Label: Text { textFormat: Text.PlainText; color: "#d8e4ec"; font.pixelSize: 13; wrapMode: Text.WrapAnywhere }
     component Field: C.TextField {
@@ -111,6 +118,7 @@ C.Dialog {
             }
         }
         RowLayout {
+            Layout.fillWidth: true
             visible: dialog.page === "nodes" || dialog.page === "recordings"
             TraceButton {
                 text: qsTr("Nodes (%1)").arg(backend.collectors.length); primary: dialog.page === "nodes"
@@ -119,6 +127,13 @@ C.Dialog {
             TraceButton {
                 text: qsTr("Recordings (%1)").arg(dialog.recordings.length); primary: dialog.page === "recordings"
                 onClicked: dialog.page = "recordings"
+            }
+            Item { Layout.fillWidth: true }
+            TraceButton {
+                objectName: "revokeUnusedKeys"
+                visible: dialog.page === "nodes"
+                text: qsTr("Revoke unused keys")
+                onClicked: { dialog.confirmRemoveSite = ""; dialog.problem = ""; dialog.notice = ""; backend.revokeUnusedKeys() }
             }
         }
         ListView {
@@ -151,10 +166,28 @@ C.Dialog {
                         Label { Layout.fillWidth: true; color: nodeRow.modelData.applyError ? "#f1a59e" : "#b4c1cb"; text: dialog.status(nodeRow.modelData) }
                     }
                     TraceButton {
-                        visible: !nodeRow.modelData.manual
+                        visible: !nodeRow.modelData.manual && dialog.confirmRemoveSite !== nodeRow.modelData.site
                         objectName: "editCollector-" + nodeRow.modelData.site
                         text: qsTr("Targets…"); Accessible.name: qsTr("Edit targets for %1").arg(nodeRow.modelData.site)
                         onClicked: dialog.manage(nodeRow.modelData)
+                    }
+                    TraceButton {
+                        visible: dialog.confirmRemoveSite !== nodeRow.modelData.site
+                        objectName: "removeCollector-" + nodeRow.modelData.site
+                        text: qsTr("Remove…"); Accessible.name: qsTr("Remove collector %1").arg(nodeRow.modelData.site)
+                        onClicked: { dialog.confirmRemoveSite = nodeRow.modelData.site; dialog.problem = ""; dialog.notice = "" }
+                    }
+                    TraceButton {
+                        visible: dialog.confirmRemoveSite === nodeRow.modelData.site
+                        objectName: "confirmRemoveCollector-" + nodeRow.modelData.site
+                        text: qsTr("Confirm remove"); primary: true
+                        Accessible.name: qsTr("Confirm removing collector %1").arg(nodeRow.modelData.site)
+                        onClicked: backend.removeCollector(nodeRow.modelData.site)
+                    }
+                    TraceButton {
+                        visible: dialog.confirmRemoveSite === nodeRow.modelData.site
+                        text: qsTr("Cancel")
+                        onClicked: dialog.confirmRemoveSite = ""
                     }
                 }
             }
