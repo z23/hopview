@@ -949,9 +949,13 @@ C.ApplicationWindow {
                                                 else e.accepted = false
                                             }
                                             readonly property var hoveredNote: containsMouse && !noteDialog.visible ? app.nearbyNote(app.cursorFraction, track.trackNotes) : null
-                                            C.ToolTip.visible: hoveredNote !== null
+                                            // Show the note explicitly so its text is in place before the delay starts.
+                                            // Bindings on the same change would open the tooltip with the previous text.
+                                            onHoveredNoteChanged: {
+                                                if (hoveredNote) C.ToolTip.show(hoveredNote.text)
+                                                else C.ToolTip.hide()
+                                            }
                                             C.ToolTip.delay: 350
-                                            C.ToolTip.text: hoveredNote ? hoveredNote.text : ""
                                         }
                                     }
                                     Rule { anchors.bottom: parent.bottom; width: parent.width; height: 1 }
@@ -993,7 +997,9 @@ C.ApplicationWindow {
                                     width: 5; height: 12; radius: 2
                                     color: ({route:"#c99bf4",alert:"#ee8581",gap:"#95a2ad",note:"#e5c576",service:"#7dcabb","interface":"#88aedf"})[modelData.kind] || app.faint
                                     C.ToolTip.visible: hoverMarker.hovered
-                                    C.ToolTip.text: hoverMarker.hovered ? new Date(modelData.t).toISOString() + " · " + modelData.text : ""
+                                    // Keep the text current while hidden. A tooltip waiting out its delay
+                                    // opens with the text it had when it was asked to show.
+                                    C.ToolTip.text: new Date(modelData.t).toISOString() + " · " + modelData.text
                                     HoverHandler { id: hoverMarker }
                                     TapHandler { onTapped: incidentNavigator.openAt(marker.modelData.t) }
                                 }
