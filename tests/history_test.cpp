@@ -1016,6 +1016,30 @@ void testStorageFailureHandling(const QTemporaryDir &dir) {
                 "Finished retention retires raw samples and keeps their summaries");
     }
 
+    // 5b. Recordings years apart are retired without walking the empty time between them.
+    {
+        const auto file = dir.filePath("sparse-retention.sqlite");
+        History h(file);
+        const auto early = h.createSession("early.test", 4, 1000), late = h.createSession("late.test", 4, 1000);
+        QVector<Sample> batch;
+        for (int i = 0; i < 20; ++i)
+            batch << Sample{early, day + i * 1000LL, 0, "198.51.100.1", 5.0, true}
+                  << Sample{early, day + i * 1000LL, 1, "192.0.2.1", 1.0, false}
+                  << Sample{late, 900 * day + i * 1000LL, 0, "198.51.100.2", 6.0, true}
+                  << Sample{late, 1500 * day + i * 1000LL, 0, "198.51.100.2", 6.0, true};
+        require(h.append(batch) && h.setRetention(1, 2), "Seed recordings years apart");
+        QElapsedTimer elapsed;
+        elapsed.start();
+        require(h.maintainStorage(1501 * day), "Retire sparse history");
+        require(elapsed.elapsed() < 3000, "Retention does not visit hours without data");
+        require(scalar(file, "SELECT count(*) FROM samples") == 20 &&
+                    scalar(file, "SELECT min(t) FROM samples") == 1500 * day &&
+                    scalar(file, "SELECT count(*) FROM bins WHERE t<129600000000") == 0 &&
+                    scalar(file, "SELECT raw_before FROM retention") == 1500 * day &&
+                    scalar(file, "SELECT summary_before FROM retention") == 1499 * day,
+                "Sparse history is retired up to both cutoffs");
+    }
+
     // 6. Prefix lengths are tracked per table, and another connection's import is picked up.
     {
         const auto file = dir.filePath("identity-lengths.sqlite");
