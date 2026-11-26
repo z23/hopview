@@ -1,4 +1,5 @@
 #include "history.h"
+#include "historycache.h"
 #include "routeevents.h"
 #include "sqlhelpers.h"
 #include <QJsonObject>
@@ -20,7 +21,11 @@ QVariantMap decode(const QString &value) {
 bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
     qint64 cursor = -1, until = 0;
     constexpr qint64 hour = 3600000;
+    constexpr qint64 checkpointSpacingMs = 60000;
+    auto &c = cache();
     RouteEvents detector;
+    qint64 lastCheckpoint = -1;
+    QString previousStateJson;
     Statement cutoff(db_, "SELECT raw_before FROM retention");
     cutoff.next();
     const auto rawBefore = cutoff.integer(0);
@@ -33,7 +38,9 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
         checkpoint.integer(4, cursor);
         if (checkpoint.next()) {
             cursor = checkpoint.integer(0);
-            detector.restore(decode(checkpoint.string(1)));
+            previousStateJson = checkpoint.string(1);
+            detector.restore(decode(previousStateJson));
+            lastCheckpoint = cursor;
         }
     };
     Statement get(db_, "SELECT cursor,state FROM route_index WHERE session=?");
@@ -41,7 +48,9 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
     if (get.next()) {
         cursor = get.integer(0);
         if (firstNew >= 0 && firstNew <= cursor) {
+            c.routeStates.remove(id);
             cursor = -1;
+            previousStateJson.clear();
             restoreBefore(firstNew);
             // A late packet may change transitions after the checkpoint. Preserve
             // intervals whose archived raw samples can no longer reproduce them.
@@ -58,7 +67,17 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
                 clear.next();
             }
         } else {
-            detector.restore(decode(get.string(1)));
+            previousStateJson = get.string(1);
+            auto cachedIt = c.routeStates.find(id);
+            // Another connection can rewind for a late sample and replay to this same cursor
+            // with a different detector state, so the cursor alone does not identify it.
+            if (cachedIt != c.routeStates.end() && cachedIt->cursor == cursor &&
+                cachedIt->state == previousStateJson) {
+                detector = cachedIt->detector;
+                lastCheckpoint = cachedIt->lastCheckpoint;
+            } else {
+                detector.restore(decode(previousStateJson));
+            }
         }
     }
     get.reset();
@@ -74,6 +93,17 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
     if (!next.next())
         return false;
     const auto first = next.integer(0);
+    // Before crossing into a new UTC hour, checkpoint the completed hour's final state. Write it
+    // even when this connection believes it has: another connection's rebuild may have removed it.
+    if (cursor >= 0 && first / hour != cursor / hour) {
+        Statement flushCkpt(db_, "INSERT OR REPLACE INTO route_checkpoints VALUES(?,?,?,?)");
+        flushCkpt.integer(1, id);
+        flushCkpt.integer(2, cursor / hour);
+        flushCkpt.integer(3, cursor);
+        flushCkpt.string(4, previousStateJson.isEmpty() ? json(detector.state()) : previousStateJson);
+        flushCkpt.next();
+        lastCheckpoint = cursor;
+    }
     if (rawBefore && cursor < rawBefore && first / hour != cursor / hour)
         restoreBefore(first);
     // Finish one UTC hour before entering the next so a frozen segment can
@@ -108,12 +138,21 @@ bool History::updateRouteIndex(qint64 id, qint64 firstNew) {
     const auto state = json(detector.state());
     put.string(3, state);
     put.next();
-    Statement checkpoint(db_, "INSERT OR REPLACE INTO route_checkpoints VALUES(?,?,?,?)");
-    checkpoint.integer(1, id);
-    checkpoint.integer(2, cursor / hour);
-    checkpoint.integer(3, cursor);
-    checkpoint.string(4, state);
-    checkpoint.next();
+    const bool needCheckpoint = before < 0 || cursor / hour != before / hour ||
+                                cursor >= (first / hour + 1) * hour - 1 ||
+                                lastCheckpoint < 0 || cursor - lastCheckpoint >= checkpointSpacingMs;
+    if (needCheckpoint) {
+        Statement checkpoint(db_, "INSERT OR REPLACE INTO route_checkpoints VALUES(?,?,?,?)");
+        checkpoint.integer(1, id);
+        checkpoint.integer(2, cursor / hour);
+        checkpoint.integer(3, cursor);
+        checkpoint.string(4, state);
+        checkpoint.next();
+        lastCheckpoint = cursor;
+    }
+    if (c.routeStates.size() > 256 && !c.routeStates.contains(id))
+        c.routeStates.clear();
+    c.routeStates[id] = {cursor, lastCheckpoint, state, std::move(detector)};
     return more || cursor < finalTime;
 }
 
@@ -194,6 +233,35 @@ QVariantList History::timelineEvents(qint64 id, qint64 from, qint64 through) {
         q.integer(3, through);
         while (q.next())
             events << QVariantMap{{"t", q.integer(0)}, {"kind", q.string(1)}, {"text", q.string(2)}};
+    } catch (const std::exception &e) {
+        error_ = QString::fromUtf8(e.what());
+    }
+    return events;
+}
+
+QVariantList History::routeTransitions(qint64 id, qint64 from, qint64 through, int limit) {
+    QVariantList events;
+    if (!open())
+        return events;
+    error_.clear();
+    try {
+        const char *sql = limit > 0
+                              ? "SELECT t, 'Hops '||json_extract(data,'$.changedHops')||CASE "
+                                "WHEN json_extract(data,'$.knownAlternate') THEN ' returned to a known responder' "
+                                "ELSE ' changed' END FROM route_transitions WHERE session=?1 AND t BETWEEN ?2 AND ?3 "
+                                "ORDER BY t DESC LIMIT ?4"
+                              : "SELECT t, 'Hops '||json_extract(data,'$.changedHops')||CASE "
+                                "WHEN json_extract(data,'$.knownAlternate') THEN ' returned to a known responder' "
+                                "ELSE ' changed' END FROM route_transitions WHERE session=?1 AND t BETWEEN ?2 AND ?3 "
+                                "ORDER BY t DESC";
+        Statement q(db_, sql);
+        q.integer(1, id);
+        q.integer(2, from);
+        q.integer(3, through);
+        if (limit > 0)
+            q.integer(4, limit);
+        while (q.next())
+            events << QVariantMap{{"t", q.integer(0)}, {"kind", QStringLiteral("route")}, {"text", q.string(1)}};
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
     }

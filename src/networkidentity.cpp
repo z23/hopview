@@ -1,4 +1,5 @@
 #include "history.h"
+#include "historycache.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
 #include <QFile>
@@ -17,6 +18,28 @@ QString encode(const QVariantMap &value) {
 
 QVariantMap decode(const QString &text) {
     return QJsonDocument::fromJson(text.toUtf8()).object().toVariantMap();
+}
+
+QString maskedPrefix(const QHostAddress &host, int bits) {
+    if (host.protocol() == QAbstractSocket::IPv4Protocol) {
+        const quint32 ip = host.toIPv4Address();
+        const quint32 mask = bits <= 0 ? 0u : bits >= 32 ? ~0u : (~0u << (32 - bits));
+        return QHostAddress(ip & mask).toString() + QLatin1Char('/') + QString::number(bits);
+    }
+    Q_IPV6ADDR ip6 = host.toIPv6Address();
+    const int fullBytes = std::clamp(bits / 8, 0, 16);
+    const int remBits = bits % 8;
+    if (fullBytes < 16) {
+        if (remBits > 0) {
+            ip6.c[fullBytes] &= static_cast<quint8>(0xFFu << (8 - remBits));
+            for (int i = fullBytes + 1; i < 16; ++i)
+                ip6.c[i] = 0;
+        } else {
+            for (int i = fullBytes; i < 16; ++i)
+                ip6.c[i] = 0;
+        }
+    }
+    return QHostAddress(ip6).toString() + QLatin1Char('/') + QString::number(bits);
 }
 
 bool validIdentity(const QVariantMap &info) {
@@ -121,8 +144,11 @@ bool History::importInventory(const QString &path) {
             "origin=1;"
             "INSERT OR REPLACE INTO network_inventory SELECT family,bits,prefix,data FROM incoming_prefixes "
             "WHERE origin=0;"
-            "INSERT OR IGNORE INTO inventory_lengths SELECT DISTINCT family,bits FROM incoming_prefixes;");
+            "DELETE FROM inventory_lengths;"
+            "INSERT OR IGNORE INTO inventory_lengths SELECT DISTINCT family,bits FROM network_inventory "
+            "UNION SELECT DISTINCT family,bits FROM network_origins;");
         tx.commit();
+        invalidateIdentityCache();
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());
@@ -131,54 +157,99 @@ bool History::importInventory(const QString &path) {
 }
 
 QVariantMap History::networkIdentity(qint64 id, const QString &address) {
-    Statement saved(db_, "SELECT data FROM captured_identity WHERE session=? AND address=?");
+    if (address.isEmpty() || !open())
+        return {};
+    auto &c = cache();
+    auto &verQ = c.stmt(c.dataVersionStmt, "PRAGMA data_version");
+    verQ.reset();
+    const qint64 version = verQ.next() ? verQ.integer(0) : -1;
+    verQ.reset();
+    if (version != c.identityDataVersion || !c.lengthsLoaded) {
+        c.lengthsLoaded = false;
+        c.inventoryLengths.clear();
+        c.originLengths.clear();
+        c.identityMap.clear();
+        // Every recorder commit changes the version, so this runs on most live refreshes.
+        // inventory_lengths lists each prefix length of either table. One index seek per length
+        // tells the tables apart; reading the prefixes would scan a whole routing snapshot.
+        auto &lengths = c.stmt(
+            c.identityLengths,
+            "SELECT family,bits,"
+            "EXISTS(SELECT 1 FROM network_inventory i WHERE i.family=l.family AND i.bits=l.bits),"
+            "EXISTS(SELECT 1 FROM network_origins o WHERE o.family=l.family AND o.bits=l.bits) "
+            "FROM inventory_lengths l ORDER BY family,bits DESC");
+        lengths.reset();
+        while (lengths.next()) {
+            const int family = int(lengths.integer(0)), bits = int(lengths.integer(1));
+            if (lengths.integer(2))
+                c.inventoryLengths[family].append(bits);
+            if (lengths.integer(3))
+                c.originLengths[family].append(bits);
+        }
+        lengths.reset();
+        c.identityDataVersion = version;
+        c.lengthsLoaded = true;
+    }
+    const auto cacheKey = qMakePair(id, address);
+    if (auto it = c.identityMap.constFind(cacheKey); it != c.identityMap.cend())
+        return *it;
+
+    auto storeCache = [&](QVariantMap value) {
+        if (c.identityMap.size() >= 4096)
+            c.identityMap.clear();
+        c.identityMap.insert(cacheKey, value);
+        return value;
+    };
+
+    auto &saved = c.stmt(c.capturedIdentity, "SELECT data FROM captured_identity WHERE session=? AND address=?");
+    saved.reset();
     saved.integer(1, id);
     saved.string(2, address);
-    if (saved.next())
-        return decode(saved.string(0));
+    const bool captured = saved.next();
+    const auto capturedData = captured ? saved.string(0) : QString();
+    saved.reset();
+    if (captured)
+        return storeCache(decode(capturedData));
     const QHostAddress host(address);
     if (host.isNull())
-        return {};
-    Statement lengths(db_, "SELECT bits FROM inventory_lengths WHERE family=? ORDER BY bits DESC");
-    lengths.integer(1, host.protocol());
-    Statement match(db_, "SELECT data FROM network_inventory WHERE family=? AND bits=? AND prefix=?");
-    Statement origin(db_, "SELECT data FROM network_origins WHERE family=? AND bits=? AND prefix=?");
+        return storeCache({});
+    const int family = int(host.protocol());
+    // The most specific prefix of one table that contains the address.
+    auto longest = [&](Statement &q, const QList<int> &lengths, int &matchedBits) {
+        QVariantMap found;
+        for (const int bits : lengths) {
+            q.reset();
+            q.integer(1, family);
+            q.integer(2, bits);
+            q.string(3, maskedPrefix(host, bits));
+            if (q.next()) {
+                found = decode(q.string(0));
+                matchedBits = bits;
+                break;
+            }
+        }
+        q.reset();
+        return found;
+    };
     QVariantMap label, routing;
     int labelBits = -1, originBits = -1;
-    while (lengths.next()) {
-        const int bits = lengths.integer(0);
-        const auto net =
-            QHostAddress::parseSubnet(host.toString().section('%', 0, 0) + "/" + QString::number(bits));
-        const auto prefix = net.first.toString() + "/" + QString::number(bits);
-        auto lookup = [&](Statement &q) {
-            q.reset();
-            q.integer(1, host.protocol());
-            q.integer(2, bits);
-            q.string(3, prefix);
-            return q.next() ? decode(q.string(0)) : QVariantMap{};
-        };
-        if (label.isEmpty()) {
-            label = lookup(match);
-            if (!label.isEmpty())
-                labelBits = bits;
-        }
-        if (routing.isEmpty()) {
-            routing = lookup(origin);
-            if (!routing.isEmpty())
-                originBits = bits;
-        }
-        if (!label.isEmpty() && !routing.isEmpty())
-            break;
-    }
+    if (const auto lengths = c.inventoryLengths.value(family); !lengths.isEmpty())
+        label = longest(c.stmt(c.inventoryMatch,
+                               "SELECT data FROM network_inventory WHERE family=? AND bits=? AND prefix=?"),
+                        lengths, labelBits);
+    if (const auto lengths = c.originLengths.value(family); !lengths.isEmpty())
+        routing = longest(c.stmt(c.originMatch,
+                                 "SELECT data FROM network_origins WHERE family=? AND bits=? AND prefix=?"),
+                          lengths, originBits);
     if (label.isEmpty())
-        return routing;
+        return storeCache(std::move(routing));
     if (!routing.isEmpty() && (label["asn"].toString().isEmpty() || originBits > labelBits)) {
         label["asn"] = routing["asn"];
         label["originPrefix"] = routing["prefix"];
         label["originSource"] = routing["source"];
         label["originUpdated"] = routing["updated"];
     }
-    return label;
+    return storeCache(std::move(label));
 }
 
 bool History::captureIdentity(qint64 id, const QString &address, const QVariantMap &info) {
@@ -195,6 +266,7 @@ bool History::captureIdentity(qint64 id, const QString &address, const QVariantM
         put.string(2, address);
         put.string(3, encode(info));
         put.next();
+        invalidateIdentityCache();
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());

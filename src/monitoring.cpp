@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS alert_rules(
 CREATE TABLE IF NOT EXISTS alert_events(
  id INTEGER PRIMARY KEY, session INTEGER NOT NULL REFERENCES sessions(id),start_ms INTEGER NOT NULL,
  end_ms INTEGER NOT NULL,reason INTEGER NOT NULL,mean_rtt REAL NOT NULL,loss_pct REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS alert_events_session_end ON alert_events(session,end_ms);
 )SQL");
 }
 

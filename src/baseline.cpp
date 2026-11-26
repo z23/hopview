@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <algorithm>
 #include <sqlite3.h>
+#include <vector>
 
 using namespace hopview_sql;
 namespace {
@@ -72,19 +73,25 @@ QVariantMap measure(sqlite3 *db, qint64 id, int hop, const Period &period, Round
         s.integer(4, period.through);
     };
     bind(samples);
+    constexpr qint64 inMemoryLimit = 250000;
     qint64 sent = 0, replies = 0, run = 0, longest = 0, previous = -1;
     QSet<QString> responders;
+    std::vector<double> rtts;
     double delta = 0, precedingRtt = -1;
     while (samples.next()) {
         const auto t = samples.integer(0);
 
         ++sent;
-        if (samples.number(1) >= 0) {
-            const auto rtt = samples.number(1);
+        const auto rtt = samples.number(1);
+        if (rtt >= 0) {
             if (precedingRtt >= 0)
                 delta += std::abs(rtt - precedingRtt);
             precedingRtt = rtt;
             ++replies;
+            if (replies <= inMemoryLimit)
+                rtts.push_back(rtt);
+            else if (!rtts.empty())
+                std::vector<double>().swap(rtts);
             run = 0;
             responders.insert(samples.string(2));
         } else {
@@ -96,21 +103,38 @@ QVariantMap measure(sqlite3 *db, qint64 id, int hop, const Period &period, Round
     }
     double median = -1, p95 = -1;
     if (replies) {
-        // The database can sort on disk. Keep only three order statistics in the client.
-        Statement sorted(db, "SELECT rtt FROM samples WHERE session=? AND hop=? AND t BETWEEN ? AND ? "
-                             "AND rtt>=0 ORDER BY rtt");
-        bind(sorted);
         const auto midLo = (replies - 1) / 2, midHi = replies / 2;
         const auto high = replies - replies / 20 - 1; // ceil(0.95 * count) - 1.
-        double lo = 0;
-        for (qint64 i = 0; i <= high && sorted.next(); ++i) {
-            const auto value = sorted.number(0);
-            if (i == midLo)
-                lo = value;
-            if (i == midHi)
-                median = (lo + value) * 0.5;
-            if (i == high)
-                p95 = value;
+        if (!rtts.empty()) {
+            // Single-pass O(N) selection avoids a second scan and full SQLite sort.
+            std::nth_element(rtts.begin(), rtts.begin() + high, rtts.end());
+            p95 = rtts[high];
+            double hiVal = p95;
+            if (midHi < high) {
+                std::nth_element(rtts.begin(), rtts.begin() + midHi, rtts.begin() + high);
+                hiVal = rtts[midHi];
+            }
+            if (midLo == midHi) {
+                median = hiVal;
+            } else {
+                const double loVal = *std::max_element(rtts.begin(), rtts.begin() + midHi);
+                median = (loVal + hiVal) * 0.5;
+            }
+        } else {
+            // For very large intervals, fall back to SQLite's bounded-memory disk sort.
+            Statement sorted(db, "SELECT rtt FROM samples WHERE session=? AND hop=? AND t BETWEEN ? AND ? "
+                                 "AND rtt>=0 ORDER BY rtt");
+            bind(sorted);
+            double lo = 0;
+            for (qint64 i = 0; i <= high && sorted.next(); ++i) {
+                const auto value = sorted.number(0);
+                if (i == midLo)
+                    lo = value;
+                if (i == midHi)
+                    median = (lo + value) * 0.5;
+                if (i == high)
+                    p95 = value;
+            }
         }
     }
     auto addresses = responders.values();

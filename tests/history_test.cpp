@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <sqlite3.h>
 #include <stdexcept>
 
@@ -788,6 +789,315 @@ void operationalHistory(const QTemporaryDir &dir) {
             "Releasing an overlapping pin preserves other protected hours");
 }
 
+void testStorageAndQueryOptimizations(const QTemporaryDir &dir) {
+    const auto file = dir.filePath("opt-checks.sqlite");
+    History h(file);
+    const auto id = h.createSession("2001:db8::9", 6, 1000);
+    require(id > 0, "Create IPv6 optimization check session");
+
+    // 1. Verify alert_events index exists.
+    {
+        sqlite3 *raw = nullptr;
+        require(sqlite3_open(file.toUtf8().constData(), &raw) == SQLITE_OK, "Open raw DB");
+        hopview_sql::Statement idx(raw, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='alert_events_session_end'");
+        const bool hasIdx = idx.next();
+        sqlite3_close(raw);
+        require(hasIdx, "alert_events_session_end index exists");
+    }
+
+    // 2. Verify local-unsent (-2) samples appended after valid samples preserve exact bin stats.
+    const ProbeFailure unsent{"local-unsent", {}, -1, -1, 0, EMSGSIZE};
+    require(h.append({{id, 10000, 0, "2001:db8::9", 5.0, true},
+                      {id, 10000, 1, "2001:db8::1", 1.0, false},
+                      {id, 11000, 0, "2001:db8::9", 7.0, true},
+                      {id, 11000, 1, "2001:db8::1", 3.0, false}}),
+            "Seed valid samples");
+    require(h.append({{id, 12000, 0, {}, -2.0, false, unsent},
+                      {id, 12000, 1, {}, -2.0, false, unsent}}),
+            "Append local-unsent samples");
+    const auto v = h.view(id, 10000, 19999, 10000, 19999, {0, 1}, 10);
+    const auto ep = v["endpoint"].toMap();
+    require(ep["sent"].toInt() == 2 && ep["received"].toInt() == 2 && std::abs(ep["avg"].toDouble() - 6.0) < 1e-8,
+            "local-unsent does not disturb endpoint rollups");
+
+    // 3. Verify IPv6 binary prefix masking (including %iface scope stripping) and cache invalidation on re-import.
+    QFile inv(dir.filePath("v6.tsv"));
+    require(inv.open(QIODevice::WriteOnly), "Create v6 inventory");
+    inv.write("2001:db8:abcd::/48\t64502\tSYD\tTransit\tCKT-1\tlocal\n");
+    inv.close();
+    require(h.importInventory(inv.fileName()), qPrintable(h.error()));
+    const auto m1 = h.networkIdentity(id, "2001:db8:abcd:1234::5");
+    require(m1["asn"] == "AS64502" && m1["pop"] == "SYD", "IPv6 /48 binary mask match");
+    require(h.networkIdentity(id, "2001:db8:abcd:1234::5") == m1, "Cached IPv6 identity hit");
+    require(h.networkIdentity(id, "2001:db8:abce::1").isEmpty(), "Non-matching IPv6 prefix");
+
+    QFile orig1(dir.filePath("orig1.pfx2as"));
+    require(orig1.open(QIODevice::WriteOnly), "Create v6 origin snapshot 1");
+    orig1.write("2001:db8:abcd:1234::\t64\t64599\n");
+    orig1.close();
+    require(h.importInventory(orig1.fileName()), qPrintable(h.error()));
+    const auto m2 = h.networkIdentity(id, "2001:db8:abcd:1234::5");
+    require(m2["asn"] == "AS64599" && m2["originPrefix"] == "2001:db8:abcd:1234::/64",
+            "Re-import invalidates cache and picks more specific /64 origin");
+
+    // 4. Verify routeTransitions() is not truncated by >500 non-route events.
+    const auto rId = h.createSession("routes-busy", 4, 1000);
+    QVector<Sample> routeSamples;
+    for (int i = 0; i < 10; ++i) {
+        const qint64 t = 100000 + i * 1000LL;
+        routeSamples << Sample{rId, t, 1, i < 4 ? "192.0.2.1" : "192.0.2.2", 2.0, false}
+                     << Sample{rId, t, 2, "198.51.100.1", 5.0, true};
+    }
+    require(h.append(routeSamples), "Append route transition");
+    for (int i = 0; i < 520; ++i)
+        require(h.addNote(rId, 110000 + i * 10LL, QString("note-%1").arg(i)), "Add filler notes");
+    const auto allTimeline = h.timelineEvents(rId, 100000, 200000);
+    require(allTimeline.size() == 501, "timelineEvents hits 501 cap");
+    const auto directRoutes = h.routeTransitions(rId, 100000, 200000);
+    require(directRoutes.size() == 1 && directRoutes.first().toMap()["kind"] == "route",
+            "routeTransitions finds transitions despite >500 other events");
+
+    // 5. Verify withWriteTransaction atomicity.
+    const bool failed = h.withWriteTransaction([&] {
+        require(h.addNote(rId, 999999, "should-rollback"), "Add note in tx");
+        throw std::runtime_error("abort tx");
+    });
+    require(!failed, "Aborted write transaction returns false");
+    require(h.view(rId, 999000, 1000000, 999000, 1000000, {}, 1)["notes"].toList().isEmpty(),
+            "Aborted write transaction rolled back");
+}
+
+// Run one statement on a separate connection, as another process would see the database.
+qint64 scalar(const QString &file, const char *sql) {
+    sqlite3 *raw = nullptr;
+    require(sqlite3_open(file.toUtf8().constData(), &raw) == SQLITE_OK, "Open raw DB");
+    qint64 value = -1;
+    {
+        hopview_sql::Statement q(raw, sql);
+        if (q.next())
+            value = q.integer(0);
+    }
+    sqlite3_close(raw);
+    return value;
+}
+
+void testStorageFailureHandling(const QTemporaryDir &dir) {
+    constexpr qint64 day = 86400000, hour = 3600000;
+
+    // 1. A failed write does not carry its error into the next valid write on that connection.
+    {
+        History h(dir.filePath("recover.sqlite"));
+        const auto id = h.createSession("example.test", 4, 1000);
+        require(h.append({{id, 1000, 1, "192.0.2.1", 1.0, false}}), "Seed a sample");
+        require(!h.append({{id + 10, 2000, 1, "192.0.2.1", 1.0, false}}), "Reject a sample for an unknown recording");
+        require(h.append({{id, 3000, 1, "192.0.2.1", 1.0, false}}), "A failed write does not fail the next valid write");
+    }
+
+    // 2. An operation that fails inside an outer transaction undoes its own writes.
+    {
+        const auto file = dir.filePath("nested.sqlite");
+        History h(file);
+        const auto id = h.createSession("example.test", 4, 1000);
+        bool inner = true;
+        require(h.withWriteTransaction([&] {
+                    inner = h.append({{id, 1000, 1, "192.0.2.1", 1.0, false}, {id, 2000, 300, "192.0.2.1", 1.0, false}});
+                }) && !inner,
+                "The outer transaction survives a failed append");
+        require(scalar(file, "SELECT count(*) FROM samples") == 0, "A failed nested append leaves no partial rows");
+        require(h.withWriteTransaction([&] { inner = h.append({{id, 1000, 1, "192.0.2.1", 1.0, false}}); }) && inner &&
+                    scalar(file, "SELECT count(*) FROM samples WHERE hop=1") == 1 &&
+                    scalar(file, "SELECT count(*) FROM bins WHERE hop=1") == 3,
+                "A successful nested append commits with its rollups");
+    }
+
+    // 3. An identity lookup may be the first use of a connection.
+    {
+        History h(dir.filePath("early.sqlite"));
+        require(h.networkIdentity(1, "192.0.2.1").isEmpty(), "Identity lookup opens the database");
+        const auto id = h.createSession("example.test", 4, 1000);
+        require(h.append({{id, 1000, 1, "192.0.2.1", 1.0, false}}), "Write after an early identity lookup");
+    }
+
+    // 4. Another connection can rebuild the route index to the same cursor with a different state.
+    {
+        const auto file = dir.filePath("two-indexers.sqlite");
+        History a(file);
+        const auto id = a.createSession("example.test", 4, 1000);
+        History b(file);
+        require(b.open(), "Open a second connection");
+        const qint64 first = hour - 600 * 1000;
+        QVector<Sample> batch;
+        // 600 rounds ending in the last second of an hour. The final 20 have no hop-1 reply yet.
+        for (int i = 0; i < 600; ++i) {
+            const qint64 t = first + i * 1000LL;
+            batch << Sample{id, t, 0, "198.51.100.1", 5.0, true};
+            if (i < 580)
+                batch << Sample{id, t, 1, "192.0.2.1", 1.0, false};
+            batch << Sample{id, t, 2, "198.51.100.1", 5.0, true};
+        }
+        require(a.append(batch), "Append an hour's last rounds");
+        bool more = true;
+        while (more)
+            require(b.advanceRouteIndex(id, more), "Second connection indexes to the end of the hour");
+        QVector<Sample> late, next;
+        for (int i = 580; i < 600; ++i)
+            late << Sample{id, first + i * 1000LL, 1, "192.0.2.9", 1.0, false};
+        require(a.append(late), "Late replies from a new router rewind the index");
+        for (int i = 0; i < 10; ++i) {
+            const qint64 t = hour + i * 1000LL;
+            next << Sample{id, t, 0, "198.51.100.1", 5.0, true} << Sample{id, t, 1, "192.0.2.9", 1.0, false}
+                 << Sample{id, t, 2, "198.51.100.1", 5.0, true};
+        }
+        require(a.append(next), "Append the next hour");
+        more = true;
+        while (more)
+            require(b.advanceRouteIndex(id, more), "Second connection indexes the next hour");
+        require(b.routeTransitions(id, 0, 2 * hour).size() == 1, "A route change is recorded once across connections");
+    }
+
+    // 5. Retention publishes each watermark together with the rows it retires.
+    {
+        const auto file = dir.filePath("atomic-retention.sqlite");
+        History h(file);
+        const auto id = h.createSession("example.test", 4, 1000);
+        QVector<Sample> batch;
+        // Three hours with a round every 30 seconds.
+        for (int i = 0; i < 360; ++i) {
+            const qint64 t = day + i * 30000LL;
+            batch << Sample{id, t, 0, "198.51.100.1", 5.0, true} << Sample{id, t, 1, "192.0.2.1", 1.0, false};
+        }
+        require(h.append(batch) && h.setRetention(1, 7), "Seed three hours and enable retention");
+        sqlite3 *raw = nullptr;
+        require(sqlite3_open(file.toUtf8().constData(), &raw) == SQLITE_OK, "Open raw DB");
+        require(sqlite3_exec(raw,
+                             "CREATE TRIGGER fail_mark BEFORE UPDATE OF raw_before ON retention "
+                             "BEGIN SELECT RAISE(ABORT,'injected failure'); END",
+                             nullptr, nullptr, nullptr) == SQLITE_OK,
+                "Install a failing watermark update");
+        {
+            History m(file);
+            require(!m.maintainStorage(4 * day), "Maintenance reports the failed step");
+        }
+        require(scalar(file, "SELECT count(*) FROM samples") == 720 &&
+                    scalar(file, "SELECT raw_before FROM retention") == 0,
+                "A failed retention step keeps its rows and its watermark");
+        History reader(file);
+        const auto kept = reader.view(id, day, day + 3 * hour - 1, day, day + 3 * hour - 1, {0}, 360);
+        require(kept["endpoint"].toMap()["sent"].toInt() == 360 &&
+                    kept["charts"].toList().first().toMap()["buckets"].toList().size() == 360,
+                "History stays readable after a failed retention step");
+        require(sqlite3_exec(raw,
+                             "DROP TRIGGER fail_mark;"
+                             // Fail only once the watermark has passed the first hour.
+                             "CREATE TRIGGER fail_later BEFORE UPDATE OF raw_before ON retention "
+                             "WHEN new.raw_before > 90000000 BEGIN SELECT RAISE(ABORT,'injected failure'); END",
+                             nullptr, nullptr, nullptr) == SQLITE_OK,
+                "Fail the second step");
+        {
+            History m(file);
+            require(!m.maintainStorage(4 * day), "Maintenance stops at the failing hour");
+        }
+        // The first hour is retired and marked; the hours after it are untouched.
+        require(scalar(file, "SELECT raw_before FROM retention") == day + hour &&
+                    scalar(file, "SELECT count(*) FROM samples WHERE t<90000000") == 0 &&
+                    scalar(file, "SELECT count(*) FROM samples") == 480,
+                "Each completed hour is retired with its watermark");
+        const auto partial = History(file).view(id, day, day + 3 * hour - 1, day, day + 3 * hour - 1, {0}, 360);
+        require(partial["endpoint"].toMap()["sent"].toInt() == 360, "Retired raw samples stay visible as summaries");
+        require(sqlite3_exec(raw, "DROP TRIGGER fail_later", nullptr, nullptr, nullptr) == SQLITE_OK, "Remove the failure");
+        sqlite3_close(raw);
+        {
+            History m(file);
+            require(m.maintainStorage(4 * day), "Maintenance completes");
+        }
+        require(scalar(file, "SELECT count(*) FROM samples") == 0 &&
+                    scalar(file, "SELECT raw_before FROM retention") == 3 * day &&
+                    scalar(file, "SELECT count(*) FROM bins WHERE span=10000 AND hop=0") == 360,
+                "Finished retention retires raw samples and keeps their summaries");
+    }
+
+    // 5b. Recordings years apart are retired without walking the empty time between them.
+    {
+        const auto file = dir.filePath("sparse-retention.sqlite");
+        History h(file);
+        const auto early = h.createSession("early.test", 4, 1000), late = h.createSession("late.test", 4, 1000);
+        QVector<Sample> batch;
+        for (int i = 0; i < 20; ++i)
+            batch << Sample{early, day + i * 1000LL, 0, "198.51.100.1", 5.0, true}
+                  << Sample{early, day + i * 1000LL, 1, "192.0.2.1", 1.0, false}
+                  << Sample{late, 900 * day + i * 1000LL, 0, "198.51.100.2", 6.0, true}
+                  << Sample{late, 1500 * day + i * 1000LL, 0, "198.51.100.2", 6.0, true};
+        require(h.append(batch) && h.setRetention(1, 2), "Seed recordings years apart");
+        QElapsedTimer elapsed;
+        elapsed.start();
+        require(h.maintainStorage(1501 * day), "Retire sparse history");
+        require(elapsed.elapsed() < 3000, "Retention does not visit hours without data");
+        require(scalar(file, "SELECT count(*) FROM samples") == 20 &&
+                    scalar(file, "SELECT min(t) FROM samples") == 1500 * day &&
+                    scalar(file, "SELECT count(*) FROM bins WHERE t<129600000000") == 0 &&
+                    scalar(file, "SELECT raw_before FROM retention") == 1500 * day &&
+                    scalar(file, "SELECT summary_before FROM retention") == 1499 * day,
+                "Sparse history is retired up to both cutoffs");
+    }
+
+    // 6. Prefix lengths are tracked per table, and another connection's import is picked up.
+    {
+        const auto file = dir.filePath("identity-lengths.sqlite");
+        History a(file), b(file);
+        const auto id = a.createSession("192.0.2.9", 4, 1000);
+        require(b.open(), "Open the reading connection");
+        require(b.networkIdentity(id, "198.51.100.77").isEmpty(), "No inventory yet");
+        QFile inventory(dir.filePath("lengths.tsv"));
+        require(inventory.open(QIODevice::WriteOnly), "Create inventory");
+        inventory.write("198.51.100.0/24\t64501\tMEL\tTransit\tCKT-9\tlocal\n");
+        inventory.close();
+        require(a.importInventory(inventory.fileName()), qPrintable(a.error()));
+        const auto labelled = b.networkIdentity(id, "198.51.100.77");
+        require(labelled["pop"] == "MEL" && labelled["asn"] == "AS64501", "Another connection's inventory import is seen");
+        QFile origins(dir.filePath("lengths.pfx2as"));
+        require(origins.open(QIODevice::WriteOnly), "Create origin snapshot");
+        origins.write("198.51.100.64\t26\t64777\n203.0.113.0\t25\t64888\n");
+        origins.close();
+        require(a.importInventory(origins.fileName()), qPrintable(a.error()));
+        const auto merged = b.networkIdentity(id, "198.51.100.77");
+        require(merged["pop"] == "MEL" && merged["asn"] == "AS64777" && merged["originPrefix"] == "198.51.100.64/26",
+                "A more specific origin of another length refines the inventory match");
+        const auto routed = b.networkIdentity(id, "203.0.113.5");
+        require(routed["asn"] == "AS64888" && routed["prefix"] == "203.0.113.0/25", "An origin-only length still matches");
+        require(b.networkIdentity(id, "203.0.113.200").isEmpty(), "An address outside every prefix has no identity");
+    }
+
+    // 7. A view of all time places samples without 128-bit arithmetic.
+    {
+        History h(dir.filePath("wide-view.sqlite"));
+        const auto id = h.createSession("example.test", 4, 1000);
+        QVector<Sample> batch;
+        for (int i = 0; i < 50; ++i)
+            batch << Sample{id, day + i * 1000LL, 0, "198.51.100.1", 5.0 + i, true}
+                  << Sample{id, day + i * 1000LL, 1, "192.0.2.1", 1.0, false};
+        require(h.append(batch), "Seed samples for a wide view");
+        const auto allTime = std::numeric_limits<qint64>::max();
+        const auto wide = h.view(id, 0, allTime, 0, allTime, {0}, 1000);
+        const auto buckets = wide["charts"].toList().first().toMap()["buckets"].toList();
+        require(buckets.size() == 1 && buckets.first().toMap()["x"].toInt() == 0 &&
+                    buckets.first().toMap()["sent"].toInt() == 50 &&
+                    std::abs(buckets.first().toMap()["max"].toDouble() - 54.0) < 1e-9,
+                "An all-time view gathers the recording into its first pixel");
+        // Samples just past the middle of representable time belong to the middle pixel.
+        const auto distant = h.createSession("distant.test", 4, 1000);
+        const qint64 middle = (allTime - 3600001) / 2 + 1000;
+        QVector<Sample> later;
+        for (int i = 0; i < 5; ++i)
+            later << Sample{distant, middle + i * 1000LL, 0, "198.51.100.1", 9.0, true}
+                  << Sample{distant, middle + i * 1000LL, 1, "192.0.2.1", 1.0, false};
+        require(h.append(later), "Seed distant samples");
+        const auto halves = h.view(distant, 0, allTime, 0, allTime, {0}, 1000)["charts"].toList().first().toMap()["buckets"].toList();
+        require(halves.size() == 1 && halves.first().toMap()["x"].toInt() == 500 &&
+                    halves.first().toMap()["sent"].toInt() == 5,
+                "An all-time view places distant samples in the matching pixel");
+    }
+}
+
 void benchmark(const QString &file) {
     constexpr qint64 base = 1720012345000;
     constexpr int hops = 15, seconds = 86400;
@@ -844,6 +1154,8 @@ int main(int argc, char **argv) {
         else {
             test(dir.filePath("history.sqlite"));
             operationalHistory(dir);
+            testStorageAndQueryOptimizations(dir);
+            testStorageFailureHandling(dir);
             preservedRouteIndex(dir);
             testIncident(dir);
             testManagedCollectors(dir.filePath("managed.db"));

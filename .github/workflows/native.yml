@@ -73,6 +73,8 @@ jobs:
           set "PATH=%HOPVIEW_DEPS%\bin;%PATH%"
           set "QT_QPA_PLATFORM=offscreen"
           set "QT_QUICK_BACKEND=software"
+          rem Without a console Qt Test reports only to the debugger, which hides a failing test's name.
+          set "QT_FORCE_STDERR_LOGGING=1"
           for %%s in (history integration portableprobe) do (
             mkdir build-native\%%s
             pushd build-native\%%s
