@@ -84,6 +84,18 @@ QQuickItem *findItem(QQuickItem *parent, const QString &name) {
     return nullptr;
 }
 
+// A control inside a popup is visible before its layout is finished. Until then the list
+// that holds it may have no height, and a click aimed at its centre lands somewhere else.
+bool reachable(QQuickItem *control) {
+    if (!control || !control->isVisible() || control->width() <= 0 || control->height() <= 0)
+        return false;
+    const auto scene = control->mapToScene(control->boundingRect().center());
+    for (auto *parent = control->parentItem(); parent; parent = parent->parentItem())
+        if (parent->clip() && !parent->contains(parent->mapFromScene(scene)))
+            return false;
+    return true;
+}
+
 struct Window {
     explicit Window(Backend &b) {
         engine.rootContext()->setContextProperty("backend", &b);
@@ -494,6 +506,7 @@ void Integration::alertControls() {
     auto click = [&](const char *name) {
         auto *item = findItem(ui.win->contentItem(), name);
         if (!item) return false;
+        waitFor([&] { return reachable(item); }, 2000);
         QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
                           item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint());
         return true;
@@ -645,7 +658,7 @@ void Integration::tabControlsAndScale() {
         QQuickItem *entry = nullptr;
         QVERIFY(waitFor([&] {
             entry = findItem(ui.win->contentItem(), "reopenTrace" + QString::number(first));
-            return entry && entry->isVisible() && entry->width() > 0;
+            return reachable(entry);
         }));
         QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
                           entry->mapToScene(entry->boundingRect().center()).toPoint());
@@ -1122,6 +1135,7 @@ void Integration::savedComparison() {
         QVERIFY(ui.win && waitFor([&] { return ui.win->isExposed(); }));
         auto item = [&](const QString &key) { return findItem(ui.win->contentItem(), key); };
         auto click = [&](QQuickItem *control) {
+            waitFor([&] { return reachable(control); }, 2000);
             QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
                               control->mapToScene(control->boundingRect().center()).toPoint());
         };
@@ -1187,6 +1201,7 @@ void Integration::compareTargets() {
     QVERIFY(waitFor([&] { return ui.win->isExposed() && fresh(b); }));
     auto item = [&](const QString &name) { return findItem(ui.win->contentItem(), name); };
     auto click = [&](QQuickItem *control) {
+        waitFor([&] { return reachable(control); }, 2000);
         QTest::mouseClick(ui.win, Qt::LeftButton, Qt::NoModifier,
                           control->mapToScene(control->boundingRect().center()).toPoint());
     };
