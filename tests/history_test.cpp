@@ -559,6 +559,12 @@ void testIncident(const QTemporaryDir &dir) {
                 content.contains("2023-11-14T22:13:20.250Z") && content.contains("8443"),
             "CSV preserves raw probes, quoted annotation and settings");
     require(!source.exportIncident(id, t, t + 500, db, false), "Cannot replace own history");
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    const QFileInfo liveFile(db);
+    const auto journal = liveFile.dir().filePath(liveFile.fileName().toUpper() + "-JOURNAL");
+    require(!source.exportIncident(id, t, t + 500, journal, false),
+            "Protect database sidecars on case-insensitive filesystems");
+#endif
     require(source.exportIncident(id, t + 250, t + 500, recording, false), "Export portable incident");
     IncidentRange range;
     QString error;
@@ -596,7 +602,7 @@ void testManagedCollectors(const QString &path) {
     const auto otherKey = desktop.createKey().split('.');
     require(otherKey[1] != key[1], "Distinct enrollment secrets");
     sqlite3 *raw = nullptr;
-    require(sqlite3_open(QFile::encodeName(path).constData(), &raw) == SQLITE_OK, "Open key storage");
+    require(sqlite3_open(path.toUtf8().constData(), &raw) == SQLITE_OK, "Open key storage");
     {
         hopview_sql::Statement row(raw, "SELECT key_digest FROM managed_collectors");
         while (row.next()) require(row.string(0).size() == 64 && row.string(0) != key[1],
@@ -668,10 +674,11 @@ void preservedRouteIndex(const QTemporaryDir &dir) {
 }
 
 void operationalHistory(const QTemporaryDir &dir) {
-    const auto file = dir.filePath("operations.sqlite");
+    const auto file = dir.filePath(QStringLiteral("réseau測定.sqlite"));
     History h(file);
     constexpr qint64 day = 86400000, start = 2 * day;
     const auto id = h.createSession("target", 4, 1000);
+    require(id > 0 && QFileInfo::exists(file), "Open the requested Unicode database path");
     const auto other = h.createSession("other", 4, 1000);
     QVector<Sample> batch;
     for (int i = 0; i < 12; ++i) {

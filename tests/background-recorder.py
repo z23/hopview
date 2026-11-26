@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise close, reopen and restart with a real loopback trace and a private history."""
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -34,10 +35,12 @@ def serve_notifications(log):
 
 def verify(binary, work, private_bus=None):
     db = work / "capture.db"
-    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="generic",
-               QT_QUICK_BACKEND="software", XDG_RUNTIME_DIR=str(work),
-               XDG_CONFIG_HOME=str(work / "config"), XDG_CACHE_HOME=str(work / "cache"),
-               DBUS_SESSION_BUS_ADDRESS=private_bus or f"unix:path={work}/unused")
+    env = dict(os.environ, QT_QUICK_BACKEND="software")
+    if sys.platform.startswith("linux"):
+        env.update(QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="generic",
+                   XDG_RUNTIME_DIR=str(work), XDG_CONFIG_HOME=str(work / "config"),
+                   XDG_CACHE_HOME=str(work / "cache"),
+                   DBUS_SESSION_BUS_ADDRESS=private_bus or f"unix:path={work}/unused")
     command = [binary, "--database", str(db)]
     target = ["--family", "4", "--interval", "250", "127.0.0.1"]
 
@@ -45,7 +48,7 @@ def verify(binary, work, private_bus=None):
         subprocess.run(command + list(args), env=env, check=True, timeout=8)
 
     def count(sql):
-        with sqlite3.connect(db) as con:
+        with closing(sqlite3.connect(db)) as con:
             return con.execute(sql).fetchone()[0]
 
     def wait_for_rounds(minimum):
@@ -53,12 +56,29 @@ def verify(binary, work, private_bus=None):
             if owner.poll() is not None:
                 raise AssertionError(f"collector exited with status {owner.returncode}")
             try:
-                if count("SELECT count(*) FROM samples WHERE hop=0") >= minimum:
+                if count("SELECT count(*) FROM samples WHERE hop=0 AND rtt>=0") >= minimum:
                     return
             except sqlite3.OperationalError:
                 pass  # The initial schema may still be opening.
             time.sleep(.1)
         raise AssertionError("collector failed to append loopback rounds")
+
+    def wait_for_exit():
+        # --quit waits for the database lock to be released. The owner might have
+        # exited before we start waiting, so query its actual exit status directly.
+        deadline = time.monotonic() + 5
+        while owner.poll() is None and time.monotonic() < deadline:
+            time.sleep(.05)
+        if owner.returncode is None:
+            if sys.platform == "darwin":
+                # Keep a thread trace in CI when Cocoa or a worker stalls at teardown.
+                trace = work / "shutdown-sample.txt"
+                subprocess.run(["/usr/bin/sample", str(owner.pid), "1", "10", "-file", str(trace)],
+                               timeout=10, check=False)
+                if trace.is_file():
+                    print(trace.read_text(errors="replace")[:24000], file=sys.stderr, flush=True)
+            raise AssertionError(f"recorder {owner.pid} was still running 5 seconds after shutdown")
+        assert owner.returncode == 0, f"recorder exited with status {owner.returncode}"
 
     owner = subprocess.Popen(command + target, env=env)
     try:
@@ -69,7 +89,7 @@ def verify(binary, work, private_bus=None):
         if private_bus:
             # The GUI controls are exercised in Integration::alertControls. Set a threshold
             # below loopback RTT, then above it, so the real recorder produces both transitions.
-            with sqlite3.connect(db) as con:
+            with closing(sqlite3.connect(db)) as con, con:
                 con.execute("INSERT INTO alert_rules(session,latency,loss,seconds) VALUES(1,0.0000001,0,1)")
             def wait_notification(expected):
                 log = work / "notices.jsonl"
@@ -82,7 +102,7 @@ def verify(binary, work, private_bus=None):
                     time.sleep(.1)
                 raise AssertionError(f"notification service did not receive {expected}")
             wait_notification("High latency")
-            with sqlite3.connect(db) as con:
+            with closing(sqlite3.connect(db)) as con, con:
                 con.execute("UPDATE alert_rules SET latency=60000 WHERE session=1")
             wait_notification("Recovered")
             assert count("SELECT count(*) FROM alert_events") == 2
@@ -91,14 +111,17 @@ def verify(binary, work, private_bus=None):
         wait_for_rounds(visible + 4)
         assert count("SELECT count(*) FROM sessions") == 1
         run("--quit")
-        assert owner.wait(timeout=5) == 0
+        wait_for_exit()
         stopped = count("SELECT count(*) FROM samples WHERE hop=0")
         owner = subprocess.Popen(command + ["--background"], env=env)
         wait_for_rounds(stopped + 3)
         run()
         assert count("SELECT count(*) FROM sessions") == 1
-        owner.terminate()
-        assert owner.wait(timeout=5) == 0
+        if sys.platform == "win32":
+            run("--quit")  # Popen.terminate() forcibly ends a Windows process.
+        else:
+            owner.terminate()
+        wait_for_exit()
         assert count("PRAGMA integrity_check") == "ok"
     finally:
         if owner.poll() is None:
@@ -115,6 +138,8 @@ if __name__ == "__main__":
     parser.add_argument("--notifications", action="store_true",
                         help="Also exercise a private D-Bus daemon and notification service (dbus-python, PyGObject).")
     args = parser.parse_args()
+    if args.notifications and not sys.platform.startswith("linux"):
+        parser.error("--notifications runs the Linux desktop notification fixture")
     binary = str(Path(args.binary).resolve())
     with tempfile.TemporaryDirectory(prefix="hopview-recorder-") as tmp:
         work = Path(tmp)

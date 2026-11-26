@@ -88,25 +88,42 @@ void line(Vertices &points, QPointF a, QPointF b, qreal thickness)
 void dot(Vertices &points, QPointF center, qreal radius)
 {
     constexpr int sides = 12;
+    static const std::array<QPointF, sides + 1> unit = [] {
+        std::array<QPointF, sides + 1> table{};
+        for (int i = 0; i <= sides; ++i) {
+            const qreal angle = i * (2 * 3.141592653589793 / sides);
+            table[i] = {std::cos(angle), std::sin(angle)};
+        }
+        return table;
+    }();
     for (int i = 0; i < sides; ++i) {
-        const qreal a = i * (2 * 3.141592653589793 / sides);
-        const qreal b = (i + 1) * (2 * 3.141592653589793 / sides);
         points.insert(points.end(), {center,
-            center + QPointF(radius * std::cos(a), radius * std::sin(a)),
-            center + QPointF(radius * std::cos(b), radius * std::sin(b))});
+            center + unit[i] * radius,
+            center + unit[i + 1] * radius});
     }
 }
 
 qreal metric(const QVariantMap &sample, const QString &key)
 {
+    const auto it = sample.constFind(key);
+    if (it == sample.cend())
+        return -1;
     bool valid = false;
-    const qreal value = sample.value(key).toDouble(&valid);
+    const qreal value = it->toDouble(&valid);
     return valid && std::isfinite(value) ? value : -1;
 }
 
 void profileLayers(Layers &layers, const QVariantList &samples, qreal width,
                    qreal height, qreal rowHeight, qreal ceiling)
 {
+    static const QString kAvg = QStringLiteral("avg");
+    static const QString kMin = QStringLiteral("min");
+    static const QString kMax = QStringLiteral("max");
+    static const QString kCur = QStringLiteral("cur");
+    const size_t n = static_cast<size_t>(samples.size());
+    layers[Range].reserve(n * 18);
+    layers[Line].reserve(n * 42);
+    layers[Current].reserve(n * 12);
     auto x = [=](qreal latency) {
         return 5 + std::clamp(latency / ceiling, 0.0, 1.0) * std::max(1.0, width - 10);
     };
@@ -122,11 +139,11 @@ void profileLayers(Layers &layers, const QVariantList &samples, qreal width,
     bool haveLast = false;
     for (qsizetype i = 0; i < samples.size(); ++i) {
         const auto sample = samples[i].toMap();
-        const qreal avg = metric(sample, "avg");
+        const qreal avg = metric(sample, kAvg);
         if (avg < 0)
             continue;
         const qreal y = (i + 0.5) * rowHeight;
-        const qreal lo = metric(sample, "min"), hi = metric(sample, "max"), cur = metric(sample, "cur");
+        const qreal lo = metric(sample, kMin), hi = metric(sample, kMax), cur = metric(sample, kCur);
         if (lo >= 0 && hi >= 0) {
             rectangle(layers[Range], x(lo), y - 1, x(hi) + 1, y + 1);
             rectangle(layers[Range], x(lo), y - 4, x(lo) + 1.4, y + 4);
@@ -149,6 +166,15 @@ void profileLayers(Layers &layers, const QVariantList &samples, qreal width,
 void timelineLayers(Layers &layers, const QVariantList &samples, qreal width,
                     qreal height, qreal ceiling, int pixels, qreal maxGap, qreal baselineP95)
 {
+    static const QString kX = QStringLiteral("x");
+    static const QString kLoss = QStringLiteral("loss");
+    static const QString kAvg = QStringLiteral("avg");
+    static const QString kMin = QStringLiteral("min");
+    static const QString kMax = QStringLiteral("max");
+    const size_t n = static_cast<size_t>(samples.size());
+    layers[Band].reserve(n * 6);
+    layers[Range].reserve(n * 6);
+    layers[Line].reserve(n * 6);
     auto y = [=](qreal rtt) { return height - 2 - std::clamp(rtt / ceiling, 0.0, 1.0) * (height - 5); };
     if (baselineP95 >= 0) {
         if (ceiling > baselineP95)
@@ -168,18 +194,18 @@ void timelineLayers(Layers &layers, const QVariantList &samples, qreal width,
     bool haveLast = false;
     for (const auto &item : samples) {
         const auto sample = item.toMap();
-        const qreal x = std::min(width - 1, (metric(sample, "x") + 0.5) * step);
-        const qreal loss = metric(sample, "loss");
+        const qreal x = std::min(width - 1, (metric(sample, kX) + 0.5) * step);
+        const qreal loss = metric(sample, kLoss);
         if (loss > 0) {
             const qreal amount = std::clamp(loss / 100, 0.0, 1.0);
             rectangle(layers[Loss], x - 0.5, height * (1 - amount), x + std::max(1.1, step - 0.5), height);
         }
-        const qreal avg = metric(sample, "avg");
+        const qreal avg = metric(sample, kAvg);
         if (avg < 0) {
             haveLast = false;
             continue;
         }
-        const qreal lo = metric(sample, "min"), hi = metric(sample, "max");
+        const qreal lo = metric(sample, kMin), hi = metric(sample, kMax);
         if (lo >= 0 && hi >= 0)
             rectangle(layers[Range], x - 0.55, y(hi), x + 0.55, y(lo) + 1);
         const QPointF current(x, y(avg));
@@ -194,6 +220,70 @@ void timelineLayers(Layers &layers, const QVariantList &samples, qreal width,
         haveLast = true;
     }
 }
+
+void diagnosticLayers(Layers &layers, const QVariantList &samples, qreal width,
+                      qreal height, qreal ceiling, bool service, double startMs, double spanMs)
+{
+    static const QString kT = QStringLiteral("t");
+    static const QString kPeriod = QStringLiteral("periodMs");
+    static const QString kMarker = QStringLiteral("marker");
+    static const std::array<QString, 4> serviceKeys{
+        QStringLiteral("dns"), QStringLiteral("connect"), QStringLiteral("tls"), QStringLiteral("firstByte")};
+    static const std::array<QString, 2> interfaceKeys{
+        QStringLiteral("rx"), QStringLiteral("tx")};
+
+    const double span = std::max(1.0, spanMs);
+    for (int i = 0; i <= 4; ++i) {
+        const qreal gx = (width - 1) * i / 4;
+        rectangle(layers[Grid], gx, 0, gx + 1, height);
+    }
+    rectangle(layers[Grid], 0, height / 2, width, height / 2 + 1);
+
+    const int seriesCount = service ? 4 : 2;
+    const size_t n = static_cast<size_t>(samples.size());
+    for (int s = 0; s < seriesCount; ++s)
+        layers[Band + s].reserve(n * 12);
+
+    std::array<bool, 4> haveLast{};
+    std::array<double, 4> lastT{};
+    std::array<QPointF, 4> lastPt{};
+    const double minGap = 3.0 * span / std::max(1.0, width);
+
+    for (const auto &item : samples) {
+        const auto p = item.toMap();
+        const double t = metric(p, kT);
+        if (t < 0)
+            continue;
+        const double periodMs = std::max(0.0, metric(p, kPeriod));
+        const qreal x = (t - startMs) / span * (width - 1);
+        for (int s = 0; s < seriesCount; ++s) {
+            const qreal v = metric(p, service ? serviceKeys[s] : interfaceKeys[s]);
+            if (v < 0) {
+                haveLast[s] = false;
+                continue;
+            }
+            const qreal y = (1.0 - std::clamp(v / ceiling, 0.0, 1.0)) * (height - 3) + 1;
+            const QPointF pt(x, y);
+            auto &dst = layers[Band + s];
+            const bool connected = haveLast[s] && (t - lastT[s]) <= std::max(periodMs * 3.0, minGap);
+            if (connected)
+                line(dst, lastPt[s], pt, 1.25);
+            if (!connected || (pt.x() - lastPt[s].x()) >= 2.5)
+                rectangle(dst, x - 1, y - 1, x + 1, y + 1);
+            lastPt[s] = pt;
+            lastT[s] = t;
+            haveLast[s] = true;
+        }
+        if (const auto mit = p.constFind(kMarker); mit != p.cend() && mit->isValid()) {
+            const auto marker = mit->toMap();
+            const double mt = metric(marker, kT);
+            if (mt >= 0) {
+                const qreal mx = (mt - startMs) / span * (width - 1);
+                rectangle(layers[Current], mx - 1, 0, mx + 2, 7);
+            }
+        }
+    }
+}
 } // namespace
 
 GraphView::GraphView(QQuickItem *parent) : QQuickItem(parent)
@@ -202,8 +292,12 @@ GraphView::GraphView(QQuickItem *parent) : QQuickItem(parent)
     setClip(true);
 }
 
-void GraphView::setSamples(const QVariantList &v) { m_samples = v; emit samplesChanged(); update(); }
+void GraphView::setSamples(const QVariantList &v) { if (m_samples != v) { m_samples = v; emit samplesChanged(); update(); } }
 void GraphView::setProfile(bool v) { if (m_profile != v) { m_profile = v; emit profileChanged(); update(); } }
+void GraphView::setDiagnostic(bool v) { if (m_diagnostic != v) { m_diagnostic = v; emit diagnosticChanged(); update(); } }
+void GraphView::setService(bool v) { if (m_service != v) { m_service = v; emit serviceChanged(); update(); } }
+void GraphView::setStartMs(double v) { if (m_startMs != v) { m_startMs = v; emit startMsChanged(); update(); } }
+void GraphView::setSpanMs(double v) { if (m_spanMs != v && v > 0) { m_spanMs = v; emit spanMsChanged(); update(); } }
 void GraphView::setPixels(int v) { if (m_pixels != v) { m_pixels = v; emit pixelsChanged(); update(); } }
 void GraphView::setBaselineP95(qreal value) {
     if (m_baselineP95 != value) { m_baselineP95 = value; emit baselineP95Changed(); update(); }
@@ -228,15 +322,21 @@ QSGNode *GraphView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
     }
 
     Layers layers;
-    if (m_profile)
-        profileLayers(layers, m_samples, width(), height(), m_rowHeight, m_ceiling);
-    else
-        timelineLayers(layers, m_samples, width(), height(), m_ceiling, m_pixels, m_maxGap, m_baselineP95);
-    QColor fill = m_accent;
-    fill.setAlpha(23);
-    const std::array<QColor, Count> colors = {
-        QColor(215,170,85,22), QColor(203,96,104,32), QColor("#293643"), fill, QColor("#dd686e"), QColor("#8296a5"), m_accent, QColor("#f4c778")
-    };
+    std::array<QColor, Count> colors;
+    if (m_diagnostic) {
+        diagnosticLayers(layers, m_samples, width(), height(), m_ceiling, m_service, m_startMs, m_spanMs);
+        colors = {Qt::transparent, Qt::transparent, QColor("#2b3946"), QColor("#82aaff"),
+                  QColor("#8ad6b4"), QColor("#e6b779"), QColor("#cb9be8"), QColor("#ee9294")};
+    } else {
+        if (m_profile)
+            profileLayers(layers, m_samples, width(), height(), m_rowHeight, m_ceiling);
+        else
+            timelineLayers(layers, m_samples, width(), height(), m_ceiling, m_pixels, m_maxGap, m_baselineP95);
+        QColor fill = m_accent;
+        fill.setAlpha(23);
+        colors = {QColor(215,170,85,22), QColor(203,96,104,32), QColor("#293643"), fill,
+                  QColor("#dd686e"), QColor("#8296a5"), m_accent, QColor("#f4c778")};
+    }
     if (window()->rendererInterface()->graphicsApi() == QSGRendererInterface::Software) {
         // The software renderer needs a raster image for custom geometry.
         const qreal ratio = window()->effectiveDevicePixelRatio();
@@ -246,14 +346,15 @@ QSGNode *GraphView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
         QPainter painter(&image);
         painter.setPen(Qt::NoPen);
         for (size_t i = 0; i < layers.size(); ++i) {
-            painter.setBrush(colors[i]);
             const auto &layer = layers[i];
+            if (layer.empty())
+                continue;
+            painter.setBrush(colors[i]);
             for (size_t j = 0; j < layer.size(); j += 3)
                 painter.drawPolygon(&layer[j], 3);
         }
         painter.end();
-        delete old;
-        auto *texture = new QSGSimpleTextureNode;
+        auto *texture = old ? static_cast<QSGSimpleTextureNode *>(old) : new QSGSimpleTextureNode;
         texture->setTexture(window()->createTextureFromImage(image));
         texture->setOwnsTexture(true);
         texture->setRect(boundingRect());

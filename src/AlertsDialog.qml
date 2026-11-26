@@ -49,7 +49,7 @@ C.Dialog {
             Layout.fillWidth: true
             Layout.fillHeight: true
             boundsBehavior: Flickable.StopAtBounds
-            model: backend.alertEvents
+            model: dialog.visible ? backend.alertEvents : []
             C.ScrollBar.vertical: C.ScrollBar { }
             header: ColumnLayout {
                 width: events.width - 12
@@ -149,8 +149,8 @@ C.Dialog {
                     }
                 }
                 onClicked: {
-                    dialog.close()
                     backend.showAlert(modelData.session, modelData.startMs, modelData.endMs)
+                    dialog.close()
                 }
             }
         }

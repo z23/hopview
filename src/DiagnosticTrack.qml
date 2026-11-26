@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls as C
+import Hopview.Graphics 1.0
 
 Item {
     id: track
@@ -97,41 +98,16 @@ Item {
             color: Qt.rgba(host.accent.r,host.accent.g,host.accent.b,0.07)
             visible: width < parent.width-1
         }
-        Canvas {
+        GraphView {
             id: graph
-            objectName: service ? "serviceDiagnosticGraph" : "interfaceDiagnosticGraph"
+            objectName: track.service ? "serviceDiagnosticGraph" : "interfaceDiagnosticGraph"
             anchors.fill: parent
-            onPaint: {
-                const ctx=getContext("2d")
-                ctx.clearRect(0,0,width,height)
-                ctx.strokeStyle="#2b3946";ctx.lineWidth=1
-                ctx.beginPath()
-                for(let i=0;i<=4;i++){let x=(width-1)*i/4;ctx.moveTo(x,0);ctx.lineTo(x,height)}
-                ctx.moveTo(0,height/2);ctx.lineTo(width,height/2);ctx.stroke()
-                for(let n=0;n<track.values.length;n++){
-                    const key=track.values[n];ctx.strokeStyle=track.colors[n];ctx.fillStyle=track.colors[n]
-                    ctx.beginPath()
-                    let last=null
-                    for(const p of track.points) {
-                        if(p[key]<0){last=null;continue}
-                        const x=(p.t-track.start)/track.span*(width-1), y=(1-p[key]/track.ceiling)*(height-3)+1
-                        if(last && p.t-last.t <= Math.max(p.periodMs*3,3*track.span/width)) ctx.lineTo(x,y)
-                        else ctx.moveTo(x,y)
-                        ctx.fillRect(x-1,y-1,2,2);last=p
-                    }
-                    ctx.stroke()
-                }
-                ctx.fillStyle="#ee9294"
-                for(const p of track.points) {
-                    if(p.marker) ctx.fillRect((p.marker.t-track.start)/track.span*(width-1)-1,0,3,7)
-                }
-            }
-            Connections {
-                target: track
-                function onSeriesChanged() { graph.requestPaint() }
-                function onStartChanged() { graph.requestPaint() }
-                function onSpanChanged() { graph.requestPaint() }
-            }
+            diagnostic: true
+            service: track.service
+            samples: track.points
+            ceiling: track.ceiling
+            startMs: track.start
+            spanMs: track.span
         }
         Rectangle {
             visible: host.cursorFraction >= 0 && !host.selectingRange

@@ -36,19 +36,20 @@ C.ComboBox {
         border.color: control.visualFocus ? "#adc9cd" : "#354350"
     }
     delegate: C.ItemDelegate {
+        id: comboItem
         required property var modelData
         required property int index
         width: control.width
         height: 30
         highlighted: control.highlightedIndex === index
         contentItem: Text {
-            text: modelData
+            text: comboItem.modelData
             color: "#e0e9ec"
             verticalAlignment: Text.AlignVCenter
             font.pixelSize: 12
             font.family: "Inter"
         }
-        background: Rectangle { color: parent.highlighted || parent.hovered ? "#344552" : "#1d2934" }
+        background: Rectangle { color: comboItem.highlighted || comboItem.hovered ? "#344552" : "#1d2934" }
     }
     popup: C.Popup {
         y: control.height + 3

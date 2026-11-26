@@ -1,4 +1,5 @@
 #include "history.h"
+#include "databasepath.h"
 #include "historycache.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
@@ -328,7 +329,7 @@ bool History::maintainStorage(qint64 now) {
             Statement earliest(db_, "SELECT coalesce(min(first_ms),-1) FROM sessions WHERE id NOT IN "
                                     "(SELECT session FROM imported_sessions)");
             earliest.next();
-            const qint64 floor = earliest.integer(0) < 0 ? raw : earliest.integer(0) / hour * hour;
+            const qint64 firstHour = earliest.integer(0) < 0 ? raw : earliest.integer(0) / hour * hour;
             earliest.reset();
             // Retire one hour per transaction and publish its watermark in that same transaction.
             // Readers and late samples then never meet pruned rows above the watermark, a failure
@@ -336,8 +337,8 @@ bool History::maintainStorage(qint64 now) {
             // the write lock away from live recorders.
             qint64 atRaw = oldRaw, atSummary = oldSummary;
             while (atRaw < raw || atSummary < summary) {
-                const qint64 nextRaw = std::min(raw, std::max(atRaw, floor) + hour);
-                const qint64 nextSummary = std::min(summary, std::max(atSummary, floor) + hour);
+                const qint64 nextRaw = std::min(raw, std::max(atRaw, firstHour) + hour);
+                const qint64 nextSummary = std::min(summary, std::max(atSummary, firstHour) + hour);
                 Transaction tx(db_, true);
                 Statement marks(db_, "SELECT raw_before,summary_before FROM retention WHERE id=1");
                 marks.next();
@@ -437,16 +438,13 @@ bool History::onlineBackup(const QString &destination) {
     sqlite3 *copy = nullptr;
     try {
         const QFileInfo target(destination);
-        const auto output = target.dir().canonicalPath() + "/" + target.fileName();
-        const auto source = QFileInfo(path_).canonicalFilePath();
-        for (const auto &suffix : {"", "-wal", "-shm", "-journal"})
-            if (output == source + suffix)
-                throw std::runtime_error("Choose a backup file outside the live database and its journals.");
+        if (isDatabaseFile(path_, destination))
+            throw std::runtime_error("Choose a backup file outside the live database and its journals.");
         if (destination.isEmpty() || target.exists() || !temp.open())
             throw std::runtime_error("Choose a new backup filename in a writable directory.");
         temp.close();
         const auto rc =
-            sqlite3_open_v2(QFile::encodeName(temp.fileName()), &copy, SQLITE_OPEN_READWRITE, nullptr);
+            sqlite3_open_v2(temp.fileName().toUtf8(), &copy, SQLITE_OPEN_READWRITE, nullptr);
         if (rc != SQLITE_OK)
             throw std::runtime_error("Cannot open backup destination.");
         // A stable WAL read transaction prevents a busy writer from repeatedly

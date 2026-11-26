@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-for suite in history integration; do
+if command -v qmake6 >/dev/null; then qmake=qmake6; else qmake=qmake; fi
+for suite in history integration darwinicmp portableprobe; do
     mkdir -p "$root/build-tests/$suite"
     cd "$root/build-tests/$suite"
-    qmake6 "$root/tests/$suite.pro" CONFIG+=release
+    "$qmake" "$root/tests/$suite.pro" CONFIG+=release
     make -j"${JOBS:-4}"
-    if [[ "$suite" == history ]]; then
-        ./history_test
-    else
+    if [[ "$suite" == integration ]]; then
         QT_QPA_PLATFORMTHEME=generic QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software ./integration_test
+    else
+        "./${suite}_test"
     fi
 done
