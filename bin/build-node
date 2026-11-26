@@ -4,6 +4,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 out=${1:-"$root/build-node"}
 mkdir -p "$out"
 cd "$out"
-if command -v qmake6 >/dev/null; then qmake=qmake6; else qmake=qmake-qt6; fi
+if command -v qmake6 >/dev/null; then qmake=qmake6
+elif command -v qmake-qt6 >/dev/null; then qmake=qmake-qt6
+else qmake=qmake
+fi
 "$qmake" "$root/node.pro" CONFIG+=release
 make -j"${JOBS:-4}"

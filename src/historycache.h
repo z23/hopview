@@ -16,6 +16,7 @@ struct History::Cache {
     struct RouteEntry {
         qint64 cursor = -1;
         qint64 lastCheckpoint = -1;
+        QString state; // As stored in route_index, to notice another connection's rebuild.
         RouteEvents detector;
     };
 
@@ -24,6 +25,8 @@ struct History::Cache {
     hopview_sql::Statement &stmt(std::optional<hopview_sql::Statement> &slot, const char *sql) {
         if (!slot)
             slot.emplace(db_, sql);
+        else
+            slot->recover();
         return *slot;
     }
 
@@ -47,6 +50,10 @@ struct History::Cache {
     std::optional<hopview_sql::Statement> isImported;
     std::optional<hopview_sql::Statement> sessionPins;
     std::optional<hopview_sql::Statement> dataVersionStmt;
+    std::optional<hopview_sql::Statement> identityLengths;
+    std::optional<hopview_sql::Statement> capturedIdentity;
+    std::optional<hopview_sql::Statement> inventoryMatch;
+    std::optional<hopview_sql::Statement> originMatch;
 
     // Network identity lookup cache, invalidated automatically via PRAGMA data_version or local writes.
     qint64 identityDataVersion = -1;

@@ -47,7 +47,7 @@ class History {
     bool addNote(qint64 session, qint64 timeMs, QString text);
     bool append(const QVector<Sample> &samples, QList<qint64> *newEvents = nullptr);
     QVariantMap diagnosticsSettings();
-    bool saveDiagnostics(qint64 id, const QString &url, const QString &interface, int seconds);
+    bool saveDiagnostics(qint64 id, const QString &url, const QString &device, int seconds);
     bool appendDiagnostic(qint64 id, const QVariantMap &record);
     bool eachDiagnostic(qint64 id, qint64 from, qint64 through,
                         const std::function<void(const QVariantMap &)> &visit);

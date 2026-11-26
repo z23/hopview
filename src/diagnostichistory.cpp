@@ -40,7 +40,7 @@ bool validUrl(const QString &text) {
            !url.hasFragment();
 }
 bool validInterface(const QString &text) {
-    return !text.isEmpty() && text.size() <= 15 && !text.contains('/') && !text.contains(QChar::Null) &&
+    return !text.isEmpty() && text.size() <= 63 && !text.contains('/') && !text.contains(QChar::Null) &&
            text != "." && text != "..";
 }
 bool validRecord(const QVariantMap &record) {
@@ -70,7 +70,7 @@ bool validRecord(const QVariantMap &record) {
                 return false;
         return !record.contains("ttfb") || measurement(record, "ttfb", 3600000);
     }
-    if (record["kind"] != "interface" || !isString(record, "name", 15) ||
+    if (record["kind"] != "interface" || !isString(record, "name", 63) ||
         !validInterface(record["name"].toString()) || !integer(record, "carrier", -1, 1) ||
         !isString(record, "ap", 64))
         return false;
@@ -112,16 +112,16 @@ QVariantMap History::diagnosticsSettings() {
     return result;
 }
 
-bool History::saveDiagnostics(qint64 id, const QString &url, const QString &interface, int seconds) {
+bool History::saveDiagnostics(qint64 id, const QString &url, const QString &device, int seconds) {
     if (!open())
         return false;
     error_.clear();
     try {
         if (seconds < 5 || seconds > 3600 || (!url.isEmpty() && !validUrl(url)) ||
-            (!interface.isEmpty() && !validInterface(interface)))
+            (!device.isEmpty() && !validInterface(device)))
             throw std::runtime_error("Choose a valid HTTP(S) URL without user information or fragment, an "
                                      "interface, and a 5–3600 second service interval.");
-        if (url.isEmpty() && interface.isEmpty()) {
+        if (url.isEmpty() && device.isEmpty()) {
             Statement q(db_, "DELETE FROM diagnostic_settings WHERE session=?");
             q.integer(1, id);
             q.next();
@@ -129,7 +129,7 @@ bool History::saveDiagnostics(qint64 id, const QString &url, const QString &inte
             Statement q(db_, "INSERT OR REPLACE INTO diagnostic_settings VALUES(?,?,?,?)");
             q.integer(1, id);
             q.string(2, url);
-            q.string(3, interface);
+            q.string(3, device);
             q.integer(4, seconds);
             q.next();
         }

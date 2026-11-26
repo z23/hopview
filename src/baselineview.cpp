@@ -24,9 +24,9 @@ void Backend::selectBaseline(QString name) {
     emit baselineChanged();
     const auto from = mark["from"].toLongLong(), through = mark["through"].toLongLong();
     const auto cachedP95 = mark["p95"].toDouble();
+    // Shutdown drains the reader and then the writer, so a baseline marked just before
+    // closing is still stored.
     auto persist = [this, id, name, mark, from, through](double p95) {
-        if (m_closing.load())
-            return;
         QMetaObject::invokeMethod(m_writerContext, [this, id, name, mark, from, through, p95] {
             if (!m_writer)
                 return;
@@ -48,11 +48,13 @@ void Backend::selectBaseline(QString name) {
             });
         });
     };
-    if (cachedP95 >= 0) {
-        persist(cachedP95);
-        return;
-    }
-    QMetaObject::invokeMethod(m_readContext, [this, id, from, through, persist = std::move(persist)] {
+    // Every choice passes through the reader queue, including one whose percentile is already
+    // known, so baselines are stored in the order they were chosen.
+    QMetaObject::invokeMethod(m_readContext, [this, id, from, through, cachedP95, persist = std::move(persist)] {
+        if (cachedP95 >= 0) {
+            persist(cachedP95);
+            return;
+        }
         if (!m_reader)
             return;
         const auto p95 = m_reader->destinationP95(id, from, through);

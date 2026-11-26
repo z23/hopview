@@ -383,8 +383,23 @@ struct Reader {
     // boundaries without per-pixel SQLite queries or unused string decoding.
     void sweepChart(QVector<ChartStats> &points, qint64 session, int hop, qint64 start, qint64 end, int count) {
         const qint64 duration = end - start + 1;
+        // offset * count only exceeds 64 bits for a view spanning millions of years.
+        const bool wide = duration > std::numeric_limits<qint64>::max() / count;
+        const qint64 whole = duration / count, part = duration % count;
         auto pixelOf = [&](qint64 t) -> int {
-            return static_cast<int>((static_cast<__int128>(t - start) * count) / duration);
+            const qint64 offset = t - start;
+            if (!wide)
+                return static_cast<int>(offset * count / duration);
+            // The last pixel whose first instant, ceil(p * duration / count), is not after t.
+            int low = 0, high = count - 1;
+            while (low < high) {
+                const int p = low + (high - low + 1) / 2;
+                if (p * whole + (p * part + count - 1) / count <= offset)
+                    low = p;
+                else
+                    high = p - 1;
+            }
+            return low;
         };
         prepareSession(session);
         if (duration <= qint64(count) * spans[0]) {
@@ -635,7 +650,7 @@ History::~History() {
         sqlite3_close(db_);
 }
 History::Cache &History::cache() {
-    if (!cache_)
+    if (!cache_ || cache_->db_ != db_)
         cache_ = std::make_unique<Cache>(db_);
     return *cache_;
 }
@@ -671,7 +686,7 @@ bool History::withWriteTransaction(const std::function<void()> &work) {
 
 bool History::openReadOnly() {
     if (db_) return sqlite3_db_readonly(db_, "main") == 1;
-    if (sqlite3_open_v2(QFile::encodeName(path_).constData(), &db_, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
+    if (sqlite3_open_v2(path_.toUtf8().constData(), &db_, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
         sqlite3_busy_timeout(db_, 3000);
         return true;
     }
@@ -691,7 +706,7 @@ bool History::open() {
         return false;
     }
     try {
-        const auto p = QFile::encodeName(path_);
+        const auto p = path_.toUtf8();
         const int rc =
             sqlite3_open_v2(p.constData(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
         if (rc != SQLITE_OK)
@@ -1091,6 +1106,8 @@ bool History::append(const QVector<Sample> &samples, QList<qint64> *newEvents) {
 }
 
 QVariantMap History::retainedDestination(qint64 id, qint64 from, qint64 through) {
+    if (!open())
+        return {};
     Reader reader(cache());
     Stats stats;
     reader.range(stats, id, 0, from, through);

@@ -7,7 +7,7 @@ trap 'rm -rf -- "$stage"' EXIT
 # Build from the same, checksummed archive that ships in the source package.
 source "$root/pkgbuild/PKGBUILD"
 archive="$pkgname-$pkgver.tar.gz"
-inputs=(src tests bin rpm deploy node.pro hopview.pro pkgbuild/PKGBUILD pkgbuild/hopview.desktop pkgbuild/hopview.svg)
+inputs=(src tests bin rpm deploy node.pro hopview.pro platform.pri pkgbuild/PKGBUILD pkgbuild/hopview.desktop pkgbuild/hopview.svg)
 for doc in README.md LICENSE docs; do
     if [[ -e "$root/$doc" ]]; then inputs+=("$doc"); fi
 done

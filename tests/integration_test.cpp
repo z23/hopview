@@ -7,6 +7,7 @@
 #include <QTcpServer>
 #include <QUdpSocket>
 #include <QNetworkDatagram>
+#include <QNetworkInterface>
 #include <QStandardPaths>
 #include <QUuid>
 #include <QJsonDocument>
@@ -100,6 +101,14 @@ struct Window {
     QStringList warnings;
 };
 
+QString loopbackInterface() {
+    for (const auto &adapter : QNetworkInterface::allInterfaces())
+        if (adapter.flags().testFlag(QNetworkInterface::IsLoopBack) &&
+            adapter.flags().testFlag(QNetworkInterface::IsUp))
+            return adapter.name();
+    return {};
+}
+
 bool fresh(Backend &b) {
     const auto snap = b.snapshot();
     return snap.value("sessionId").toLongLong() == b.sessionId() &&
@@ -139,15 +148,15 @@ class Integration : public QObject {
 void Integration::pairedTraces() {
     QTemporaryDir dir;
     Backend b(dir.filePath("pair.sqlite"));
-    b.startTracePair("localhost", 4, 6, 500, "udp", 33434, {}, false, 16,16,0,0);
+    b.startTracePair("localhost", 4, 6, 500, "icmp", 0, {}, false, 16,16,0,0);
     QVERIFY(waitFor([&] { return b.sessions().size() == 2 && b.comparisonIds().size() == 1; }));
     const auto peers = b.comparisonIds();
     const auto primary = b.sessionId();
-    b.startTracePair("localhost", 4, 6, 500, "udp", 33434, {}, false, 16,16,0,0);
+    b.startTracePair("localhost", 4, 6, 500, "icmp", 0, {}, false, 16,16,0,0);
     QCOMPARE(b.sessions().size(), 2);
     QCOMPARE(b.comparisonIds(), peers);
     QCOMPARE(b.sessionId(), primary);
-    b.startTracePair("localhost", 4, 4, 500, "udp", 33434, {}, false, 16,48,0,0);
+    b.startTracePair("localhost", 4, 4, 500, "icmp", 0, {}, false, 16,48,0,0);
     QVERIFY(waitFor([&] { return b.sessions().size() == 3 && b.sessionId() == primary && b.comparisonIds() != peers; }));
 }
 
@@ -379,7 +388,9 @@ void Integration::diagnosticLoopback() {
     History storage(path);
     const auto id = storage.createSession("127.0.0.1", 4, 250);
     Backend b(path);
-    b.setDiagnostics(id, http, "lo", 5);
+    const auto device = loopbackInterface();
+    QVERIFY(!device.isEmpty());
+    b.setDiagnostics(id, http, device, 5);
     QVERIFY(waitFor([&] { return !b.diagnosticsSettings().isEmpty(); }));
     b.toggleRunning();
     auto observations = [&] {
@@ -389,13 +400,13 @@ void Integration::diagnosticLoopback() {
         return rows;
     };
     auto completed = [&] {
-        bool service = false, interface = false;
+        bool service = false, counters = false;
         for (const auto &v : observations()) {
             const auto r = v.toMap();
             service |= r["kind"] == "service" && r["status"].toInt() == 200;
-            interface |= r["kind"] == "interface" && r["rx"].toDouble() > 0;
+            counters |= r["kind"] == "interface" && r["name"] == device && r["rx"].toDouble() >= 0;
         }
-        return service && interface;
+        return service && counters;
     };
     QVERIFY(waitFor(completed, 12000));
     b.toggleRunning();
@@ -420,16 +431,31 @@ void Integration::probeSettings() {
     auto *port = findItem(ui.win->contentItem(), "probePort");
     auto *iface = findItem(ui.win->contentItem(), "probeInterface");
     QVERIFY(method && port && iface);
-    QVERIFY(method->setProperty("currentIndex", 3));
-    QVERIFY(QMetaObject::invokeMethod(method, "activated", Q_ARG(int, 3)));
+#ifdef Q_OS_LINUX
+    const int selectedMethod = 3;
+    const QString expectedProtocol = "tcp";
+    const int expectedPort = 8443;
+#else
+    const int selectedMethod = 1;
+    const QString expectedProtocol = "icmp";
+    const int expectedPort = 0;
+    QCOMPARE(method->property("count").toInt(), 2);
+    QVERIFY(!port->isVisible());
+#endif
+    QVERIFY(method->setProperty("currentIndex", selectedMethod));
+    QVERIFY(QMetaObject::invokeMethod(method, "activated", Q_ARG(int, selectedMethod)));
+#ifdef Q_OS_LINUX
     QCOMPARE(port->property("value").toInt(), 443);
-    QVERIFY(port->setProperty("value", 8443));
-    QString expectedInterface;
-    const int loopback = backend.interfaceNames().indexOf("lo");
+    QVERIFY(port->setProperty("value", expectedPort));
+#endif
+    QString expectedInterface = loopbackInterface();
+    const int loopback = backend.interfaceNames().indexOf(expectedInterface);
     if (loopback >= 0) {
         QVERIFY(iface->setProperty("currentIndex", loopback + 1));
-        expectedInterface = "lo";
         QCOMPARE(iface->property("currentText").toString(), expectedInterface);
+    } else {
+        expectedInterface.clear();
+        QCOMPARE(iface->property("currentIndex").toInt(), 0);
     }
     QTest::keyClick(ui.win, Qt::Key_Escape);
     auto *target = findItem(ui.win->contentItem(), "destinationInput");
@@ -437,8 +463,8 @@ void Integration::probeSettings() {
     QVERIFY(QMetaObject::invokeMethod(target, "accepted"));
     QVERIFY(waitFor([&] { return !backend.sessions().isEmpty(); }));
     const auto saved = History(db).sessions().first().toMap();
-    QCOMPARE(saved["protocol"].toString(), QString("tcp"));
-    QCOMPARE(saved["port"].toInt(), 8443);
+    QCOMPARE(saved["protocol"].toString(), expectedProtocol);
+    QCOMPARE(saved["port"].toInt(), expectedPort);
     QCOMPARE(saved["interfaceName"].toString(), expectedInterface);
     QVERIFY2(ui.warnings.isEmpty(), qPrintable(ui.warnings.join('\n')));
 }
@@ -791,6 +817,11 @@ void Integration::managedDesktopLoopback() {
     config.write(QJsonDocument(fields).toJson());
     config.close();
     QProcess node;
+#ifdef Q_OS_WIN
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert("HOPVIEW_PARENT_PIPE", "1");
+    node.setProcessEnvironment(environment);
+#endif
     node.start(binary, {"collect", configPath});
     QVERIFY(node.waitForStarted());
     QVERIFY2(waitFor([&] { return admin.nodes().size() == 1; }, 10000), qPrintable(node.readAllStandardError()));
@@ -799,8 +830,7 @@ void Integration::managedDesktopLoopback() {
     QVERIFY(enrolled["targets"].toList().isEmpty());
     const auto site = enrolled["site"].toString();
     const auto version = enrolled["revision"].toLongLong();
-    QVariantMap target{{"target", "127.0.0.1"}, {"family", 4}, {"protocol", "tcp"},
-                       {"port", port}, {"intervalMs", 250}};
+    QVariantMap target{{"target", "127.0.0.1"}, {"family", 4}, {"protocol", "icmp"}, {"intervalMs", 250}};
     QVERIFY2(admin.setTargets(site, version, {target}), qPrintable(admin.error()));
     QVERIFY2(waitFor([&] {
         const auto row = admin.nodes().value(0).toMap();
@@ -812,7 +842,11 @@ void Integration::managedDesktopLoopback() {
         return admin.nodes().value(0).toMap()["appliedRevision"].toLongLong() == version + 2;
     }, 15000));
     QVERIFY(!backend.sessions().isEmpty());
+#ifdef Q_OS_WIN
+    node.closeWriteChannel();
+#else
     node.terminate();
+#endif
     QVERIFY(node.waitForFinished(5000) && node.exitCode() == 0);
     listener->stop();
     QVERIFY(waitFor([&] { return !listener->running() && !listener->busy(); }));
@@ -1052,6 +1086,10 @@ void Integration::saveFocus() {
     };
     findSave(picker->contentItem());
     QVERIFY(confirm && confirm->isEnabled());
+    // Qt's Quick file picker commits the filename when its text field loses focus.
+    // On macOS clicking a button does not normally transfer keyboard focus.
+    confirm->forceActiveFocus(Qt::TabFocusReason);
+    QVERIFY(!name->hasActiveFocus());
     QTest::mouseClick(picker, Qt::LeftButton, Qt::NoModifier,
                       confirm->mapToScene(confirm->boundingRect().center()).toPoint());
     QVERIFY(waitFor([&] { return !result.isEmpty(); }));
@@ -1278,6 +1316,9 @@ void Integration::latencyColors() {
 }
 
 void Integration::firstVisibleReply() {
+#ifndef Q_OS_LINUX
+    QSKIP("This fixture holds a UDP TTL sweep open. Local UDP tracing requires the Linux error queue.");
+#else
     if (!qEnvironmentVariableIsSet("HOPVIEW_LIVE_TEST"))
         QSKIP("Set HOPVIEW_LIVE_TEST=1 for the live first-reply benchmark.");
     QTemporaryDir dir;
@@ -1314,8 +1355,9 @@ void Integration::firstVisibleReply() {
     QCOMPARE(b.snapshot()["endpoint"].toMap()["loss"].toDouble(),0.);
     const auto actual = b.snapshot()["measurement"].toMap();
     QCOMPARE(actual["effectiveProtocol"].toString(), "udp");
-    QCOMPARE(actual["effectiveInterface"].toString(), "lo");
+    QCOMPARE(actual["effectiveInterface"].toString(), loopbackInterface());
     QCOMPARE(actual["sourceAddress"].toString(), "127.0.0.1");
+#endif
 }
 
 void Integration::replayWhileProbing() {
@@ -1363,7 +1405,7 @@ void Integration::replayWhileProbing() {
           presentedMs[presentedMs.size() / 2], presentedMs[presentedMs.size() * 95 / 100],
           renderMs[renderMs.size() / 2], renderMs[renderMs.size() * 95 / 100]);
     sqlite3 *db = nullptr;
-    QCOMPARE(sqlite3_open_v2(QFile::encodeName(file), &db, SQLITE_OPEN_READONLY, nullptr), SQLITE_OK);
+    QCOMPARE(sqlite3_open_v2(file.toUtf8(), &db, SQLITE_OPEN_READONLY, nullptr), SQLITE_OK);
     for (const auto id : {v4, v6}) {
         sqlite3_stmt *q = nullptr;
         const char *sql = "SELECT count(*),sum(rtt>=0),max(gap),avg(gap) FROM "
@@ -1415,7 +1457,7 @@ void Integration::backendFixes() {
     // Simulate a pre-index recording by clearing route index tables before opening Backend.
     {
         sqlite3 *db = nullptr;
-        QCOMPARE(sqlite3_open_v2(QFile::encodeName(path).constData(), &db, SQLITE_OPEN_READWRITE, nullptr),
+        QCOMPARE(sqlite3_open_v2(path.toUtf8().constData(), &db, SQLITE_OPEN_READWRITE, nullptr),
                  SQLITE_OK);
         QCOMPARE(sqlite3_exec(db,
                               "DELETE FROM route_index; DELETE FROM route_transitions; "
@@ -1495,7 +1537,12 @@ int main(int argc, char **argv) {
         return 1;
     qputenv("XDG_CONFIG_HOME", QFile::encodeName(config.path()));
     qputenv("XDG_DATA_HOME", QFile::encodeName(config.filePath("data")));
+    QCoreApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QGuiApplication app(argc, argv);
+#ifndef Q_OS_LINUX
+    QStandardPaths::setTestModeEnabled(true);
+    app.setApplicationName("HopviewIntegrationTests");
+#endif
     QQuickStyle::setStyle("Basic");
     qmlRegisterType<LocalReceiver>("Hopview.Graphics", 1, 0, "LocalReceiver");
     qmlRegisterType<GraphView>("Hopview.Graphics", 1, 0, "GraphView");

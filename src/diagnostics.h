@@ -41,7 +41,7 @@ class Diagnostics : public QObject {
 
   private:
     struct Watch {
-        QString interface, url, bindInterface;
+        QString device, url, bindInterface;
         int family = 0, seconds = 30;
         qint64 nextCheck = 0, nextInterface = 0;
         InterfaceReading previous;

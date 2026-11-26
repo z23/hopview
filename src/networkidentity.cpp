@@ -157,7 +157,7 @@ bool History::importInventory(const QString &path) {
 }
 
 QVariantMap History::networkIdentity(qint64 id, const QString &address) {
-    if (address.isEmpty())
+    if (address.isEmpty() || !open())
         return {};
     auto &c = cache();
     auto &verQ = c.stmt(c.dataVersionStmt, "PRAGMA data_version");
@@ -165,20 +165,30 @@ QVariantMap History::networkIdentity(qint64 id, const QString &address) {
     const qint64 version = verQ.next() ? verQ.integer(0) : -1;
     verQ.reset();
     if (version != c.identityDataVersion || !c.lengthsLoaded) {
-        c.identityDataVersion = version;
-        c.lengthsLoaded = true;
+        c.lengthsLoaded = false;
         c.inventoryLengths.clear();
         c.originLengths.clear();
         c.identityMap.clear();
-        auto loadLengths = [&](const char *sql, QHash<int, QList<int>> &dest) {
-            Statement q(db_, sql);
-            while (q.next())
-                dest[int(q.integer(0))].append(int(q.integer(1)));
-        };
-        loadLengths("SELECT DISTINCT family,bits FROM network_inventory ORDER BY family,bits DESC",
-                    c.inventoryLengths);
-        loadLengths("SELECT DISTINCT family,bits FROM network_origins ORDER BY family,bits DESC",
-                    c.originLengths);
+        // Every recorder commit changes the version, so this runs on most live refreshes.
+        // inventory_lengths lists each prefix length of either table. One index seek per length
+        // tells the tables apart; reading the prefixes would scan a whole routing snapshot.
+        auto &lengths = c.stmt(
+            c.identityLengths,
+            "SELECT family,bits,"
+            "EXISTS(SELECT 1 FROM network_inventory i WHERE i.family=l.family AND i.bits=l.bits),"
+            "EXISTS(SELECT 1 FROM network_origins o WHERE o.family=l.family AND o.bits=l.bits) "
+            "FROM inventory_lengths l ORDER BY family,bits DESC");
+        lengths.reset();
+        while (lengths.next()) {
+            const int family = int(lengths.integer(0)), bits = int(lengths.integer(1));
+            if (lengths.integer(2))
+                c.inventoryLengths[family].append(bits);
+            if (lengths.integer(3))
+                c.originLengths[family].append(bits);
+        }
+        lengths.reset();
+        c.identityDataVersion = version;
+        c.lengthsLoaded = true;
     }
     const auto cacheKey = qMakePair(id, address);
     if (auto it = c.identityMap.constFind(cacheKey); it != c.identityMap.cend())
@@ -191,47 +201,46 @@ QVariantMap History::networkIdentity(qint64 id, const QString &address) {
         return value;
     };
 
-    Statement saved(db_, "SELECT data FROM captured_identity WHERE session=? AND address=?");
+    auto &saved = c.stmt(c.capturedIdentity, "SELECT data FROM captured_identity WHERE session=? AND address=?");
+    saved.reset();
     saved.integer(1, id);
     saved.string(2, address);
-    if (saved.next())
-        return storeCache(decode(saved.string(0)));
+    const bool captured = saved.next();
+    const auto capturedData = captured ? saved.string(0) : QString();
+    saved.reset();
+    if (captured)
+        return storeCache(decode(capturedData));
     const QHostAddress host(address);
     if (host.isNull())
         return storeCache({});
     const int family = int(host.protocol());
+    // The most specific prefix of one table that contains the address.
+    auto longest = [&](Statement &q, const QList<int> &lengths, int &matchedBits) {
+        QVariantMap found;
+        for (const int bits : lengths) {
+            q.reset();
+            q.integer(1, family);
+            q.integer(2, bits);
+            q.string(3, maskedPrefix(host, bits));
+            if (q.next()) {
+                found = decode(q.string(0));
+                matchedBits = bits;
+                break;
+            }
+        }
+        q.reset();
+        return found;
+    };
     QVariantMap label, routing;
     int labelBits = -1, originBits = -1;
-    const auto &invLens = c.inventoryLengths.value(family);
-    if (!invLens.isEmpty()) {
-        Statement match(db_, "SELECT data FROM network_inventory WHERE family=? AND bits=? AND prefix=?");
-        for (const int bits : invLens) {
-            match.reset();
-            match.integer(1, family);
-            match.integer(2, bits);
-            match.string(3, maskedPrefix(host, bits));
-            if (match.next()) {
-                label = decode(match.string(0));
-                labelBits = bits;
-                break;
-            }
-        }
-    }
-    const auto &orgLens = c.originLengths.value(family);
-    if (!orgLens.isEmpty()) {
-        Statement origin(db_, "SELECT data FROM network_origins WHERE family=? AND bits=? AND prefix=?");
-        for (const int bits : orgLens) {
-            origin.reset();
-            origin.integer(1, family);
-            origin.integer(2, bits);
-            origin.string(3, maskedPrefix(host, bits));
-            if (origin.next()) {
-                routing = decode(origin.string(0));
-                originBits = bits;
-                break;
-            }
-        }
-    }
+    if (const auto lengths = c.inventoryLengths.value(family); !lengths.isEmpty())
+        label = longest(c.stmt(c.inventoryMatch,
+                               "SELECT data FROM network_inventory WHERE family=? AND bits=? AND prefix=?"),
+                        lengths, labelBits);
+    if (const auto lengths = c.originLengths.value(family); !lengths.isEmpty())
+        routing = longest(c.stmt(c.originMatch,
+                                 "SELECT data FROM network_origins WHERE family=? AND bits=? AND prefix=?"),
+                          lengths, originBits);
     if (label.isEmpty())
         return storeCache(std::move(routing));
     if (!routing.isEmpty() && (label["asn"].toString().isEmpty() || originBits > labelBits)) {
