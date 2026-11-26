@@ -1,4 +1,5 @@
 #include "history.h"
+#include "databasepath.h"
 #include "historycache.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
@@ -298,50 +299,86 @@ bool History::maintainStorage(qint64 now) {
             raw = std::max(oldRaw, cutoff(0));
             summary = std::max(oldSummary, cutoff(1));
         }
+        Statement behind(db_, "SELECT id FROM sessions WHERE EXISTS(SELECT 1 FROM samples WHERE "
+                              "session=sessions.id AND hop=0 AND t<? AND t>coalesce((SELECT cursor "
+                              "FROM route_index WHERE session=sessions.id),-1)) LIMIT 1");
+        // The next recording whose raw history before this time has not reached the route index.
+        auto unindexed = [&](qint64 before) {
+            behind.reset();
+            behind.integer(1, before);
+            const qint64 id = behind.next() ? behind.integer(0) : 0;
+            behind.reset();
+            return id;
+        };
         if (raw > oldRaw) {
             // Upgraded databases may still have unindexed raw history. Save its
             // transitions in bounded transactions before retiring raw observations.
-            Statement behind(db_, "SELECT id FROM sessions WHERE EXISTS(SELECT 1 FROM samples WHERE "
-                                  "session=sessions.id AND hop=0 AND t<? AND t>coalesce((SELECT cursor "
-                                  "FROM route_index WHERE session=sessions.id),-1)) LIMIT 1");
-            while (true) {
-                behind.reset();
-                behind.integer(1, raw);
-                if (!behind.next())
-                    break;
-                const auto id = behind.integer(0);
-                behind.reset();
+            while (const auto id = unindexed(raw)) {
                 Transaction tx(db_, true);
                 updateRouteIndex(id, -1);
                 tx.commit();
             }
-            // Ensure each session's latest route_index state is checkpointed before pruning.
-            Transaction ckptTx(db_, true);
-            execute(db_, "INSERT OR REPLACE INTO route_checkpoints(session,hour,t,state) "
-                         "SELECT session,cursor/3600000,cursor,state FROM route_index WHERE cursor>=0");
-            ckptTx.commit();
         }
-        const qint64 pruneRaw = raw > oldRaw ? raw : 0;
-        const qint64 pruneSummary = summary > oldSummary ? summary : 0;
-        if (pruneRaw || pruneSummary) {
+        if (raw > oldRaw || summary > oldSummary) {
             QList<qint64> targets;
             Statement sids(db_, "SELECT id FROM sessions WHERE id NOT IN (SELECT session FROM imported_sessions)");
             while (sids.next())
                 targets.append(sids.integer(0));
-            // Commit per session so live writers and telemetry receivers never hit busy timeouts.
-            for (const qint64 sid : targets) {
+            // The hour after the earliest row that is still to be retired, or the cutoff when no
+            // recording has one before it. Stretches of time without data then cost nothing.
+            Statement rawFrom(db_, "SELECT coalesce(min(t),-1) FROM samples WHERE session=? AND hop=0 AND t>=?");
+            Statement summaryFrom(db_, "SELECT coalesce(min(t),-1) FROM bins WHERE session=? AND hop=0 "
+                                       "AND span=3600000 AND t>=?");
+            auto stepTo = [&](Statement &q, qint64 from, qint64 cutoff) {
+                qint64 first = cutoff;
+                for (const qint64 sid : targets) {
+                    q.reset();
+                    q.integer(1, sid);
+                    q.integer(2, from);
+                    if (q.next() && q.integer(0) >= 0)
+                        first = std::min(first, q.integer(0));
+                }
+                q.reset();
+                return std::min(cutoff, first / hour * hour + hour);
+            };
+            // Retire one hour per transaction and publish its watermark in that same transaction.
+            // Readers and late samples then never meet pruned rows above the watermark, a failure
+            // leaves the previous hour's consistent state, and a long first prune does not hold
+            // the write lock away from live recorders.
+            qint64 atRaw = oldRaw, atSummary = oldSummary;
+            while (atRaw < raw || atSummary < summary) {
+                const qint64 nextRaw = atRaw < raw ? stepTo(rawFrom, atRaw, raw) : atRaw;
+                const qint64 nextSummary = atSummary < summary ? stepTo(summaryFrom, atSummary, summary) : atSummary;
                 Transaction tx(db_, true);
-                pruneSession(db_, sid, pruneRaw, pruneSummary);
+                Statement marks(db_, "SELECT raw_before,summary_before FROM retention WHERE id=1");
+                marks.next();
+                const qint64 pruneRaw = nextRaw > marks.integer(0) ? nextRaw : 0;
+                const qint64 pruneSummary = nextSummary > marks.integer(1) ? nextSummary : 0;
+                marks.reset();
+                if (pruneRaw) {
+                    // A late sample may have rewound an index since the pass above.
+                    while (const auto id = unindexed(pruneRaw))
+                        updateRouteIndex(id, -1);
+                    // Each recording's latest detector state must survive its raw samples.
+                    execute(db_, "INSERT OR REPLACE INTO route_checkpoints(session,hour,t,state) "
+                                 "SELECT session,cursor/3600000,cursor,state FROM route_index WHERE cursor>=0");
+                }
+                if (pruneRaw || pruneSummary)
+                    for (const qint64 sid : targets)
+                        pruneSession(db_, sid, pruneRaw, pruneSummary);
+                Statement set(db_, "UPDATE retention SET raw_before=max(raw_before,?),"
+                                   "summary_before=max(summary_before,?) WHERE id=1");
+                set.integer(1, nextRaw);
+                set.integer(2, nextSummary);
+                set.next();
                 tx.commit();
+                if (cache_)
+                    cache_->routeStates.clear();
+                atRaw = nextRaw;
+                atSummary = nextSummary;
             }
-            if (cache_)
-                cache_->routeStates.clear();
         }
         Transaction tx(db_, true);
-        Statement set(db_, "UPDATE retention SET raw_before=max(raw_before,?),summary_before=max(summary_before,?) WHERE id=1");
-        set.integer(1, raw);
-        set.integer(2, summary);
-        set.next();
         Statement usage(db_, "INSERT OR IGNORE INTO storage_growth VALUES(?,?)");
         usage.integer(1, now / hour * hour);
         usage.integer(2, (scalar(db_, "PRAGMA page_count") - scalar(db_, "PRAGMA freelist_count")) *
@@ -351,9 +388,13 @@ bool History::maintainStorage(qint64 now) {
         old.integer(1, now - 7 * day);
         old.next();
         tx.commit();
-        execute(db_, "PRAGMA optimize");
+        // Planner statistics are an optimization. Bound their sampling, because SQLite before
+        // 3.46 would analyse whole tables under the write lock, and never fail maintenance on them.
+        sqlite3_exec(db_, "PRAGMA analysis_limit=400; PRAGMA optimize", nullptr, nullptr, nullptr);
         return true;
     } catch (const std::exception &e) {
+        if (cache_)
+            cache_->routeStates.clear();
         error_ = QString::fromUtf8(e.what());
         return false;
     }
@@ -407,16 +448,13 @@ bool History::onlineBackup(const QString &destination) {
     sqlite3 *copy = nullptr;
     try {
         const QFileInfo target(destination);
-        const auto output = target.dir().canonicalPath() + "/" + target.fileName();
-        const auto source = QFileInfo(path_).canonicalFilePath();
-        for (const auto &suffix : {"", "-wal", "-shm", "-journal"})
-            if (output == source + suffix)
-                throw std::runtime_error("Choose a backup file outside the live database and its journals.");
+        if (isDatabaseFile(path_, destination))
+            throw std::runtime_error("Choose a backup file outside the live database and its journals.");
         if (destination.isEmpty() || target.exists() || !temp.open())
             throw std::runtime_error("Choose a new backup filename in a writable directory.");
         temp.close();
         const auto rc =
-            sqlite3_open_v2(QFile::encodeName(temp.fileName()), &copy, SQLITE_OPEN_READWRITE, nullptr);
+            sqlite3_open_v2(temp.fileName().toUtf8(), &copy, SQLITE_OPEN_READWRITE, nullptr);
         if (rc != SQLITE_OK)
             throw std::runtime_error("Cannot open backup destination.");
         // A stable WAL read transaction prevents a busy writer from repeatedly

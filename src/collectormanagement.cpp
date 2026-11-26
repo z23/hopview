@@ -105,7 +105,7 @@ void CollectorManagement::open() {
     if (db_)
         return;
     try {
-        const auto path = QFile::encodeName(path_);
+        const auto path = path_.toUtf8();
         const auto result = sqlite3_open_v2(path.constData(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
         check(db_, result);
         check(db_, sqlite3_busy_timeout(db_, 4000));
@@ -199,7 +199,9 @@ bool CollectorManagement::setTargets(const QString &site, qint64 expectedRevisio
     }
 }
 
-bool CollectorManagement::removeCollector(const QString &site) {
+bool CollectorManagement::removeCollector(const QString &site, bool *revoked) {
+    if (revoked)
+        *revoked = false;
     try {
         open();
         Transaction tx(db_, true);
@@ -214,6 +216,8 @@ bool CollectorManagement::removeCollector(const QString &site) {
         if (removedManaged == 0 && removedHealth == 0)
             throw telemetry::Error("Unknown collector.");
         tx.commit();
+        if (revoked)
+            *revoked = removedManaged > 0;
         return true;
     } catch (const std::exception &e) {
         error_ = QString::fromUtf8(e.what());

@@ -80,11 +80,15 @@ void Backend::removeCollector(QString site) {
     }
     QMetaObject::invokeMethod(m_writerContext, [this, site] {
         auto &management = collectorManagement();
-        const bool ok = management.removeCollector(site);
+        bool revoked = false;
+        const bool ok = management.removeCollector(site, &revoked);
         const auto error = ok ? QString{} : management.error();
-        QMetaObject::invokeMethod(this, [this, site, ok, error] {
-            emit collectorActionDone(
-                ok ? tr("Removed collector %1. Historical recordings were kept.").arg(site) : QString{}, error);
+        QMetaObject::invokeMethod(this, [this, site, ok, revoked, error] {
+            const auto done = revoked ? tr("Removed collector %1. Historical recordings were kept.").arg(site)
+                                      : tr("Cleared the entry for %1. A collector listed in the receiver's "
+                                           "configuration stays authorized until its token is removed there.")
+                                            .arg(site);
+            emit collectorActionDone(ok ? done : QString{}, error);
             refreshCollectors();
         });
     });

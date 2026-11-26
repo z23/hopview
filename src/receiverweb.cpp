@@ -2,7 +2,7 @@
 #include "history.h"
 #include "nodeconfig.h"
 #include <QCryptographicHash>
-#include <QDateTime>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QHash>
 #include <QHostAddress>
@@ -91,6 +91,7 @@ class Viewer final : public QTcpServer {
           expected_(QCryptographicHash::hash("reader:" + token, QCryptographicHash::Sha256)),
           ssl_(std::move(ssl)) {
         readers_.setMaxThreadCount(3);
+        clock_.start();
     }
 
     ~Viewer() override {
@@ -103,7 +104,6 @@ class Viewer final : public QTcpServer {
     struct AuthWindow {
         qint64 windowStartMs = 0;
         int failures = 0;
-        qint64 lastLogMs = 0;
     };
 
     std::unique_ptr<History> acquireReader() {
@@ -181,24 +181,14 @@ class Viewer final : public QTcpServer {
                 return;
             socket->setProperty("handled", true);
             deadline->start(transferDeadlineMs);
-            const auto nowMs = QDateTime::currentMSecsSinceEpoch();
-            if (auto it = authFailures_.find(peer); it != authFailures_.end()) {
-                if (nowMs - it->windowStartMs >= authWindowMs) {
-                    authFailures_.erase(it);
-                } else if (it->failures >= maxAuthFailures) {
-                    const auto retryAfter =
-                        std::max<qint64>(1, (authWindowMs - (nowMs - it->windowStartMs) + 999) / 1000);
-                    respond(socket, {"429 Too Many Requests", "text/plain", "Too many authentication failures",
-                                     "Retry-After: " + QByteArray::number(retryAfter) + "\r\n"});
-                    return;
-                }
-            }
             const auto lines = bytes.first(end).split('\n');
             const auto request = lines.first().trimmed().split(' ');
             QByteArray credentials;
+            bool presented = false;
             for (const auto &line : lines) {
                 const auto split = line.indexOf(':');
                 if (split > 0 && line.first(split).compare("Authorization", Qt::CaseInsensitive) == 0) {
+                    presented = true;
                     const auto value = line.sliced(split + 1).trimmed();
                     if (value.left(6).compare("Basic ", Qt::CaseInsensitive) == 0)
                         credentials =
@@ -210,18 +200,30 @@ class Viewer final : public QTcpServer {
             for (int i = 0; i < digest.size(); ++i)
                 difference |= static_cast<unsigned char>(digest[i] ^ expected_[i]);
             if (difference) {
-                if (authFailures_.size() >= 4096)
-                    pruneAuthWindows(nowMs);
-                auto &window = authFailures_[peer];
-                if (!window.windowStartMs || nowMs - window.windowStartMs >= authWindowMs) {
-                    window.windowStartMs = nowMs;
-                    window.failures = 1;
-                } else {
-                    ++window.failures;
+                // Only a wrong password counts toward the limit, and the correct one is never
+                // refused. A request without credentials is how every browser starts, and one
+                // stale script must not lock out the readers who share its address.
+                const auto nowMs = clock_.elapsed();
+                auto window = authFailures_.find(peer);
+                if (window != authFailures_.end() && nowMs - window->windowStartMs >= authWindowMs) {
+                    authFailures_.erase(window);
+                    window = authFailures_.end();
                 }
-                if (window.failures == maxAuthFailures && nowMs - window.lastLogMs >= authWindowMs) {
-                    window.lastLogMs = nowMs;
-                    log(QString("Rate-limiting viewer authentication failures from %1").arg(peer));
+                if (presented) {
+                    if (window != authFailures_.end() && window->failures >= maxAuthFailures) {
+                        const auto retryAfter =
+                            std::max<qint64>(1, (authWindowMs - (nowMs - window->windowStartMs) + 999) / 1000);
+                        respond(socket, {"429 Too Many Requests", "text/plain", "Too many authentication failures",
+                                         "Retry-After: " + QByteArray::number(retryAfter) + "\r\n"});
+                        return;
+                    }
+                    if (window == authFailures_.end()) {
+                        if (authFailures_.size() >= 4096)
+                            pruneAuthWindows(nowMs);
+                        window = authFailures_.insert(peer, {nowMs, 0});
+                    }
+                    if (++window->failures == maxAuthFailures)
+                        log(QString("Rate-limiting viewer authentication failures from %1").arg(peer));
                 }
                 respond(socket, {"401 Unauthorized", "text/plain", "Viewer credentials required", {}});
                 return;
@@ -271,6 +273,7 @@ class Viewer final : public QTcpServer {
     int active_ = 0;
     QHash<QString, int> activeByIp_;
     QHash<QString, AuthWindow> authFailures_;
+    QElapsedTimer clock_; // A wall-clock step must not stretch or cut short a limit.
     std::mutex poolMutex_;
     std::vector<std::unique_ptr<History>> pool_;
     QThreadPool readers_;

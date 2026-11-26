@@ -9,15 +9,29 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QScopeGuard>
-#include <fcntl.h>
 #include <QUuid>
+#ifdef Q_OS_LINUX
+#include <csignal>
+#include <fcntl.h>
 #include <grp.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
+#endif
 
 namespace telemetry {
+#ifdef Q_OS_LINUX
 namespace {
+// The terminal settings to put back if a signal ends the process at the hidden prompt.
+termios promptSettings;
+volatile std::sig_atomic_t promptHidden = 0;
+void restorePrompt(int signal) {
+    if (promptHidden)
+        ::tcsetattr(STDIN_FILENO, TCSANOW, &promptSettings);
+    std::signal(signal, SIG_DFL);
+    ::raise(signal);
+}
+
 QString readKey() {
     QByteArray input;
     if (::isatty(STDIN_FILENO)) {
@@ -33,15 +47,31 @@ QString readKey() {
             termios saved{};
             if (::tcgetattr(STDIN_FILENO, &saved) != 0)
                 throw Error("Cannot configure terminal for hidden enrollment key entry");
+            // Ctrl-C, a hangup or a kill at the prompt would otherwise leave the shell without echo.
+            static constexpr int interrupts[] = {SIGINT, SIGTERM, SIGQUIT, SIGHUP};
+            struct sigaction previous[std::size(interrupts)], handler{};
+            handler.sa_handler = restorePrompt;
+            sigemptyset(&handler.sa_mask);
+            promptSettings = saved;
+            for (size_t i = 0; i < std::size(interrupts); ++i)
+                ::sigaction(interrupts[i], &handler, &previous[i]);
+            const auto restore = qScopeGuard([&] {
+                if (promptHidden) {
+                    ::tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+                    promptHidden = 0;
+                    const char newline = '\n';
+                    if (::write(STDERR_FILENO, &newline, 1) < 0) {}
+                }
+                for (size_t i = 0; i < std::size(interrupts); ++i)
+                    ::sigaction(interrupts[i], &previous[i], nullptr);
+            });
             termios hidden = saved;
             hidden.c_lflag &= ~tcflag_t(ECHO);
-            if (::tcsetattr(STDIN_FILENO, TCSANOW, &hidden) != 0)
+            promptHidden = 1;
+            if (::tcsetattr(STDIN_FILENO, TCSANOW, &hidden) != 0) {
+                promptHidden = 0;
                 throw Error("Cannot disable terminal echo for enrollment key entry");
-            const auto restore = qScopeGuard([&] {
-                ::tcsetattr(STDIN_FILENO, TCSANOW, &saved);
-                const char newline = '\n';
-                if (::write(STDERR_FILENO, &newline, 1) < 0) {}
-            });
+            }
             const char label[] = "Hopview enrollment key: ";
             if (::write(STDERR_FILENO, label, sizeof(label) - 1) < 0) {}
             QFile tty;
@@ -63,6 +93,7 @@ QString readKey() {
     return QString::fromLatin1(input);
 }
 }
+#endif
 
 EnrollmentKey parseEnrollmentKey(const QString &text) {
     static const QRegularExpression format(QStringLiteral(R"(\Ahv1\.([a-f0-9]{64})(?:\.([a-f0-9]{64}))?\z)"));
@@ -73,6 +104,7 @@ EnrollmentKey parseEnrollmentKey(const QString &text) {
 }
 
 int joinCollector(const QString &endpoint) {
+#ifdef Q_OS_LINUX
     ReceiverEndpoint address;
     if (!parseReceiverEndpoint(endpoint, address))
         throw Error("Expected a receiver hostname, address, or [IPv6]:port");
@@ -132,5 +164,9 @@ int joinCollector(const QString &endpoint) {
         throw Error("Enrollment saved. Could not start the collector service; rerun join to retry.");
     log("Collector service enabled. Check its connection under Collectors in Hopview.");
     return 0;
+#else
+    Q_UNUSED(endpoint)
+    throw Error("Service enrollment requires a Linux collector. Start this node with collect COLLECTOR.json.");
+#endif
 }
 }

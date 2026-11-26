@@ -63,9 +63,10 @@ def verify(binary, work):
                                         viewer=dict(port=viewer_port, tokenFile="viewer-token"))))
 
     def http(path, token=reader, method="GET", with_headers=False):
-        credentials = base64.b64encode(("reader:" + token).encode()).decode()
-        request = urllib.request.Request(f"https://127.0.0.1:{viewer_port}" + path,
-                                         headers={"Authorization": "Basic " + credentials}, method=method)
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = "Basic " + base64.b64encode(("reader:" + token).encode()).decode()
+        request = urllib.request.Request(f"https://127.0.0.1:{viewer_port}" + path, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, context=ctx, timeout=6) as response:
                 return (response.status, response.read(), response.headers) if with_headers else (response.status, response.read())
@@ -173,6 +174,14 @@ def verify(binary, work):
             assert http("/", token="wrong")[0] == 401
         limited_code, _, limited_headers = http("/", token="wrong", with_headers=True)
         assert limited_code == 429 and int(limited_headers.get("Retry-After", "0")) >= 1
+        # The right password is let through while the limit is active, and clears it.
+        assert http("/")[0] == 200
+        assert http("/", token="wrong")[0] == 401
+        # A request without credentials is every browser's first step. It is refused but not counted.
+        for _ in range(12):
+            assert http("/", token=None)[0] == 401
+        assert http("/", token="wrong")[0] == 401
+        assert http("/")[0] == 200
 
 
 if __name__ == "__main__":

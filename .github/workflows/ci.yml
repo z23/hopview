@@ -4,18 +4,23 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    # The tree needs Qt 6.5 or newer. Ubuntu 24.04 packages 6.4.
+    container: ubuntu:26.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install build and test dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            git \
             build-essential \
             pkg-config \
             qmake6 \
@@ -33,6 +38,8 @@ jobs:
             libcurl4-openssl-dev \
             openssl \
             python3
+
+      - uses: actions/checkout@v4
 
       - name: Build hopview and hopview-node
         run: JOBS="$(nproc)" bin/build

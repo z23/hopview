@@ -1,5 +1,5 @@
 #include "probeoptions.h"
-#include "probe.h"
+#include "probesession.h"
 
 #include <QDateTime>
 #include <QHostAddress>
@@ -194,18 +194,18 @@ qint64 realtimeNs() {
 QString systemError(int error) { return QString::fromLocal8Bit(strerror(error)); }
 } // namespace
 
-class ProbeSession : public QObject {
+class LinuxProbeSession final : public ProbeSession {
 public:
-    ProbeSession(Probe *owner, qint64 id, int intervalMs, ProbeOptions options)
-        : QObject(owner), owner_(owner), id_(id), interval_(std::clamp(intervalMs, 250, 3'600'000)),
+    LinuxProbeSession(Probe *owner, qint64 id, int intervalMs, ProbeOptions options)
+        : ProbeSession(owner), owner_(owner), id_(id), interval_(std::clamp(intervalMs, 250, 3'600'000)),
           options_(std::move(options)) {
         timer_.setSingleShot(true);
         timer_.setTimerType(Qt::PreciseTimer);
         connect(&timer_, &QTimer::timeout, this, [this] { tick(); });
     }
-    ~ProbeSession() override { cancel(); }
+    ~LinuxProbeSession() override { cancel(); }
 
-    void cancel() {
+    void cancel() override {
         active_ = false;
         if (lookup_ >= 0) QHostInfo::abortHostLookup(std::exchange(lookup_, -1));
         timer_.stop();
@@ -214,7 +214,7 @@ public:
         while (!sockets_.empty()) closeSocket(sockets_.begin()->first);
     }
 
-    void finish() {
+    void finish() override {
         finishing_ = true;
         if (rounds_.empty()) {
             cancel();
@@ -224,7 +224,7 @@ public:
         }
     }
 
-    void resolve(QString target, int family) {
+    void resolve(QString target, int family) override {
         target = target.trimmed();
         if (target.isEmpty() || (family != 0 && family != 4 && family != 6)) {
             fail("Specify a host or address and a valid IP family.");
@@ -419,7 +419,7 @@ private:
     std::map<quint16, Pending> pending_;
 };
 
-void ProbeSession::tick() {
+void LinuxProbeSession::tick() {
     if (!active_) return;
     drain();
     const auto now = Clock::now();
@@ -467,7 +467,7 @@ void ProbeSession::tick() {
     timer_.start(std::max(1ms, std::chrono::ceil<std::chrono::milliseconds>(wake - Clock::now())));
 }
 
-void ProbeSession::sendProbe(qint64 number, Round &r, int hop) {
+void LinuxProbeSession::sendProbe(qint64 number, Round &r, int hop) {
     const bool ipv6 = endpoint_.family() == AF_INET6;
     const int level = ipv6 ? IPPROTO_IPV6 : IPPROTO_IP;
     const int option = ipv6 ? IPV6_UNICAST_HOPS : IP_TTL;
@@ -517,7 +517,7 @@ void ProbeSession::sendProbe(qint64 number, Round &r, int hop) {
     sendError(r, hop, errno);
 }
 
-void ProbeSession::sendError(Round &r, int hop, int error) {
+void LinuxProbeSession::sendError(Round &r, int hop, int error) {
     r.values[hop] = Sample{id_, r.wallMs, hop, {}, -2, false, {"local-unsent", {}, -1, -1, 0, error}};
     const auto now = Clock::now();
     if (now - lastError_ > 3s) {
@@ -527,7 +527,7 @@ void ProbeSession::sendError(Round &r, int hop, int error) {
     // A local send failure did not put a probe on the wire.
 }
 
-void ProbeSession::switchUdpSockets() {
+void LinuxProbeSession::switchUdpSockets() {
     if (separateUdp_) return;
     separateUdp_ = true;
     if (notifier_) {
@@ -549,7 +549,7 @@ void ProbeSession::switchUdpSockets() {
     }
 }
 
-void ProbeSession::separateProbe(qint64 number, Round &r, int hop, quint16 key) {
+void LinuxProbeSession::separateProbe(qint64 number, Round &r, int hop, quint16 key) {
     const bool tcp = method_ == "tcp";
     const bool v6 = endpoint_.family() == AF_INET6;
     const int fd = openSocket(endpoint_.family(), method_);
@@ -587,7 +587,7 @@ void ProbeSession::separateProbe(qint64 number, Round &r, int hop, quint16 key) 
     connect(notifier, &QSocketNotifier::activated, this, [this, key] { socketReady(key); });
 }
 
-void ProbeSession::closeSocket(quint16 key) {
+void LinuxProbeSession::closeSocket(quint16 key) {
     auto it = sockets_.find(key);
     if (it == sockets_.end()) return;
     it->second.notifier->setEnabled(false);
@@ -596,7 +596,7 @@ void ProbeSession::closeSocket(quint16 key) {
     sockets_.erase(it);
 }
 
-void ProbeSession::socketReady(quint16 key) {
+void LinuxProbeSession::socketReady(quint16 key) {
     const auto it = sockets_.find(key);
     if (it == sockets_.end()) return;
     const int fd = it->second.fd;
@@ -626,14 +626,14 @@ void ProbeSession::socketReady(quint16 key) {
     finishRounds();
 }
 
-void ProbeSession::drain() {
+void LinuxProbeSession::drain() {
     if (fd_ < 0) return;
     // Bound each callback so queued responses cannot starve other sessions or controls.
     for (const bool errors : {true, false})
         for (int count = 0; count < 256 && fd_ >= 0 && receive(fd_, errors); ++count) {}
 }
 
-bool ProbeSession::receive(int fd, bool errors, std::optional<quint16> socketKey) {
+bool LinuxProbeSession::receive(int fd, bool errors, std::optional<quint16> socketKey) {
     std::array<unsigned char, 256> packet{};
     alignas(cmsghdr) std::array<unsigned char, 512> control{};
     Endpoint peer;
@@ -721,7 +721,7 @@ bool ProbeSession::receive(int fd, bool errors, std::optional<quint16> socketKey
     return true;
 }
 
-void ProbeSession::complete(quint16 key, const QHostAddress &responder, bool destination, qint64 rxNs) {
+void LinuxProbeSession::complete(quint16 key, const QHostAddress &responder, bool destination, qint64 rxNs) {
     auto it = pending_.find(key);
     if (it == pending_.end()) return;
     const auto &p = it->second;
@@ -746,7 +746,7 @@ void ProbeSession::complete(quint16 key, const QHostAddress &responder, bool des
     pending_.erase(it);
 }
 
-void ProbeSession::finishRounds() {
+void LinuxProbeSession::finishRounds() {
     QVector<Sample> batch;
     while (!rounds_.empty()) {
         const auto &r = rounds_.begin()->second;
@@ -763,26 +763,6 @@ void ProbeSession::finishRounds() {
     }
 }
 
-Probe::Probe(QObject *parent) : QObject(parent) {}
-
-void Probe::start(qint64 id, QString target, int family, int intervalMs, QString protocol, int port, QString interfaceName, int payloadBytes, int dscp, bool dontFragment) {
-    stop(id);
-    auto *s = new ProbeSession(this, id, intervalMs, {std::move(protocol), port, std::move(interfaceName), payloadBytes, dscp, dontFragment});
-    sessions_.insert(id, s);
-    s->resolve(std::move(target), family);
-}
-
-void Probe::stop(qint64 id) {
-    if (auto *s = sessions_.take(id)) {
-        s->cancel();
-        s->deleteLater();
-    }
-}
-
-void Probe::finish(qint64 id) {
-    if (auto *s = sessions_.value(id)) s->finish();
-}
-
-void Probe::shutdown() {
-    for (auto id : sessions_.keys()) stop(id);
+ProbeSession *newProbeSession(Probe *owner, qint64 id, int intervalMs, ProbeOptions options) {
+    return new LinuxProbeSession(owner, id, intervalMs, std::move(options));
 }

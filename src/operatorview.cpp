@@ -65,8 +65,14 @@ void Backend::startTracePair(QString target, int firstFamily, int secondFamily, 
     }
     const ProbeOptions options{protocol, port, iface, firstSize, firstDscp, df};
     const ProbeOptions other{protocol, port, iface, secondSize, secondDscp, df};
+    for (const auto &error : {localProbeError(options, firstFamily), localProbeError(other, secondFamily)}) {
+        if (!error.isEmpty()) {
+            setStatus(error);
+            return;
+        }
+    }
     const auto validFamily = [](int family) { return family == 0 || family == 4 || family == 6; };
-    if (!options.valid() || !other.valid() || !validFamily(firstFamily) || !validFamily(secondFamily) ||
+    if (!validFamily(firstFamily) || !validFamily(secondFamily) ||
         target.isEmpty() || target.size() > 255 || intervalMs < 250 || intervalMs > 60000) {
         setStatus(tr("Choose a valid target and probe profiles for both traces."));
         return;

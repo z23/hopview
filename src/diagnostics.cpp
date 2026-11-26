@@ -1,19 +1,34 @@
 #include "diagnostics.h"
 #include <QDateTime>
+#ifdef Q_OS_LINUX
 #include <QDBusConnection>
+#include <QDBusError>
 #include <QDBusMessage>
 #include <QDBusObjectPath>
 #include <QDBusVariant>
+#endif
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QHostAddress>
+#include <QNetworkInterface>
 #include <QUrl>
-#include <curl/curl.h>
+#ifdef Q_OS_LINUX
 #include <linux/wireless.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#elif defined(Q_OS_MACOS)
+#include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <net/if.h>
+#include <net/if_mib.h>
+#elif defined(Q_OS_WIN)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#endif
+#include <curl/curl.h>
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -24,18 +39,15 @@ struct Diagnostics::WifiCache {
     struct Entry {
         quint64 ifindex = 0;
         bool wextUnsupported = false;
-        QString nmDevicePath;
-        qint64 nmDeviceCheckedTick = -1;
-        QString nmApPath;
-        QString nmApBssid;
-        qint64 nmApCheckedTick = -1;
+        // The device object, the NetworkManager instance that named it, and when to ask again.
+        QString nmDevicePath, nmOwner;
+        qint64 nmNextLookup = 0;
     };
     QHash<QString, Entry> entries;
 };
 
 namespace {
 constexpr int interfacePeriodMs = 2000;
-constexpr qint64 nmRetryMs = 60000;
 
 std::atomic<int> curlInitState{0};
 std::mutex curlInitMutex;
@@ -53,6 +65,9 @@ bool ensureCurlInitialized() {
     return ok;
 }
 
+#ifdef Q_OS_LINUX
+constexpr qint64 nmRetryMs = 60000, nmAbsentRetryMs = 10000;
+
 std::optional<quint64> readNumber(const QString &file) {
     QFile input(file);
     if (!input.open(QIODevice::ReadOnly))
@@ -63,82 +78,86 @@ std::optional<quint64> readNumber(const QString &file) {
 }
 
 QString networkManagerAP(const QString &interface, qint64 tick, Diagnostics::WifiCache::Entry &cache) {
-    if (cache.nmDevicePath.isEmpty() && cache.nmDeviceCheckedTick >= 0 &&
-        tick - cache.nmDeviceCheckedTick < nmRetryMs)
+    // NetworkManager is not running or does not manage this interface. Ask again later.
+    if (cache.nmDevicePath.isEmpty() && tick < cache.nmNextLookup)
         return {};
     const auto bus = QDBusConnection::systemBus();
     if (!bus.isConnected()) {
         cache.nmDevicePath.clear();
-        cache.nmApPath.clear();
-        cache.nmApBssid.clear();
-        cache.nmDeviceCheckedTick = tick;
+        cache.nmNextLookup = tick + nmAbsentRetryMs;
         return {};
     }
+    // A late or lost reply says nothing about the device, so only an answer is remembered.
+    struct Reply {
+        QVariant value;
+        QString sender;
+        bool answered = false, absent = false;
+    };
     const auto call = [&](const QString &path, const QString &iface, const QString &method,
                           const QVariantList &args) {
         auto request = QDBusMessage::createMethodCall("org.freedesktop.NetworkManager", path, iface, method);
         request.setAutoStartService(false);
         request.setArguments(args);
         const auto reply = bus.call(request, QDBus::Block, 200);
-        if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty())
-            return QVariant{};
-        return reply.arguments().first();
+        Reply result;
+        result.sender = reply.service();
+        if (reply.type() == QDBusMessage::ReplyMessage) {
+            result.answered = true;
+            if (!reply.arguments().isEmpty())
+                result.value = reply.arguments().first();
+        } else if (reply.type() == QDBusMessage::ErrorMessage) {
+            const auto error = QDBusError(reply).type();
+            const auto name = reply.errorName();
+            result.answered = error != QDBusError::NoReply && error != QDBusError::Timeout &&
+                              error != QDBusError::TimedOut;
+            result.absent = name == QLatin1String("org.freedesktop.DBus.Error.NameHasNoOwner") ||
+                            name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown");
+        }
+        return result;
     };
-    auto resolveDevice = [&] {
-        cache.nmDeviceCheckedTick = tick;
-        cache.nmDevicePath = call("/org/freedesktop/NetworkManager", "org.freedesktop.NetworkManager",
-                                  "GetDeviceByIpIface", {interface})
-                                 .value<QDBusObjectPath>()
-                                 .path();
-        cache.nmApPath.clear();
-        cache.nmApBssid.clear();
-        cache.nmApCheckedTick = -1;
+    const auto resolveDevice = [&] {
+        const auto device = call("/org/freedesktop/NetworkManager", "org.freedesktop.NetworkManager",
+                                 "GetDeviceByIpIface", {interface});
+        if (!device.answered)
+            return false;
+        cache.nmDevicePath = device.value.value<QDBusObjectPath>().path();
+        cache.nmOwner = device.sender;
+        // A stopped NetworkManager usually returns soon. An unmanaged interface rarely changes.
+        cache.nmNextLookup = tick + (device.absent ? nmAbsentRetryMs : nmRetryMs);
+        return true;
     };
-    if (cache.nmDevicePath.isEmpty())
+    const auto activeAccessPoint = [&] {
+        return call(cache.nmDevicePath, "org.freedesktop.DBus.Properties", "Get",
+                    {"org.freedesktop.NetworkManager.Device.Wireless", "ActiveAccessPoint"});
+    };
+    const auto objectPath = [](const Reply &reply) {
+        return reply.value.value<QDBusVariant>().variant().value<QDBusObjectPath>().path();
+    };
+    if (cache.nmDevicePath.isEmpty() || tick >= cache.nmNextLookup)
         resolveDevice();
     if (cache.nmDevicePath.isEmpty())
         return {};
-    auto ap = call(cache.nmDevicePath, "org.freedesktop.DBus.Properties", "Get",
-                   {"org.freedesktop.NetworkManager.Device.Wireless", "ActiveAccessPoint"})
-                  .value<QDBusVariant>()
-                  .variant()
-                  .value<QDBusObjectPath>()
-                  .path();
-    if (ap.isEmpty()) {
-        // The cached device object path may have gone stale (for example after a NetworkManager restart).
-        resolveDevice();
-        if (cache.nmDevicePath.isEmpty())
+    auto active = activeAccessPoint();
+    // A restarted NetworkManager numbers its objects afresh, so the remembered path can name another
+    // device. An answer from a different instance, or one without an access point, means look again.
+    if (active.answered && (active.sender != cache.nmOwner || objectPath(active).isEmpty())) {
+        if (!resolveDevice() || cache.nmDevicePath.isEmpty())
             return {};
-        ap = call(cache.nmDevicePath, "org.freedesktop.DBus.Properties", "Get",
-                  {"org.freedesktop.NetworkManager.Device.Wireless", "ActiveAccessPoint"})
-                 .value<QDBusVariant>()
-                 .variant()
-                 .value<QDBusObjectPath>()
-                 .path();
-        if (ap.isEmpty()) {
-            cache.nmDevicePath.clear();
-            return {};
-        }
+        active = activeAccessPoint();
     }
-    if (ap == "/") {
-        cache.nmApPath = ap;
-        cache.nmApBssid = QStringLiteral("disconnected");
-        cache.nmApCheckedTick = tick;
-        return cache.nmApBssid;
-    }
-    if (ap == cache.nmApPath && !cache.nmApBssid.isEmpty() && cache.nmApCheckedTick >= 0 &&
-        tick - cache.nmApCheckedTick < nmRetryMs)
-        return cache.nmApBssid;
-    const auto bssid = call(ap, "org.freedesktop.DBus.Properties", "Get",
-                            {"org.freedesktop.NetworkManager.AccessPoint", "HwAddress"})
-                           .value<QDBusVariant>()
-                           .variant()
-                           .toString()
-                           .toLower();
-    cache.nmApPath = ap;
-    cache.nmApBssid = bssid;
-    cache.nmApCheckedTick = tick;
-    return bssid;
+    const auto ap = objectPath(active);
+    if (ap.isEmpty())
+        return {};
+    if (ap == "/")
+        return QStringLiteral("disconnected");
+    // Read the address on every poll. A backend that keeps one object per network
+    // changes its address in place when the station roams.
+    return call(ap, "org.freedesktop.DBus.Properties", "Get",
+                {"org.freedesktop.NetworkManager.AccessPoint", "HwAddress"})
+        .value.value<QDBusVariant>()
+        .variant()
+        .toString()
+        .toLower();
 }
 
 QString accessPoint(const QString &interface, qint64 tick, Diagnostics::WifiCache::Entry &cache) {
@@ -210,6 +229,64 @@ InterfaceReading readInterface(const QString &name, qint64 tick, Diagnostics::Wi
     }
     return s;
 }
+#else
+InterfaceReading readInterface(const QString &name, qint64 tick, Diagnostics::WifiCache &) {
+    InterfaceReading s;
+    s.name = name;
+    s.tick = tick;
+    s.index = QNetworkInterface::interfaceIndexFromName(name);
+    if (!s.index)
+        return s;
+#ifdef Q_OS_MACOS
+    int mib[] = {CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, s.index, IFDATA_GENERAL};
+    ifmibdata counters{};
+    size_t size = sizeof(counters);
+    if (sysctl(mib, 6, &counters, &size, nullptr, 0) != 0 || size < sizeof(counters) ||
+        name != QString::fromLocal8Bit(counters.ifmd_name))
+        return s;
+    s.rx = counters.ifmd_data.ifi_ibytes;
+    s.tx = counters.ifmd_data.ifi_obytes;
+    s.rxErrors = counters.ifmd_data.ifi_ierrors;
+    s.txErrors = counters.ifmd_data.ifi_oerrors;
+    s.rxDrops = counters.ifmd_data.ifi_iqdrops;
+    s.txDrops = counters.ifmd_snd_drops;
+    s.readable = true;
+#elif defined(Q_OS_WIN)
+    MIB_IF_ROW2 counters{};
+    counters.InterfaceIndex = s.index;
+    if (GetIfEntry2(&counters) != NO_ERROR)
+        return s;
+    s.rx = counters.InOctets;
+    s.tx = counters.OutOctets;
+    s.rxErrors = counters.InErrors;
+    s.txErrors = counters.OutErrors;
+    s.rxDrops = counters.InDiscards;
+    s.txDrops = counters.OutDiscards;
+    if (counters.MediaConnectState != MediaConnectStateUnknown)
+        s.carrier = counters.MediaConnectState == MediaConnectStateConnected;
+    s.readable = true;
+#endif
+    return s;
+}
+#endif
+
+#ifdef Q_OS_WIN
+// libcurl accepts source IPs on Windows but cannot bind by adapter name.
+int bindServiceSocket(void *context, curl_socket_t fd, curlsocktype purpose) {
+    if (purpose != CURLSOCKTYPE_IPCXN)
+        return CURL_SOCKOPT_OK;
+    WSAPROTOCOL_INFOW info{};
+    int size = sizeof(info);
+    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL_INFOW, reinterpret_cast<char *>(&info), &size) != 0)
+        return CURL_SOCKOPT_ERROR;
+    const auto index = *static_cast<const unsigned *>(context);
+    const bool v4 = info.iAddressFamily == AF_INET;
+    const DWORD value = v4 ? htonl(index) : index;
+    const int result = setsockopt(fd, v4 ? IPPROTO_IP : IPPROTO_IPV6, v4 ? IP_UNICAST_IF : IPV6_UNICAST_IF,
+                                  reinterpret_cast<const char *>(&value), sizeof(value));
+    return result == 0 ? CURL_SOCKOPT_OK : CURL_SOCKOPT_ERROR;
+}
+#endif
 
 int stopTransfer(void *state, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
     return static_cast<const std::atomic_bool *>(state)->load(std::memory_order_relaxed) ? 1 : 0;
@@ -283,7 +360,7 @@ QVariantMap measureService(const QString &address, int family, const QString &bi
         rec["error"] = rec["event"] = "Cannot initialize HTTP client";
         return rec;
     }
-    const auto encoded = url.toEncoded(), device = QByteArray("if!") + bindInterface.toLocal8Bit();
+    const auto encoded = url.toEncoded();
     char message[CURL_ERROR_SIZE]{};
     curl_easy_setopt(curl, CURLOPT_URL, encoded.constData());
 #if LIBCURL_VERSION_NUM >= 0x075500
@@ -299,8 +376,23 @@ QVariantMap measureService(const QString &address, int family, const QString &bi
                      long(family == 6   ? CURL_IPRESOLVE_V6
                           : family == 4 ? CURL_IPRESOLVE_V4
                                         : CURL_IPRESOLVE_WHATEVER));
-    if (!bindInterface.isEmpty())
+#ifdef Q_OS_WIN
+    unsigned interfaceIndex = 0;
+#endif
+    if (!bindInterface.isEmpty()) {
+#ifdef Q_OS_WIN
+        interfaceIndex = QNetworkInterface::interfaceIndexFromName(bindInterface);
+        if (!interfaceIndex) {
+            rec["error"] = rec["event"] = "Unknown network interface: " + bindInterface;
+            return rec;
+        }
+        curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, bindServiceSocket);
+        curl_easy_setopt(curl, CURLOPT_SOCKOPTDATA, &interfaceIndex);
+#else
+        const auto device = QByteArray("if!") + bindInterface.toLocal8Bit();
         curl_easy_setopt(curl, CURLOPT_INTERFACE, device.constData());
+#endif
+    }
     if (!caFile.isEmpty())
         curl_easy_setopt(curl, CURLOPT_CAINFO, caFile.constData());
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Hopview");
@@ -363,7 +455,7 @@ void Diagnostics::configure(qint64 id, const QVariantMap &settings, int family,
     if (!settings["url"].toString().isEmpty() || !settings["interface"].toString().isEmpty()) {
         Watch watch;
         watch.url = settings["url"].toString();
-        watch.interface = settings["interface"].toString();
+        watch.device = settings["interface"].toString();
         watch.family = family;
         watch.bindInterface = bindInterface;
         watch.seconds = settings["seconds"].toInt();
@@ -392,10 +484,10 @@ void Diagnostics::poll() {
     for (auto it = watches_.begin(); it != watches_.end(); ++it) {
         auto &watch = it.value();
         const auto id = it.key();
-        if (!watch.interface.isEmpty() && tick >= watch.nextInterface) {
-            if (!interfaces.contains(watch.interface))
-                interfaces[watch.interface] = readInterface(watch.interface, tick, *wifiCache_);
-            auto current = interfaces.value(watch.interface);
+        if (!watch.device.isEmpty() && tick >= watch.nextInterface) {
+            if (!interfaces.contains(watch.device))
+                interfaces[watch.device] = readInterface(watch.device, tick, *wifiCache_);
+            auto current = interfaces.value(watch.device);
             emit observation(
                 id,
                 interfaceSample(current, watch.previous.name.isEmpty() ? nullptr : &watch.previous, wall));
