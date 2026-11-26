@@ -52,6 +52,11 @@ ip -6 route add 2001:db8:1::/64 via 2001:db8::2
 d ip -6 route add 2001:db8::/64 via 2001:db8:1::2
 r sysctl -qw net.ipv4.ip_forward=1
 r sysctl -qw net.ipv6.conf.all.forwarding=1
+# This fixture verifies hop attribution at 250 ms intervals. Permit every TTL
+# and closed-port ICMP response on the isolated routers and destination.
+for ns in r d x; do
+    "$ns" sysctl -qw net.ipv4.icmp_ratelimit=0 net.ipv6.icmp.ratelimit=0
+done
 
 # Only topology setup needs namespace capabilities. Exercise the real CLI with none.
 trace() { setpriv --bounding-set=-all --no-new-privs "$binary" "$@"; }

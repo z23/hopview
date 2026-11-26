@@ -1,4 +1,5 @@
 <RCC><qresource prefix="/">
+  <file alias="hopview.svg">../pkgbuild/hopview.svg</file>
   <file>Main.qml</file>
   <file>FleetDialog.qml</file>
   <file>SiteComparison.qml</file>

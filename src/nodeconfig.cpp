@@ -57,7 +57,7 @@ Trace parseTrace(const QJsonObject &o) {
         const auto device = settings["interface"].toString();
         if ((!address.isEmpty() && (address.size() > 2048 || !url.isValid() || url.host().isEmpty() ||
              (url.scheme() != "http" && url.scheme() != "https") || !url.userInfo().isEmpty() || url.hasFragment())) ||
-            !validText(device, 15, true) || device.contains('/') || device == "." || device == "..")
+            !validText(device, 63, true) || device.contains('/') || device == "." || device == "..")
             throw Error("Invalid service URL or diagnostic interface");
         const auto seconds = settings.contains("seconds") ? integer(settings, "seconds", 5, 3600) : 30;
         if (!address.isEmpty() || !device.isEmpty())

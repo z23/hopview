@@ -5,10 +5,18 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QProcessEnvironment>
 #include <QSaveFile>
 #include <QStandardPaths>
 
 LocalReceiver::LocalReceiver(QObject *parent) : QObject(parent) {
+#ifdef Q_OS_WIN
+    // A console-only Windows child has no window to receive QProcess::terminate().
+    // Closing its private stdin pipe requests a flush and also handles parent exit.
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert("HOPVIEW_PARENT_PIPE", "1");
+    server_.setProcessEnvironment(environment);
+#endif
     connect(&certificate_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
         if (e == QProcess::FailedToStart) {
             staging_.reset();
@@ -47,6 +55,11 @@ LocalReceiver::~LocalReceiver() {
     for (auto *process : {&certificate_, &server_}) {
         disconnect(process, nullptr, this, nullptr);
         if (process->state() != QProcess::NotRunning) {
+#ifdef Q_OS_WIN
+            if (process == &server_)
+                process->closeWriteChannel();
+            else
+#endif
             process->terminate();
             if (!process->waitForFinished(2000)) {
                 process->kill();
@@ -100,7 +113,8 @@ void LocalReceiver::start(const QString &address) {
     }
     const auto host = endpoint_.host.section('%', 0, 0);
     const auto alt = (QHostAddress(host).isNull() ? "DNS:" : "IP:") + host;
-    certificate_.start("openssl", {"req", "-x509", "-newkey", "rsa:3072", "-sha256", "-nodes",
+    const QString bundledOpenSsl = QStandardPaths::findExecutable("openssl", {QCoreApplication::applicationDirPath()});
+    certificate_.start(bundledOpenSsl.isEmpty() ? "openssl" : bundledOpenSsl, {"req", "-x509", "-newkey", "rsa:3072", "-sha256", "-nodes",
                                     "-days", "730", "-subj", "/CN=Hopview receiver",
                                     "-addext", "subjectAltName=" + alt, "-keyout", staging_->filePath("key.pem"),
                                     "-out", staging_->filePath("cert.pem")});
@@ -119,10 +133,8 @@ void LocalReceiver::launchServer() {
         return;
     }
     const QDir binaries(QCoreApplication::applicationDirPath());
-    QString program = binaries.filePath("hopview-node");
-    if (!QFileInfo(program).isExecutable())
-        program = binaries.filePath("../build-node/hopview-node");
-    if (!QFileInfo(program).isExecutable())
+    QString program = QStandardPaths::findExecutable("hopview-node", {binaries.path(), binaries.filePath("../build-node")});
+    if (program.isEmpty())
         program = QStandardPaths::findExecutable("hopview-node");
     if (program.isEmpty()) {
         report(false, false, tr("The receiver executable hopview-node is missing."));
@@ -135,6 +147,10 @@ void LocalReceiver::stop() {
     if (ready_) {
         stopping_ = true;
         report(true, false, tr("Stopping receiver…"));
+#ifdef Q_OS_WIN
+        server_.closeWriteChannel();
+#else
         server_.terminate();
+#endif
     }
 }

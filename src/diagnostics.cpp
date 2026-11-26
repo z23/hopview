@@ -1,25 +1,40 @@
 #include "diagnostics.h"
 #include <QDateTime>
+#ifdef Q_OS_LINUX
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusObjectPath>
 #include <QDBusVariant>
+#endif
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QHostAddress>
+#include <QNetworkInterface>
 #include <QUrl>
-#include <curl/curl.h>
+#ifdef Q_OS_LINUX
 #include <linux/wireless.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#elif defined(Q_OS_MACOS)
+#include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <net/if.h>
+#include <net/if_mib.h>
+#elif defined(Q_OS_WIN)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#endif
+#include <curl/curl.h>
 #include <algorithm>
 #include <cstring>
 #include <optional>
 
 namespace {
 constexpr int interfacePeriodMs = 2000;
+#ifdef Q_OS_LINUX
 std::optional<quint64> readNumber(const QString &file) {
     QFile input(file);
     if (!input.open(QIODevice::ReadOnly))
@@ -124,6 +139,64 @@ InterfaceReading readInterface(const QString &name, qint64 tick) {
         s.ap = accessPoint(name);
     return s;
 }
+#else
+InterfaceReading readInterface(const QString &name, qint64 tick) {
+    InterfaceReading s;
+    s.name = name;
+    s.tick = tick;
+    s.index = QNetworkInterface::interfaceIndexFromName(name);
+    if (!s.index)
+        return s;
+#ifdef Q_OS_MACOS
+    int mib[] = {CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, s.index, IFDATA_GENERAL};
+    ifmibdata counters{};
+    size_t size = sizeof(counters);
+    if (sysctl(mib, 6, &counters, &size, nullptr, 0) != 0 || size < sizeof(counters) ||
+        name != QString::fromLocal8Bit(counters.ifmd_name))
+        return s;
+    s.rx = counters.ifmd_data.ifi_ibytes;
+    s.tx = counters.ifmd_data.ifi_obytes;
+    s.rxErrors = counters.ifmd_data.ifi_ierrors;
+    s.txErrors = counters.ifmd_data.ifi_oerrors;
+    s.rxDrops = counters.ifmd_data.ifi_iqdrops;
+    s.txDrops = counters.ifmd_snd_drops;
+    s.readable = true;
+#elif defined(Q_OS_WIN)
+    MIB_IF_ROW2 counters{};
+    counters.InterfaceIndex = s.index;
+    if (GetIfEntry2(&counters) != NO_ERROR)
+        return s;
+    s.rx = counters.InOctets;
+    s.tx = counters.OutOctets;
+    s.rxErrors = counters.InErrors;
+    s.txErrors = counters.OutErrors;
+    s.rxDrops = counters.InDiscards;
+    s.txDrops = counters.OutDiscards;
+    if (counters.MediaConnectState != MediaConnectStateUnknown)
+        s.carrier = counters.MediaConnectState == MediaConnectStateConnected;
+    s.readable = true;
+#endif
+    return s;
+}
+#endif
+
+#ifdef Q_OS_WIN
+// libcurl accepts source IPs on Windows but cannot bind by adapter name.
+int bindServiceSocket(void *context, curl_socket_t fd, curlsocktype purpose) {
+    if (purpose != CURLSOCKTYPE_IPCXN)
+        return CURL_SOCKOPT_OK;
+    WSAPROTOCOL_INFOW info{};
+    int size = sizeof(info);
+    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL_INFOW, reinterpret_cast<char *>(&info), &size) != 0)
+        return CURL_SOCKOPT_ERROR;
+    const auto index = *static_cast<const unsigned *>(context);
+    const bool v4 = info.iAddressFamily == AF_INET;
+    const DWORD value = v4 ? htonl(index) : index;
+    const int result = setsockopt(fd, v4 ? IPPROTO_IP : IPPROTO_IPV6, v4 ? IP_UNICAST_IF : IPV6_UNICAST_IF,
+                                  reinterpret_cast<const char *>(&value), sizeof(value));
+    return result == 0 ? CURL_SOCKOPT_OK : CURL_SOCKOPT_ERROR;
+}
+#endif
 
 int stopTransfer(void *state, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
     return static_cast<const std::atomic_bool *>(state)->load(std::memory_order_relaxed) ? 1 : 0;
@@ -188,7 +261,7 @@ QVariantMap measureService(const QString &address, int family, const QString &bi
         rec["error"] = rec["event"] = "Cannot initialize HTTP client";
         return rec;
     }
-    const auto encoded = url.toEncoded(), device = QByteArray("if!") + bindInterface.toLocal8Bit();
+    const auto encoded = url.toEncoded();
     char message[CURL_ERROR_SIZE]{};
     curl_easy_setopt(curl, CURLOPT_URL, encoded.constData());
 #if LIBCURL_VERSION_NUM >= 0x075500
@@ -204,8 +277,23 @@ QVariantMap measureService(const QString &address, int family, const QString &bi
                      long(family == 6   ? CURL_IPRESOLVE_V6
                           : family == 4 ? CURL_IPRESOLVE_V4
                                         : CURL_IPRESOLVE_WHATEVER));
-    if (!bindInterface.isEmpty())
+#ifdef Q_OS_WIN
+    unsigned interfaceIndex = 0;
+#endif
+    if (!bindInterface.isEmpty()) {
+#ifdef Q_OS_WIN
+        interfaceIndex = QNetworkInterface::interfaceIndexFromName(bindInterface);
+        if (!interfaceIndex) {
+            rec["error"] = rec["event"] = "Unknown network interface: " + bindInterface;
+            return rec;
+        }
+        curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, bindServiceSocket);
+        curl_easy_setopt(curl, CURLOPT_SOCKOPTDATA, &interfaceIndex);
+#else
+        const auto device = QByteArray("if!") + bindInterface.toLocal8Bit();
         curl_easy_setopt(curl, CURLOPT_INTERFACE, device.constData());
+#endif
+    }
     if (!caFile.isEmpty())
         curl_easy_setopt(curl, CURLOPT_CAINFO, caFile.constData());
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Hopview");
@@ -267,7 +355,7 @@ void Diagnostics::configure(qint64 id, const QVariantMap &settings, int family,
     if (!settings["url"].toString().isEmpty() || !settings["interface"].toString().isEmpty()) {
         Watch watch;
         watch.url = settings["url"].toString();
-        watch.interface = settings["interface"].toString();
+        watch.device = settings["interface"].toString();
         watch.family = family;
         watch.bindInterface = bindInterface;
         watch.seconds = settings["seconds"].toInt();
@@ -296,10 +384,10 @@ void Diagnostics::poll() {
     for (auto it = watches_.begin(); it != watches_.end(); ++it) {
         auto &watch = it.value();
         const auto id = it.key();
-        if (!watch.interface.isEmpty() && tick >= watch.nextInterface) {
-            if (!interfaces.contains(watch.interface))
-                interfaces[watch.interface] = readInterface(watch.interface, tick);
-            auto current = interfaces.value(watch.interface);
+        if (!watch.device.isEmpty() && tick >= watch.nextInterface) {
+            if (!interfaces.contains(watch.device))
+                interfaces[watch.device] = readInterface(watch.device, tick);
+            auto current = interfaces.value(watch.device);
             emit observation(
                 id,
                 interfaceSample(current, watch.previous.name.isEmpty() ? nullptr : &watch.previous, wall));

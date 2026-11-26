@@ -64,7 +64,7 @@ class Spool {
         if (!lock_.tryLock())
             throw Error("Cannot acquire collector spool " + path);
         sqlite3 *opened = nullptr;
-        const auto rc = sqlite3_open_v2(QFile::encodeName(path).constData(), &opened,
+        const auto rc = sqlite3_open_v2(path.toUtf8().constData(), &opened,
                                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
         db_.reset(opened);
         if (rc != SQLITE_OK)
@@ -398,9 +398,12 @@ class Collector final : public QObject {
         const auto localFailure = std::find_if(samples.crbegin(), samples.crend(), [](const Sample &sample) {
             return sample.failure.kind == "local-unsent";
         });
-        if (localFailure != samples.crend())
-            errors_[id] = QString("Probe could not be sent (system error %1)").arg(localFailure->failure.systemError);
-        else errors_.remove(id);
+        if (localFailure != samples.crend()) {
+            auto text = QStringLiteral("Probe could not be sent");
+            if (localFailure->failure.systemError)
+                text += QString(" (system error %1)").arg(localFailure->failure.systemError);
+            errors_[id] = text;
+        } else errors_.remove(id);
         auto body = recordHeader(id, samples.front().timeMs);
         QJsonArray rows, detailed;
         for (const auto &s : samples) {

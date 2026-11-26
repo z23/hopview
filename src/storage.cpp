@@ -1,4 +1,5 @@
 #include "history.h"
+#include "databasepath.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
 #include <QDir>
@@ -255,16 +256,13 @@ bool History::onlineBackup(const QString &destination) {
     sqlite3 *copy = nullptr;
     try {
         const QFileInfo target(destination);
-        const auto output = target.dir().canonicalPath() + "/" + target.fileName();
-        const auto source = QFileInfo(path_).canonicalFilePath();
-        for (const auto &suffix : {"", "-wal", "-shm", "-journal"})
-            if (output == source + suffix)
-                throw std::runtime_error("Choose a backup file outside the live database and its journals.");
+        if (isDatabaseFile(path_, destination))
+            throw std::runtime_error("Choose a backup file outside the live database and its journals.");
         if (destination.isEmpty() || target.exists() || !temp.open())
             throw std::runtime_error("Choose a new backup filename in a writable directory.");
         temp.close();
         const auto rc =
-            sqlite3_open_v2(QFile::encodeName(temp.fileName()), &copy, SQLITE_OPEN_READWRITE, nullptr);
+            sqlite3_open_v2(temp.fileName().toUtf8(), &copy, SQLITE_OPEN_READWRITE, nullptr);
         if (rc != SQLITE_OK)
             throw std::runtime_error("Cannot open backup destination.");
         // A stable WAL read transaction prevents a busy writer from repeatedly

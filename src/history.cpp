@@ -429,7 +429,7 @@ QString History::error() const {
 
 bool History::openReadOnly() {
     if (db_) return sqlite3_db_readonly(db_, "main") == 1;
-    if (sqlite3_open_v2(QFile::encodeName(path_).constData(), &db_, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
+    if (sqlite3_open_v2(path_.toUtf8().constData(), &db_, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
         sqlite3_busy_timeout(db_, 3000);
         return true;
     }
@@ -448,7 +448,7 @@ bool History::open() {
         return false;
     }
     try {
-        const auto p = QFile::encodeName(path_);
+        const auto p = path_.toUtf8();
         const int rc =
             sqlite3_open_v2(p.constData(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
         if (rc != SQLITE_OK)

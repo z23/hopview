@@ -3,6 +3,7 @@
 #include <QString>
 #include <QHostAddress>
 #include <QJsonObject>
+#include <cmath>
 
 struct ProbeOptions {
     QString protocol = QStringLiteral("auto");
@@ -26,6 +27,26 @@ struct ProbeOptions {
         return protocol == "tcp" ? 443 : 33434;
     }
 };
+
+// Receiver assignments and portable recordings may contain profiles from any OS.
+// Apply these limits only when starting a probe on this machine.
+inline QString localProbeError(const ProbeOptions &options, int family) {
+    if (!options.valid())
+        return QStringLiteral("Check the protocol, port, payload size and DSCP. TCP uses the system SYN size.");
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    if (options.protocol != "auto" && options.protocol != "icmp")
+        return QStringLiteral("Local traces on this platform support Auto or ICMP.");
+    if (family == 6 && options.dontFragment)
+        return QStringLiteral("Unfragmented probes on this platform require IPv4.");
+#ifdef Q_OS_WIN
+    if (options.dscp)
+        return QStringLiteral("The Windows ICMP API cannot guarantee the requested DSCP marking.");
+#endif
+#else
+    Q_UNUSED(family);
+#endif
+    return {};
+}
 
 inline bool validMeasurement(const QJsonObject &m) {
     const auto family = m["effectiveFamily"].toInt(), port = m["effectivePort"].toInt(-1);

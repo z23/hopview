@@ -1,10 +1,10 @@
 #include "incident.h"
+#include "databasepath.h"
 #include "history.h"
 #include "probeoptions.h"
 #include "sqlhelpers.h"
 #include <QDateTime>
 #include <QFile>
-#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -39,11 +39,6 @@ void csvRow(QSaveFile &out, const QStringList &fields) {
         bytes += '"' + field.toUtf8().replace("\"", "\"\"") + '"';
     }
     writeBytes(out, bytes + "\r\n");
-}
-QString absolutePath(const QString &path) {
-    const QFileInfo info(path);
-    const auto canonical = info.canonicalFilePath();
-    return canonical.isEmpty() ? info.absoluteFilePath() : canonical;
 }
 QString utc(qint64 ms) {
     return QDateTime::fromMSecsSinceEpoch(ms, QTimeZone::UTC).toString(Qt::ISODateWithMs);
@@ -350,9 +345,7 @@ bool History::exportIncident(qint64 id, qint64 from, qint64 through, const QStri
     error_.clear();
     try {
         require(id > 0 && from >= 0 && from <= through && through <= maxTime, "Invalid incident range.");
-        const auto source = absolutePath(path_), output = absolutePath(file);
-        for (const auto &suffix : {QString(), QString("-wal"), QString("-shm"), QString("-journal")})
-            require(output != source + suffix, "Choose a file outside the active history database.");
+        require(!isDatabaseFile(path_, file), "Choose a file outside the active history database.");
         Transaction tx(db_, false);
         QHash<qint64, QVariantMap> available;
         for (auto entry : sessions())

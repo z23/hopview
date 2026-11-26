@@ -3,6 +3,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$root/build"
 cd "$root/build"
-qmake6 "$root/hopview.pro" CONFIG+=release
+if command -v qmake6 >/dev/null; then qmake=qmake6; else qmake=qmake; fi
+"$qmake" "$root/hopview.pro" CONFIG+=release
 make -j"${JOBS:-4}"
 "$root/bin/build-node"
