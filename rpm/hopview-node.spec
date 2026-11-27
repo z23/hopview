@@ -1,5 +1,5 @@
 Name:           hopview-node
-Version:        0.5.0
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        Headless IPv4 and IPv6 path telemetry collector and receiver
 License:        MIT
