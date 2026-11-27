@@ -196,7 +196,7 @@ int main(int argc, char **argv) {
     else
         app = std::make_unique<QCoreApplication>(argc, argv);
     app->setApplicationName("hopview");
-    app->setApplicationVersion("0.5.0");
+    app->setApplicationVersion("0.6.0");
     QCommandLineParser parser;
     parser.setApplicationDescription("Hopview — continuous IPv4 and IPv6 path monitoring");
     parser.addHelpOption();

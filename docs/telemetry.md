@@ -26,8 +26,8 @@ Use the VM’s package installer to install the local x86_64 package matching it
 
 | VM release | Package file |
 | --- | --- |
-| EL9 | [hopview-node-0.5.0-1.el9.x86_64.rpm](https://github.com/z23/hopview/releases/download/v0.5.0/hopview-node-0.5.0-1.el9.x86_64.rpm) |
-| EL10 | [hopview-node-0.5.0-1.el10.x86_64.rpm](https://github.com/z23/hopview/releases/download/v0.5.0/hopview-node-0.5.0-1.el10.x86_64.rpm) |
+| EL9 | [hopview-node-0.6.0-1.el9.x86_64.rpm](https://github.com/z23/hopview/releases/download/v0.6.0/hopview-node-0.6.0-1.el9.x86_64.rpm) |
+| EL10 | [hopview-node-0.6.0-1.el10.x86_64.rpm](https://github.com/z23/hopview/releases/download/v0.6.0/hopview-node-0.6.0-1.el10.x86_64.rpm) |
 
 The package creates the `hopview` service account and installs editable examples as `/etc/hopview/collector.json` and `/etc/hopview/receiver.json`. Choose the role of each host and configure it below. The collector on a VM only needs an outbound connection to the receiver.
 
